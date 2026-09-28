@@ -1,0 +1,16 @@
+# ai-boot 配置示例。密钥不写在这里：飞书 AppSecret 从环境变量 FEISHU_APP_SECRET 读取。
+
+[feishu]
+# 企业自建应用的 App ID
+app_id = "cli_xxxxxxxxxxxxxxxx"
+# 开放平台地址，必须以 / 结尾
+base_url = "https://open.feishu.cn/"
+
+[access]
+# 用户资料里的邮箱（不是企业邮箱），启动时解析成 open_id。姓名会重名，不用于匹配
+allowed_emails = ["someone@example.com"]
+# 也可以直接写 open_id，不依赖通讯录权限
+allowed_open_ids = []
+
+[storage]
+data_dir = "/var/lib/ai-boot"
