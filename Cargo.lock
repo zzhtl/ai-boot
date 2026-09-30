@@ -34,6 +34,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-boot-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ai-boot-feishu"
 version = "0.1.0"
 dependencies = [

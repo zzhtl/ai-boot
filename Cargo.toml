@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ai-boot-feishu", "crates/ai-boot"]
+members = ["crates/ai-boot-feishu", "crates/ai-boot-agent", "crates/ai-boot"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 ai-boot-feishu = { path = "crates/ai-boot-feishu" }
+ai-boot-agent = { path = "crates/ai-boot-agent" }
 
 anyhow = "1.0"
 async-trait = "0.1"
@@ -19,6 +20,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 # 长连接的帧是 proto2 的两条消息，手写 derive 即可，不引入 prost-build/protoc。
 prost = "0.14"
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
+# 给 CLI 进程组发 SIGINT/SIGKILL；safe 封装，满足 unsafe_code = "forbid"。
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "json",
@@ -53,7 +56,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "connect",
     "rustls-tls-native-roots",
 ] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["codec"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
