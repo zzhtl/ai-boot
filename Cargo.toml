@@ -14,14 +14,30 @@ ai-boot-agent = { path = "crates/ai-boot-agent" }
 
 anyhow = "1.0"
 async-trait = "0.1"
+# OAuth 回调服务：只有两个 GET 路由；底层的 hyper、tower 已经在依赖树里。
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
 base64 = "0.23"
+# 表格（xlsx/xls/ods）转文本；纯 Rust，不起外部进程。
+calamine = { version = "0.36", default-features = false }
+# 日志里常见 GBK/GB18030，UTF-8 解不开时用它再试。
+encoding_rs = "0.8"
 clap = { version = "4.6", features = ["derive", "env"] }
+# 截图缩放：SIMD 实现的 Lanczos3，比 image 自带的快十几倍、结果几乎一样；
+# 它的 image 依赖和下面这份是同一个。
+fast_image_resize = { version = "6.1", features = ["image"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+# 截图缩放到模型合适的尺寸；只开常见格式的编解码，不要 rayon 和 avif。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# 模型输出的 markdown 要解析后重新输出成飞书卡片支持的子集，不能靠正则替换。
+pulldown-cmark = { version = "0.13", default-features = false }
 # 长连接的帧是 proto2 的两条消息，手写 derive 即可，不引入 prost-build/protoc。
 prost = "0.14"
+# docx/pptx 是 zip 里的 XML，逐事件读出文字，不建 DOM；版本与 calamine 用的一致。
+quick-xml = "0.41"
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 # 给 CLI 进程组发 SIGINT/SIGKILL；safe 封装，满足 unsafe_code = "forbid"。
 rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+regex = "1.12"
 reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "json",
@@ -34,7 +50,10 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# OAuth 的 PKCE（S256）；这个版本已经在依赖树里。
+sha2 = "0.11"
+# 保留键的原始顺序：拍平别人的卡片时，文字要按卡片上的先后排。
+serde_json = { version = "1.0", features = ["preserve_order"] }
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
@@ -62,6 +81,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.24", features = ["v5", "v7"] }
+# docx/pptx 的容器；版本和 feature 与 calamine 用的保持一致，不引入第二份。
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # dev-dependencies
 tempfile = "3"
@@ -71,6 +92,19 @@ wiremock = "0.6"
 codegen-units = 1
 lto = "thin"
 strip = "symbols"
+
+# 图片编解码和缩放在 debug 下要慢几十倍，测试里处理一张 1920×1080 的图要好几秒；
+# 只给这几个包开优化，不影响其余代码的调试
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.fast_image_resize]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

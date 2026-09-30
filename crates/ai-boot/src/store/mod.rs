@@ -1,11 +1,24 @@
 //! SQLite 存储。单机、单写者；WAL 让读不阻塞写。
 
+mod conversation;
+mod tokens;
+mod writeback;
+
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+
+#[cfg(test)]
+pub use conversation::Turn;
+pub use conversation::{
+    Conversation, FinishedTurn, InterruptedTurn, NewConversation, Origin, TurnKind, TurnRecord,
+    TurnStatus,
+};
+pub use tokens::NewToken;
+pub use writeback::{NewWriteback, Writeback, WritebackStatus};
 
 const DB_FILE: &str = "ai-boot.db";
 
@@ -89,17 +102,42 @@ impl Store {
         Ok(())
     }
 
-    /// 尚未处理完的输入，按接收时间排序。
-    pub async fn pending_inputs(&self) -> anyhow::Result<Vec<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT message_id FROM turn_inputs
-             WHERE status = 'pending'
-             ORDER BY received_at_ms",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("查询待处理输入失败")?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+    /// 在线备份：`VACUUM INTO` 出一份完整、一致的库。目标文件必须不存在。
+    pub async fn backup_into(&self, target: &Path) -> anyhow::Result<()> {
+        let target = target
+            .to_str()
+            .with_context(|| format!("备份路径不是 UTF-8：{}", target.display()))?;
+        sqlx::query("VACUUM INTO ?")
+            .bind(target)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("备份到 {target} 失败"))?;
+        Ok(())
+    }
+
+    /// 删过数据之后整理数据库文件。被删的内容还留在空闲页和 WAL 里，VACUUM 重写整个
+    /// 文件、再把 WAL 截断，才算真的没了。库只有几 MB，一天一次的开销可以忽略。
+    pub async fn compact(&self) -> anyhow::Result<()> {
+        sqlx::query("VACUUM")
+            .execute(&self.pool)
+            .await
+            .context("整理数据库失败")?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+            .context("截断 WAL 失败")?;
+        Ok(())
+    }
+
+    /// 一条输入的原始事件 JSON。
+    pub async fn input_payload(&self, message_id: &str) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT payload FROM turn_inputs WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("查询 turn_inputs 失败")?;
+        Ok(row.map(|(payload,)| payload))
     }
 }
 
@@ -124,6 +162,11 @@ mod tests {
         let store = Store::open(dir.path()).await.expect("打开");
         assert!(store.insert_input(&input("om_1", 1)).await.expect("首次"));
         assert!(!store.insert_input(&input("om_1", 2)).await.expect("重复"));
+        assert_eq!(
+            store.input_payload("om_1").await.expect("查询").as_deref(),
+            Some("{}")
+        );
+        assert_eq!(store.input_payload("om_x").await.expect("查询"), None);
     }
 
     #[tokio::test]
@@ -138,7 +181,7 @@ mod tests {
         }
         let store = Store::open(dir.path()).await.expect("重新打开");
         assert_eq!(
-            store.pending_inputs().await.expect("查询"),
+            store.unassigned_inputs().await.expect("查询"),
             vec!["om_1".to_owned(), "om_2".to_owned()]
         );
     }

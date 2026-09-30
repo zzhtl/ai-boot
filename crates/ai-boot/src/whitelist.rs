@@ -34,6 +34,18 @@ impl Whitelist {
             .unwrap_or(false)
     }
 
+    /// 当前白名单里的所有人（告警发给他们）。
+    pub fn open_ids(&self) -> Vec<String> {
+        self.open_ids
+            .read()
+            .map(|ids| {
+                let mut ids: Vec<String> = ids.iter().cloned().collect();
+                ids.sort();
+                ids
+            })
+            .unwrap_or_default()
+    }
+
     fn extend(&self, ids: impl IntoIterator<Item = String>) {
         if let Ok(mut set) = self.open_ids.write() {
             set.extend(ids.into_iter().filter(|id| !id.is_empty()));

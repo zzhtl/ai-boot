@@ -1,18 +1,34 @@
 //! ai-boot：飞书问题排查机器人。
 
+mod alert;
+mod answer;
+mod callback;
 mod config;
-mod echo;
+mod context;
+mod conversation;
+mod doctor;
+mod hook;
 mod ingest;
 mod lock;
+mod maintenance;
+mod oauth;
+mod prompt;
+mod render;
+mod runner;
 mod store;
 mod whitelist;
+mod writeback;
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use ai_boot_agent::claude::{ClaudeBackend, ClaudeConfig};
+use ai_boot_agent::{AgentBackend, McpServer};
 use ai_boot_feishu::api::ApiClient;
 use ai_boot_feishu::ws::{WsClient, WsConfig};
 use anyhow::Context as _;
@@ -20,6 +36,11 @@ use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+/// 连发合并的窗口：一轮的第一条消息之后这么久内的消息并进同一轮。进度卡在收到
+/// 第一条时就回了，这段只推迟开始分析，越短越快；只发了图片、文件的会多等一会儿
+/// 后面的提问（见 conversation::actor）。
+const DEBOUNCE: Duration = Duration::from_millis(1500);
 
 #[derive(Parser)]
 #[command(version, about = "飞书问题排查机器人")]
@@ -40,13 +61,35 @@ enum Command {
         )]
         config: PathBuf,
     },
+    /// 部署后自检：逐项检查配置、权限、飞书、Agent、MCP、外部工具
+    ///
+    /// 要用服务的运行用户和环境执行才有意义：部署后用 `deploy/doctor.sh`
+    Doctor {
+        #[arg(
+            long,
+            env = "AI_BOOT_CONFIG",
+            default_value = "/etc/ai-boot/config.toml"
+        )]
+        config: PathBuf,
+    },
+    /// Agent CLI 调用的工具判决 hook（由 CLI 按 hook 配置调起，不要手动运行）
+    #[command(hide = true)]
+    Hook(hook::HookArgs),
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    match Cli::parse().command {
+        // hook 是每次工具调用都要起一次的短命进程，stdout 专用于判决：
+        // 不初始化日志，也不构建运行时
+        Command::Hook(args) => hook::run(&args),
+        Command::Run { config } => serve(&config),
+        Command::Doctor { config } => doctor::run(&config),
+    }
+}
+
+fn serve(config: &Path) -> ExitCode {
     init_tracing();
-    // 运行时手动构建而不是用 #[tokio::main]：之后的 hook 子命令要在
-    // 构建运行时之前就分发出去（hook 是短命进程，起运行时既慢又多一个失败点）
+    // 运行时手动构建而不是用 #[tokio::main]，这样 hook 子命令用不着它
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -57,10 +100,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = match cli.command {
-        Command::Run { config } => runtime.block_on(run(&config)),
-    };
-    match result {
+    match runtime.block_on(run(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!("{err:#}");
@@ -114,12 +154,155 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         cancel.clone(),
     ));
 
+    let backend = claude_backend(&config.agent);
+    let info = backend
+        .preflight()
+        .await
+        .context("claude 不可用，检查 agent.claude.program")?;
+    tracing::info!(backend = ?info.kind, version = %info.version, "Agent 后端就绪");
+    let backends: HashMap<String, Arc<dyn AgentBackend>> =
+        HashMap::from([(info.kind.as_str().to_owned(), Arc::new(backend) as _)]);
+    let scratch = data_dir.join("tmp");
+    prepare_data_dir(&scratch)?;
+    let window = (config.context.window_messages > 0).then(|| {
+        (
+            config.context.window_messages,
+            Duration::from_secs(config.context.window_minutes * 60),
+        )
+    });
+    let settings = runner::Settings {
+        data_dir: data_dir.clone(),
+        tools: context::extract::Tools {
+            office_legacy: config.context.office_legacy,
+            scratch,
+        },
+        window,
+        model: config.agent.model.clone(),
+        effort: config.agent.effort_level(),
+        timeout: Duration::from_secs(config.agent.timeout_secs),
+        budget_usd_micros: config.agent.budget_micros(),
+        mcp_servers: config
+            .agent
+            .mcp
+            .iter()
+            .map(|server| McpServer {
+                name: server.name.clone(),
+                command: server.command.clone(),
+                args: server.args.clone(),
+                env: server.env.clone(),
+            })
+            .collect(),
+        link_hosts: config.render.link_hosts.clone(),
+    };
+    let mut runner = runner::Runner::new(
+        Arc::clone(&api),
+        store.clone(),
+        backends,
+        settings,
+        config.agent.max_concurrent,
+        Arc::clone(&bot_open_id),
+    );
+    if let Some(oauth_config) = &config.oauth {
+        let oauth = Arc::new(oauth::Oauth::new(
+            Arc::clone(&api),
+            store.clone(),
+            Arc::clone(&whitelist),
+            oauth::OauthSettings {
+                app_id: config.feishu.app_id.clone(),
+                redirect_uri: oauth_config.redirect_uri.clone(),
+                accounts_url: oauth_config.accounts_url.clone(),
+                scopes: oauth_config.scopes.clone(),
+            },
+        ));
+        let listen = oauth_config.listen;
+        let server = Arc::clone(&oauth);
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            if let Err(err) = oauth::serve(server, listen, stop).await {
+                tracing::error!("{err:#}");
+            }
+        });
+        tokio::spawn(oauth::keep_fresh(Arc::clone(&oauth), cancel.clone()));
+        runner = runner.with_oauth(oauth);
+    } else {
+        tracing::info!("没有配置 [oauth]，不读取群里贴的云文档");
+    }
+    let writer = config.writeback.as_ref().map(|wb| {
+        Arc::new(writeback::Writer::new(
+            Arc::clone(&api),
+            store.clone(),
+            writeback::Settings {
+                server: writeback::mcp::Server {
+                    command: wb.command.clone(),
+                    args: wb.args.clone(),
+                    env: wb.env.clone(),
+                },
+                confluence: wb
+                    .confluence_space
+                    .clone()
+                    .zip(wb.confluence_parent_id.clone()),
+            },
+            config.render.link_hosts.clone(),
+        ))
+    });
+    if let Some(writer) = &writer {
+        runner = runner.with_writer(Arc::clone(writer));
+    }
+    runner = runner.with_alerts(Arc::new(alert::Alerts::new(
+        Arc::clone(&api),
+        Arc::clone(&whitelist),
+    )));
+    let runner = Arc::new(runner);
+    tokio::spawn(maintenance::run(
+        maintenance::Maintenance {
+            store: store.clone(),
+            data_dir: data_dir.clone(),
+            // 复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 CLI 的默认位置 ~/.claude
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+                }),
+        },
+        cancel.clone(),
+    ));
+
+    // 上次退出时没结束的轮次记为中断，卡片上给重试按钮
+    let interrupted = store.interrupt_open_turns(store::now_ms()).await?;
+    if !interrupted.is_empty() {
+        tracing::warn!(
+            count = interrupted.len(),
+            "上次退出时有没结束的轮次，已记为中断"
+        );
+        let runner = Arc::clone(&runner);
+        tokio::spawn(async move { runner.mark_interrupted(interrupted).await });
+    }
+    // 上次退出时还在写的写回：结果不明，卡片上给重试（重试会先查重）
+    let unclear = store.interrupt_writebacks(store::now_ms()).await?;
+    if let Some(writer) = writer.filter(|_| !unclear.is_empty()) {
+        tracing::warn!(
+            count = unclear.len(),
+            "上次退出时有没写完的写回，已记为结果不明"
+        );
+        tokio::spawn(async move {
+            for turn_id in unclear {
+                writer.refresh_card(&turn_id).await;
+            }
+        });
+    }
     let (jobs_tx, jobs_rx) = mpsc::channel(256);
-    tokio::spawn(echo::run(Arc::clone(&api), store.clone(), jobs_rx));
-    // 上次退出时还没处理完的消息
-    for message_id in store.pending_inputs().await? {
+    let registry = conversation::Registry::new(
+        store.clone(),
+        runner,
+        Arc::clone(&bot_open_id),
+        config.agent.backend.clone(),
+        DEBOUNCE,
+    );
+    tokio::spawn(registry.run(jobs_rx));
+    // 上次退出时还没分派的消息
+    for message_id in store.unassigned_inputs().await? {
         jobs_tx
-            .send(echo::Job::Echo { message_id })
+            .send(conversation::Job::Input { message_id })
             .await
             .context("处理队列已关闭")?;
     }
@@ -132,6 +315,27 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     client.run(ingest, cancel).await;
     tracing::info!("ai-boot 已退出");
     Ok(())
+}
+
+/// Claude 后端：环境变量按白名单从 ai-boot 自己的环境里挑，其余一律不传。
+pub(crate) fn claude_backend(agent: &config::AgentConfig) -> ClaudeBackend {
+    ClaudeBackend::new(ClaudeConfig {
+        program: agent.claude.program.clone(),
+        hook_program: agent.hook.program.clone(),
+        hook_timeout_secs: agent.hook.timeout_secs,
+        env: claude_env(agent),
+        stop_grace: Duration::from_secs(10),
+    })
+}
+
+/// 传给 claude 的环境变量：按白名单从 ai-boot 自己的环境里挑，其余一律不传。
+pub(crate) fn claude_env(agent: &config::AgentConfig) -> Vec<(OsString, OsString)> {
+    agent
+        .claude
+        .env_passthrough
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect()
 }
 
 /// 数据目录里有聊天内容，只允许属主访问。已存在的目录不改权限（可能是

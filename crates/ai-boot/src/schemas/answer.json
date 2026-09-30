@@ -1,0 +1,267 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "title",
+    "status",
+    "confidence",
+    "summary",
+    "corrections",
+    "conflicts",
+    "sections",
+    "open_questions",
+    "references",
+    "jira_keys"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "diagnosis",
+        "summary",
+        "howto",
+        "other"
+      ],
+      "description": "问题类型：diagnosis 故障排查，summary 讨论总结，howto 用法/操作，other 其他"
+    },
+    "title": {
+      "type": "string",
+      "description": "卡片标题，一句话概括问题，不超过 40 个字"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "answered",
+        "need_more_info",
+        "partial"
+      ],
+      "description": "answered 已给出结论（排查类即根因已确认）；partial 只有部分结论（排查类即根因待确认，给了可能原因和验证方法）；need_more_info 缺关键信息没法往下分析"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "description": "结论的把握程度：有代码/Jira 等证据支撑为 high，含推测时降低"
+    },
+    "summary": {
+      "type": "string",
+      "description": "一段简洁的全文概述：不展开详情也能看懂是什么问题、结论是什么，纯文字，不超过 200 字"
+    },
+    "corrections": {
+      "type": "array",
+      "description": "本轮相对上一轮回答的更正：每条写清原来的结论、改成了什么、依据；第一轮或结论没变时为空数组",
+      "items": {
+        "type": "string"
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "description": "上下文之间的冲突及取舍；没有冲突时为空数组",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "topic",
+          "claim",
+          "adopted",
+          "sources"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "冲突点"
+          },
+          "claim": {
+            "type": "string",
+            "description": "被否定的说法及其出处"
+          },
+          "adopted": {
+            "type": "string",
+            "description": "采信的说法及理由"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "description": "详细内容，卡片上默认折叠。排查类：根因已确认写「根本原因」「解决方案」；根因未确认写「可能原因与验证方法」，不写解决方案。只问原因就只写原因。图片、图表、流程图只在比文字更清楚时才附，大多数段落三个数组都是空的",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "body",
+          "images",
+          "charts",
+          "diagrams"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string",
+            "description": "markdown 正文"
+          },
+          "images": {
+            "type": "array",
+            "description": "这一段要展示的截图：只在要指出群里更早的某张截图时才放，只能用本轮读到过的附件路径（如 attachments/1/03-image.webp）；提问附带的和刚发的截图不要再贴",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "caption"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "工作目录里的相对路径"
+                },
+                "caption": {
+                  "type": "string",
+                  "description": "一句话说明图里看什么"
+                }
+              }
+            }
+          },
+          "charts": {
+            "type": "array",
+            "description": "数据对比、趋势、占比用图表更直观时才放",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "title",
+                "type",
+                "categories",
+                "series"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line",
+                    "area",
+                    "pie"
+                  ],
+                  "description": "柱状、折线、面积、饼图"
+                },
+                "categories": {
+                  "type": "array",
+                  "description": "横轴的分类（饼图是各扇区）",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "series": {
+                  "type": "array",
+                  "description": "每条数据系列的值与 categories 一一对应；饼图只用第一条",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "name",
+                      "values"
+                    ],
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "values": {
+                        "type": "array",
+                        "items": {
+                          "type": "number"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "diagrams": {
+            "type": "array",
+            "description": "调用链、处理流程、依赖关系用图更清楚时才放",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "title",
+                "dot"
+              ],
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "dot": {
+                  "type": "string",
+                  "description": "Graphviz DOT（digraph），节点文字用中文，不超过 30 个节点；不要用 image、URL、href 等属性和 HTML 标签"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "description": "待确认事项与标为推测的结论",
+      "items": {
+        "type": "string"
+      }
+    },
+    "references": {
+      "type": "array",
+      "description": "实际查阅过的来源",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "title",
+          "url"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "jira",
+              "confluence",
+              "gitlab",
+              "feishu",
+              "other"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "jira_keys": {
+      "type": "array",
+      "description": "与本问题直接相关的 Jira 单号，如 ABC-123",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

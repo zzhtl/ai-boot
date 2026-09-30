@@ -1,4 +1,5 @@
-# ai-boot 配置示例。密钥不写在这里：飞书 AppSecret 从环境变量 FEISHU_APP_SECRET 读取。
+# ai-boot 配置示例。密钥不写在这里：飞书 AppSecret 从环境变量 FEISHU_APP_SECRET 读取，
+# Claude 的登录 token 从 CLAUDE_CODE_OAUTH_TOKEN 读取（见 agent.claude.env_passthrough）。
 
 [feishu]
 # 企业自建应用的 App ID
@@ -14,3 +15,78 @@ allowed_open_ids = []
 
 [storage]
 data_dir = "/var/lib/ai-boot"
+
+[agent]
+# 目前只有 claude
+backend = "claude"
+# 不写就用 CLI 的默认模型（目前是 Opus），CLI 升级后自动跟上新的默认；要锁定就写全名
+# model = "claude-opus-5-5"
+# low / medium / high / xhigh / max
+effort = "xhigh"
+timeout_secs = 1200
+# 单轮预算（美元）：订阅账号下是估算值，只起熔断作用
+budget_usd = 5.0
+# 同时分析的轮数，1～4。每轮各起一个 claude 和 qtmcp：qtmcp 要能多进程共用 SSO 会话
+# （sessions.v2.json），否则并发时会各自登录，同一个 TOTP 码只能用一次
+max_concurrent = 2
+
+[agent.claude]
+# 用本机已登录用户的 claude（会自动升级）；要锁版本就指向一份固定拷贝，比如 /opt/ai-boot/bin/claude
+program = "/home/someone/.local/bin/claude"
+# 按名字从 ai-boot 自己的环境里挑出来传给 claude，其余一律不传
+env_passthrough = ["HOME", "PATH", "LANG", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]
+
+[agent.hook]
+# ai-boot 自己的可执行文件，CLI 通过 `ai-boot hook` 判决每一次工具调用
+program = "/opt/ai-boot/bin/ai-boot"
+timeout_secs = 10
+
+[[agent.mcp]]
+name = "qtmcp"
+command = "/opt/ai-boot/bin/qtmcp"
+args = ["--toolsets", "jira,confluence,gitlab,jenkins"]
+env = { QTMCP_CONFIG = "/etc/ai-boot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
+
+[render]
+# 卡片里允许出现链接的 host（含子域），通常是 Jira、Confluence、GitLab 的域名
+link_hosts = ["jira.example.com", "wiki.example.com", "git.example.com"]
+
+[context]
+# 群聊附带的最近消息：最多几条（0 表示不带，上限 500）、往前看多少分钟（0 表示不限时间）。
+# 新会话取最近的，群里的追问取上一轮之后的
+window_messages = 500
+window_minutes = 0
+# 旧版 Office（doc、ppt）和 OpenDocument 先用 soffice 转换再读取
+office_legacy = true
+
+# 以你的身份读云文档（OAuth 授权一次，之后后台自动续期）。不配这一节就不读文档。
+[oauth]
+# 回调服务监听的地址：本机内网 IP 和端口
+listen = "10.0.0.8:18080"
+# 在开发者后台「安全设置」里登记的重定向 URL，必须与这里完全一致，路径固定
+redirect_uri = "http://10.0.0.8:18080/oauth/feishu/callback"
+# 授权页所在的域名
+accounts_url = "https://accounts.feishu.cn/"
+# 申请的用户权限，按开发者后台实际开通的调整；offline_access 必须有
+scopes = [
+    "offline_access",
+    "docs:document.content:read",
+    "docx:document:readonly",
+    "wiki:wiki:readonly",
+    "sheets:spreadsheet:readonly",
+    "bitable:app:readonly",
+    "drive:file:download",
+    "docs:document.media:download",
+    "drive:drive.metadata:readonly",
+]
+
+# 闭环方案写回：点「已解决」生成闭环方案后，可以写入 Jira 评论、发布到 Confluence。
+# 写回由 ai-boot 在你点按钮确认后执行。不配这一节就只生成方案。
+[writeback]
+# 和 Agent 用的是同一个 qtmcp，但这里不能带只读开关
+command = "/opt/ai-boot/bin/qtmcp"
+args = ["--toolsets", "jira,confluence"]
+env = { QTMCP_CONFIG = "/etc/ai-boot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
+# 发布到 Confluence 的空间和父页面（页面 ID）
+confluence_space = "DEV"
+confluence_parent_id = "123456789"

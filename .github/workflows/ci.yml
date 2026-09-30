@@ -26,6 +26,14 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+      # PDF 解析的测试要用 poppler；LibreOffice 太大不装，旧版 Office 的测试会自动跳过
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
+
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      # 编排层只认 AgentBackend，具体后端只能在装配代码（main.rs）里出现，接 Codex 时才不用动编排
+      - name: backend boundary
+        run: |
+          ! grep -rnE --include='*.rs' 'ai_boot_agent::(\{[^}]*)?claude' crates/ai-boot/src \
+            | grep -v '^crates/ai-boot/src/main.rs:'
