@@ -1,0 +1,59 @@
+# ai-boot：飞书问题排查机器人。由 deploy/install.sh 安装到 /etc/systemd/system/。
+[Unit]
+Description=ai-boot 飞书问题排查机器人
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-boot
+Group=ai-boot
+ExecStart=/opt/ai-boot/bin/ai-boot run --config /etc/ai-boot/config.toml
+# FEISHU_APP_SECRET、CLAUDE_CODE_OAUTH_TOKEN；systemd 以 root 读，文件是 0600 root
+EnvironmentFile=/etc/ai-boot/ai-boot.env
+# 机器人自己的 Claude 配置目录和 HOME，不和任何人的 ~/.claude 共用
+Environment=CLAUDE_CONFIG_DIR=/var/lib/ai-boot/claude
+Environment=HOME=/var/lib/ai-boot/home
+Environment=XDG_RUNTIME_DIR=/run/ai-boot
+Environment=AI_BOOT_LOG=info
+
+Restart=on-failure
+RestartSec=5s
+# 停止时整组杀掉：Agent CLI、MCP server、soffice 一个都不留
+KillMode=control-group
+TimeoutStopSec=30s
+
+StateDirectory=ai-boot ai-boot/claude ai-boot/home
+StateDirectoryMode=0700
+RuntimeDirectory=ai-boot
+RuntimeDirectoryMode=0700
+# 机器人和交互式 qtmcp 共用的 SSO 会话目录
+ReadWritePaths=/var/lib/qtmcp
+UMask=0077
+
+# 加固：聊天内容、文档、Jira 正文都是不可信输入，Agent 只该碰到工作目录
+ProtectHome=tmpfs
+ProtectSystem=strict
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectProc=invisible
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# claude 是带 JIT 的单文件程序，不能开 MemoryDenyWriteExecute；
+# 接 Codex 时它的沙箱要用命名空间，届时再评估 RestrictNamespaces
+MemoryMax=4G
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
