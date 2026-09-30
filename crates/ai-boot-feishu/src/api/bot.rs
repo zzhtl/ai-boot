@@ -7,7 +7,7 @@ use super::client::{ApiClient, ApiError, Call};
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotInfo {
     pub open_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::nullable")]
     pub app_name: String,
 }
 

@@ -22,6 +22,8 @@ rand = { version = "0.9", default-features = false, features = ["std", "std_rng"
 reqwest = { version = "0.13", default-features = false, features = [
     "http2",
     "json",
+    # 上传卡片里显示的图片（im/v1/images 只收 multipart）
+    "multipart",
     "query",
     "rustls",
     # 内网与企业环境可能装了自有 CA，统一读系统证书库，和 qtmcp 保持一致。

@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use rand::Rng as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -47,7 +46,8 @@ pub struct WsConfig {
     pub connect_timeout: Duration,
     /// 单条数据帧的处理预算。服务端 3 秒收不到 ACK 就重推，留出余量。
     pub handler_budget: Duration,
-    /// 致命错误后的退避。
+    /// 配置或鉴权类错误后的退避。和普通失败一样按 120 秒重试：后台把应用修好之后
+    /// 不用重启服务就能自己连上。
     pub fatal_backoff: Duration,
     /// 存活截止在 `2×PingInterval` 之外的宽限。
     pub liveness_grace: Duration,
@@ -61,7 +61,7 @@ impl WsConfig {
             base_url: Url::parse("https://open.feishu.cn/").expect("常量地址必然合法"),
             connect_timeout: Duration::from_secs(10),
             handler_budget: Duration::from_secs(2),
-            fatal_backoff: Duration::from_secs(600),
+            fatal_backoff: Duration::from_secs(DEFAULT_RECONNECT_INTERVAL_SECS),
             liveness_grace: Duration::from_secs(5),
         }
     }
@@ -134,14 +134,12 @@ impl ReconnectPolicy {
         }
     }
 
+    /// 断开后等 `nonce`（默认 30 秒）重连一次，还不行就每隔 `interval`（默认 120 秒）
+    /// 试一次，两个值都以服务端下发的为准。只有一个客户端，不需要官方 SDK 那样随机
+    /// 打散首次重连的时刻。
     fn next_delay(&mut self) -> Duration {
         let delay = if self.attempts == 0 {
-            let nonce_ms = u64::try_from(self.nonce.as_millis()).unwrap_or(u64::MAX);
-            if nonce_ms == 0 {
-                Duration::ZERO
-            } else {
-                Duration::from_millis(rand::rng().random_range(0..nonce_ms))
-            }
+            self.nonce
         } else {
             self.interval
         };
@@ -227,7 +225,7 @@ impl WsClient {
                     tracing::error!(
                         %reason,
                         backoff_secs = self.config.fatal_backoff.as_secs(),
-                        "长连接遇到配置或鉴权类错误，长间隔退避后再试"
+                        "长连接遇到配置或鉴权类错误，稍后再试"
                     );
                     self.config.fatal_backoff
                 }
@@ -573,19 +571,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_reconnect_is_jittered_then_the_interval_applies() {
+    fn reconnect_after_30_seconds_then_every_120() {
+        let mut policy = ReconnectPolicy::default();
+        let delays: Vec<u64> = (0..4).map(|_| policy.next_delay().as_secs()).collect();
+        assert_eq!(delays, [30, 120, 120, 120]);
+        policy.reset();
+        assert_eq!(policy.next_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_server_can_adjust_both_delays() {
         let mut policy = ReconnectPolicy::default();
         policy.apply(&ClientConfig {
             reconnect_interval: 7,
             reconnect_nonce: 3,
             ping_interval: 0,
         });
-        let first = policy.next_delay();
-        assert!(first < Duration::from_secs(3), "{first:?}");
+        assert_eq!(policy.next_delay(), Duration::from_secs(3));
         assert_eq!(policy.next_delay(), Duration::from_secs(7));
-        assert_eq!(policy.next_delay(), Duration::from_secs(7));
-        policy.reset();
-        assert!(policy.next_delay() < Duration::from_secs(3));
     }
 
     #[test]

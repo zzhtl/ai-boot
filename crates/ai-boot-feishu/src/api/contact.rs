@@ -7,14 +7,20 @@ use super::client::{ApiClient, ApiError, Call};
 /// 单次请求最多 50 个邮箱。
 const BATCH: usize = 50;
 
+/// 文档里有两种响应：旧的 `user_list`（`user_id_type=open_id` 时 open_id 放在
+/// `user_id` 里），新的 `items`（有单独的 `open_id`）。两种都认。
 #[derive(Deserialize)]
 struct BatchGetIdData {
     #[serde(default)]
     user_list: Vec<UserIdEntry>,
+    #[serde(default)]
+    items: Vec<UserIdEntry>,
 }
 
 #[derive(Deserialize)]
 struct UserIdEntry {
+    #[serde(default)]
+    open_id: Option<String>,
     #[serde(default)]
     user_id: Option<String>,
     #[serde(default)]
@@ -37,11 +43,20 @@ impl ApiClient {
             )
             .query("user_id_type", "open_id");
             let data: BatchGetIdData = self.call(call).await?;
-            found.extend(data.user_list.into_iter().filter_map(|entry| {
-                let email = entry.email.filter(|e| !e.is_empty())?;
-                let open_id = entry.user_id.filter(|id| !id.is_empty())?;
-                Some((email, open_id))
-            }));
+            found.extend(
+                data.user_list
+                    .into_iter()
+                    .chain(data.items)
+                    .filter_map(|entry| {
+                        let email = entry.email.filter(|e| !e.is_empty())?;
+                        let open_id = entry
+                            .open_id
+                            .filter(|id| !id.is_empty())
+                            .or(entry.user_id)
+                            .filter(|id| !id.is_empty())?;
+                        Some((email, open_id))
+                    }),
+            );
         }
         Ok(found)
     }
