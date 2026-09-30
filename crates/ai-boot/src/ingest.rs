@@ -5,12 +5,14 @@
 //!
 //! 这段逻辑跑在 ACK 的预算内（见 `WsConfig::handler_budget`），只做本地判断和
 //! SQLite 读写，不调用任何外部接口。落库失败会返回错误，ACK 带 500，由飞书
-//! 重推；落库成功后即便进程崩溃，重启时也能从收件箱恢复。
+//! 重推；落库成功后即便进程崩溃，重启时也能从收件箱恢复。唯一要调接口的判断
+//! （引用的是不是已被清理的机器人卡片）放到后台做，不占 ACK 的预算。
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use ai_boot_feishu::api::ApiClient;
 use ai_boot_feishu::event::{
     CARD_ACTION, CardAction, Envelope, MESSAGE_RECEIVE, Message, MessageReceived,
 };
@@ -21,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::callback::{Action, Toast};
 use crate::conversation::Job;
-use crate::store::{NewInput, Origin, Store, now_ms};
+use crate::store::{NewInput, Store, now_ms};
 use crate::whitelist::Whitelist;
 
 /// 等会话调度应答按钮的时间。飞书要求 3 秒内响应，ACK 本身的预算是 2 秒。
@@ -35,6 +37,14 @@ pub struct Ingest {
     jobs: mpsc::Sender<Job>,
     /// 回过「无权限」的人。每个进程周期只回一次，避免被人刷屏。
     denied: Mutex<HashSet<String>>,
+    /// 认引用的是不是机器人自己的卡片（卡片所在的会话过了保留期、库里已经查不到时）。
+    cards: Option<CardLookup>,
+}
+
+struct CardLookup {
+    api: Arc<ApiClient>,
+    /// 机器人发的消息，发送人是应用的 app_id。
+    app_id: String,
 }
 
 impl Ingest {
@@ -50,7 +60,13 @@ impl Ingest {
             bot_open_id,
             jobs,
             denied: Mutex::new(HashSet::new()),
+            cards: None,
         }
+    }
+
+    pub fn with_card_lookup(mut self, api: Arc<ApiClient>, app_id: String) -> Self {
+        self.cards = Some(CardLookup { api, app_id });
+        self
     }
 
     async fn on_message(&self, envelope: Envelope, raw: &str) -> Result<Option<Vec<u8>>, String> {
@@ -76,6 +92,13 @@ impl Ingest {
                 .await
                 .map_err(|err| format!("{err:#}"))?;
         if !addressed {
+            // 还没取到机器人自己的 open_id，认不出这条是不是 @ 了它：回 500 让飞书稍后
+            // 重推，别直接丢掉。只 @ 了人的消息才可能是，普通消息照常忽略
+            if self.bot_open_id.get().is_none() && !message.is_p2p() && !message.mentions.is_empty()
+            {
+                return Err("还没取到机器人信息，认不出是否 @ 了机器人，等飞书重推".to_owned());
+            }
+            self.check_quoted_card(&received, raw);
             return Ok(None);
         }
 
@@ -89,47 +112,53 @@ impl Ingest {
             return Ok(None);
         }
 
-        let inserted = self
-            .store
-            .insert_input(&NewInput {
-                message_id: &message.message_id,
-                chat_id: &message.chat_id,
-                chat_type: &message.chat_type,
-                sender_open_id: sender,
-                payload: raw,
-                received_at_ms: now_ms(),
-            })
+        enqueue(&self.store, &self.jobs, &received, raw)
             .await
             .map_err(|err| format!("{err:#}"))?;
-        if !inserted {
-            tracing::debug!(message_id = %message.message_id, "重复推送，已忽略");
-            return Ok(None);
-        }
-        tracing::info!(message_id = %message.message_id, chat_type = %message.chat_type, "收到消息");
-        let job = Job::Input {
-            message_id: message.message_id.clone(),
-        };
-        if self.jobs.try_send(job).is_err() {
-            tracing::warn!(message_id = %message.message_id, "处理队列已满，消息留在收件箱，重启后恢复");
-        }
         Ok(None)
     }
 
-    /// 群里没 @ 机器人的消息，也可能是追问：在机器人开的话题里说的话，或者
-    /// 引用了机器人的卡片。别人开的话题里，只有 @ 或引用卡片才算。
+    /// 群里没 @ 机器人的消息，也可能是追问：引用了机器人的卡片。机器人不开话题，
+    /// 话题里的消息和群里的一样，要 @ 或引用卡片才算。
     async fn is_follow_up(&self, message: &Message) -> anyhow::Result<bool> {
-        if let Some(thread) = message.thread() {
-            let root = message.root_id.as_deref().filter(|r| !r.is_empty());
-            if let Some(conversation) = self.store.find_conversation(Some(thread), root).await?
-                && conversation.origin == Origin::NewThread
-            {
-                return Ok(true);
-            }
-        }
         if let Some(parent) = message.parent_id.as_deref().filter(|p| !p.is_empty()) {
             return Ok(self.store.conversation_by_card(parent).await?.is_some());
         }
         Ok(false)
+    }
+
+    /// 白名单用户在群里引用了一条库里查不到的消息：可能是机器人的卡片，只是它所在的
+    /// 会话过了保留期被清掉了。要调接口才认得出，放到后台，认出来就当成一次提问。
+    fn check_quoted_card(&self, received: &MessageReceived, raw: &str) {
+        let Some(lookup) = &self.cards else {
+            return;
+        };
+        let message = &received.message;
+        let Some(parent) = message.parent_id.clone().filter(|p| !p.is_empty()) else {
+            return;
+        };
+        if message.is_p2p() || !self.whitelist.allows(&received.sender.sender_id.open_id) {
+            return;
+        }
+        let (api, app_id) = (Arc::clone(&lookup.api), lookup.app_id.clone());
+        let (store, jobs) = (self.store.clone(), self.jobs.clone());
+        let (received, raw) = (received.clone(), raw.to_owned());
+        tokio::spawn(async move {
+            let ours = match api.get_message(&parent).await {
+                Ok(items) => items.iter().any(|item| {
+                    item.message_id == parent
+                        && item.sender.sender_type == "app"
+                        && item.sender.id == app_id
+                }),
+                Err(err) => {
+                    tracing::warn!(%err, "查被引用的消息失败，按没引用机器人处理");
+                    false
+                }
+            };
+            if ours && let Err(err) = enqueue(&store, &jobs, &received, &raw).await {
+                tracing::error!("{err:#}");
+            }
+        });
     }
 
     async fn on_card_action(&self, envelope: Envelope) -> Result<Option<Vec<u8>>, String> {
@@ -185,6 +214,38 @@ impl Ingest {
     }
 }
 
+/// 落进收件箱、交给会话调度。重复推送的消息只落一次。
+async fn enqueue(
+    store: &Store,
+    jobs: &mpsc::Sender<Job>,
+    received: &MessageReceived,
+    raw: &str,
+) -> anyhow::Result<()> {
+    let message = &received.message;
+    let inserted = store
+        .insert_input(&NewInput {
+            message_id: &message.message_id,
+            chat_id: &message.chat_id,
+            chat_type: &message.chat_type,
+            sender_open_id: &received.sender.sender_id.open_id,
+            payload: raw,
+            received_at_ms: now_ms(),
+        })
+        .await?;
+    if !inserted {
+        tracing::debug!(message_id = %message.message_id, "重复推送，已忽略");
+        return Ok(());
+    }
+    tracing::info!(message_id = %message.message_id, chat_type = %message.chat_type, "收到消息");
+    let job = Job::Input {
+        message_id: message.message_id.clone(),
+    };
+    if jobs.try_send(job).is_err() {
+        tracing::warn!(message_id = %message.message_id, "处理队列已满，消息留在收件箱，重启后恢复");
+    }
+    Ok(())
+}
+
 /// 事件的结构骨架：保留字段名、null 和布尔，字符串与数字只留类型。解析失败时打进日志，
 /// 一眼看出是哪个字段和预期不符，又不把聊天内容写进日志。
 fn shape(value: &Value) -> Value {
@@ -228,6 +289,7 @@ impl FrameHandler for Ingest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Origin;
 
     const BOT: &str = "ou_bot";
     const BOSS: &str = "ou_boss";
@@ -430,9 +492,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn until_the_bot_id_is_known_group_mentions_are_not_trusted() {
+    async fn until_the_bot_id_is_known_group_mentions_are_left_for_a_redelivery() {
         let mut f = fixture(false).await;
-        handle(&f, event("om_4", BOSS, "user", "group", true)).await;
+        // 认不出 @ 的是不是机器人：回错误（ACK 500），飞书稍后重推，不能直接丢
+        let reply = f
+            .ingest
+            .handle(DataKind::Event, event("om_4", BOSS, "user", "group", true))
+            .await;
+        assert!(reply.is_err(), "{reply:?}");
+        assert_eq!(next_job(&mut f), None);
+        // 没 @ 任何人的群消息照常忽略
+        handle(&f, event("om_4b", BOSS, "user", "group", false)).await;
         assert_eq!(next_job(&mut f), None);
     }
 
@@ -458,50 +528,107 @@ mod tests {
         assert_eq!(next_job(&mut f), None);
     }
 
+    /// 机器人不开话题：有人在第一次提问底下开话题讨论，话题里的话和群里的一样，
+    /// 要 @ 或引用卡片才算追问，不然白名单用户说的每句话都会跑一轮。
     #[tokio::test]
-    async fn in_a_thread_the_bot_opened_no_mention_is_needed() {
+    async fn a_thread_under_the_first_question_needs_a_mention_like_the_rest_of_the_group() {
         let mut f = fixture(true).await;
         conversation(&f.store, "c1", Origin::NewThread, "omt_1", "om_root").await;
-        let follow_up = serde_json::json!({"thread_id": "omt_1", "root_id": "om_root"});
+        let in_thread = serde_json::json!({"thread_id": "omt_1", "root_id": "om_root"});
         handle(
             &f,
-            event_with("om_10", BOSS, "user", "group", false, follow_up.clone()),
-        )
-        .await;
-        assert_eq!(next_job(&mut f).as_deref(), Some("ask:om_10"));
-        // 外人在话题里说话照样不理
-        handle(
-            &f,
-            event_with("om_11", "ou_other", "user", "group", false, follow_up),
+            event_with("om_10", BOSS, "user", "group", false, in_thread.clone()),
         )
         .await;
         assert_eq!(next_job(&mut f), None);
-    }
-
-    #[tokio::test]
-    async fn before_the_thread_id_is_recorded_the_root_identifies_the_conversation() {
-        let mut f = fixture(true).await;
-        f.store
-            .create_conversation(&crate::store::NewConversation {
-                id: "c1",
-                chat_id: "oc_1",
-                chat_type: "group",
-                origin: Origin::NewThread,
-                thread_id: None,
-                root_message_id: "om_root",
-                owner_open_id: BOSS,
-                backend: "claude",
-                now_ms: 1,
-            })
-            .await
-            .expect("建会话");
-        let follow_up = serde_json::json!({"thread_id": "omt_new", "root_id": "om_root"});
+        let unrecorded = serde_json::json!({"thread_id": "omt_new", "root_id": "om_root"});
         handle(
             &f,
-            event_with("om_12", BOSS, "user", "group", false, follow_up),
+            event_with("om_12", BOSS, "user", "group", false, unrecorded),
         )
         .await;
-        assert_eq!(next_job(&mut f).as_deref(), Some("ask:om_12"));
+        assert_eq!(next_job(&mut f), None);
+        handle(
+            &f,
+            event_with("om_13", BOSS, "user", "group", true, in_thread),
+        )
+        .await;
+        assert_eq!(next_job(&mut f).as_deref(), Some("ask:om_13"), "@ 了就算");
+    }
+
+    /// 会话过了保留期被清掉，库里查不到它的卡片了：引用卡片追问要靠接口认出是机器人
+    /// 发的，认出来照样当成提问；引用别人的消息不算。
+    #[tokio::test]
+    async fn quoting_a_card_whose_conversation_was_purged_still_counts() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/open-apis/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"code": 0, "tenant_access_token": "t-x", "expire": 7200}),
+            ))
+            .mount(&server)
+            .await;
+        for (id, sender, sender_type) in [
+            ("om_old_card", "cli_x", "app"),
+            ("om_human", "ou_qa", "user"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/open-apis/im/v1/messages/{id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0, "msg": "ok", "data": {"items": [
+                        {"message_id": id, "msg_type": "interactive", "create_time": "1",
+                         "sender": {"id": sender, "sender_type": sender_type},
+                         "body": {"content": "{}"}}
+                    ]}
+                })))
+                .mount(&server)
+                .await;
+        }
+        let base = url::Url::parse(&format!("{}/", server.uri())).expect("地址");
+        let api = Arc::new(
+            ApiClient::new(base, "cli_x", secrecy::SecretString::from("s")).expect("客户端"),
+        );
+        let mut f = fixture(true).await;
+        f.ingest = f.ingest.with_card_lookup(api, "cli_x".to_owned());
+
+        let quote = |parent: &str| serde_json::json!({"parent_id": parent, "root_id": parent});
+        handle(
+            &f,
+            event_with("om_30", BOSS, "user", "group", false, quote("om_human")),
+        )
+        .await;
+        handle(
+            &f,
+            event_with("om_31", BOSS, "user", "group", false, quote("om_old_card")),
+        )
+        .await;
+        // 外人引用机器人的卡片照样不理
+        handle(
+            &f,
+            event_with(
+                "om_32",
+                "ou_other",
+                "user",
+                "group",
+                false,
+                quote("om_old_card"),
+            ),
+        )
+        .await;
+        let job = tokio::time::timeout(Duration::from_secs(5), f.jobs.recv())
+            .await
+            .expect("后台认出卡片后应当排上")
+            .expect("通道");
+        assert!(matches!(job, Job::Input { ref message_id } if message_id == "om_31"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(next_job(&mut f), None, "引用别人的消息不算");
+        assert_eq!(
+            f.store.unassigned_inputs().await.expect("查询"),
+            vec!["om_31".to_owned()]
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,10 @@
 //!   的存质量 80 的 JPEG——缩小后看不出和 90 的差别，体积小三成，飞书压过的截图原件
 //!   往往只有 75～80 的质量，按 90 重压反而比原图还大。
 //!
-//! 解码有尺寸和内存上限，挡住「小文件、超大画布」的图片。
+//! 长截图整张缩下来字就看不清了（1080×8000 缩成 270×2000），改成沿长边切成几段，
+//! 每段都在上限以内，相邻两段略有重叠；切出来的段按上面同样的规则编码。
+//!
+//! 解码有内存上限，挡住「小文件、超大画布」的图片。
 //!
 //! 上限出自 Claude 的视觉文档：一次请求超过 20 张图时每张的长边不能超过 2000 像素
 //! （之前轮次的图也算在内），一张图最多折算 4784 个视觉 token（28 像素一格），超出的
@@ -22,6 +25,7 @@ use image::{
     DynamicImage, ExtendedColorType, ImageEncoder as _, ImageFormat, ImageReader, Limits, Rgb,
     RgbImage,
 };
+use tokio::sync::Semaphore;
 
 /// 长边上限。按这个处理，就不用管一次请求里会累积多少张图。
 pub const MAX_EDGE: u32 = 2000;
@@ -30,10 +34,19 @@ const MAX_VISUAL_TOKENS: u32 = 4784;
 const PATCH: u32 = 28;
 /// 单张图的字节上限：API 按 base64 之后 5 MB 算，留出编码膨胀的余量。
 const MAX_BYTES: usize = 3_750_000;
-const MAX_CANVAS: u32 = 16_384;
+/// 解码的画布边长和内存上限。长截图能有几万像素高，边长放宽，总像素由内存上限兜住。
+const MAX_CANVAS: u32 = 65_535;
 const MAX_ALLOC: u64 = 256 * 1024 * 1024;
 /// 照片、以及无损放不下时依次尝试的 JPEG 质量。
 const JPEG_QUALITIES: [u8; 3] = [80, 72, 65];
+/// 整张缩放后短边不到这么多像素，字就看不清了，改成切段。
+const READABLE_EDGE: u32 = 800;
+/// 一张图最多切几段：每段都占一张图的名额。再长的先整体缩一点，让这么多段刚好装下。
+const MAX_TILES: u32 = 6;
+
+/// 同时解码、压缩的图片数：一张手机照片解码后要几十 MB 内存，不能跟着下载、解析的
+/// 并发走。聊天里的图和文档里嵌的图共用。
+pub static WORKERS: Semaphore = Semaphore::const_new(2);
 
 /// 常见图片格式的魔数。
 pub fn is_image(bytes: &[u8]) -> bool {
@@ -52,12 +65,37 @@ pub fn is_image(bytes: &[u8]) -> bool {
         || bmp
 }
 
-/// 缩放、压缩。返回要保存的内容和扩展名。
+/// 缩放、压缩成一张。返回要保存的内容和扩展名。
 ///
 /// 不管要不要缩放都先完整解码一遍：坏图在这里挡掉，不会被带进会话，让之后每一轮
 /// 请求都因为这张图报错。
 pub fn normalize(bytes: Vec<u8>) -> Result<(Vec<u8>, &'static str), String> {
-    let mut reader = ImageReader::new(Cursor::new(&bytes))
+    let (image, format) = decode(&bytes)?;
+    scale(image, format, bytes)
+}
+
+/// 同 `normalize`，但整张缩放后看不清字的长截图沿长边切成几段（从上到下、从左到右）。
+pub fn normalize_tiled(bytes: Vec<u8>) -> Result<Vec<(Vec<u8>, &'static str)>, String> {
+    let (image, format) = decode(&bytes)?;
+    let Some(tiles) = tiles(image.width(), image.height()) else {
+        return Ok(vec![scale(image, format, bytes)?]);
+    };
+    tiles
+        .iter()
+        .map(|tile| {
+            let part = image.crop_imm(tile.x, tile.y, tile.width, tile.height);
+            let part = if tile.target == (tile.width, tile.height) {
+                part
+            } else {
+                resize(&part, tile.target)?
+            };
+            encode(&part, format, None)
+        })
+        .collect()
+}
+
+fn decode(bytes: &[u8]) -> Result<(DynamicImage, ImageFormat), String> {
+    let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|err| format!("读取图片失败：{err}"))?;
     let format = reader
@@ -71,44 +109,64 @@ pub fn normalize(bytes: Vec<u8>) -> Result<(Vec<u8>, &'static str), String> {
     let image = reader
         .decode()
         .map_err(|err| format!("图片解码失败：{err}"))?;
+    Ok((image, format))
+}
+
+/// 整张缩放到上限以内再编码；不用缩放的，原文件也是候选。
+fn scale(
+    image: DynamicImage,
+    format: ImageFormat,
+    bytes: Vec<u8>,
+) -> Result<(Vec<u8>, &'static str), String> {
     let (width, height) = (image.width(), image.height());
     let target = fit(width, height);
-    let resized = target != (width, height);
-    let image = if resized {
-        resize(&image, target)?
-    } else {
-        image
-    };
+    if target == (width, height) {
+        return encode(&image, format, Some(bytes));
+    }
+    encode(&resize(&image, target)?, format, None)
+}
+
+/// 编码。`original` 是像素没动过时的原文件。
+fn encode(
+    image: &DynamicImage,
+    format: ImageFormat,
+    original: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, &'static str), String> {
     if format == ImageFormat::Jpeg {
-        if !resized && bytes.len() <= MAX_BYTES {
-            return Ok((bytes, "jpg"));
-        }
-        return jpeg(&image);
+        return match original {
+            Some(bytes) if bytes.len() <= MAX_BYTES => Ok((bytes, "jpg")),
+            _ => jpeg(image),
+        };
     }
     // 无损的候选：WebP 无损总要试；没缩放时原图本身就是一个（深色终端截图 PNG 往往
-    // 比 WebP 还小），缩放过的再试一次 PNG
-    let mut best = (webp_lossless(&image)?, "webp");
-    let original = match format {
-        ImageFormat::Png => Some("png"),
-        ImageFormat::Gif => Some("gif"),
-        ImageFormat::WebP => Some("webp"),
-        _ => None,
-    };
-    if resized {
-        let png = png(&image)?;
-        if png.len() < best.0.len() {
-            best = (png, "png");
+    // 比 WebP 还小），缩放过、切出来的再试一次 PNG
+    let mut best = (webp_lossless(image)?, "webp");
+    match original {
+        Some(bytes) => {
+            let ext = match format {
+                ImageFormat::Png => Some("png"),
+                ImageFormat::Gif => Some("gif"),
+                ImageFormat::WebP => Some("webp"),
+                _ => None,
+            };
+            if let Some(ext) = ext
+                && bytes.len() < best.0.len()
+            {
+                best = (bytes, ext);
+            }
         }
-    } else if let Some(ext) = original
-        && bytes.len() < best.0.len()
-    {
-        best = (bytes, ext);
+        None => {
+            let png = png(image)?;
+            if png.len() < best.0.len() {
+                best = (png, "png");
+            }
+        }
     }
     if best.0.len() <= MAX_BYTES {
         return Ok(best);
     }
     // 噪点很多的大图无损放不下，只能有损
-    jpeg(&image)
+    jpeg(image)
 }
 
 /// SIMD 实现的 Lanczos3（默认算法；带透明通道的按预乘处理，边缘不发黑）。
@@ -142,6 +200,75 @@ fn fit(width: u32, height: u32) -> (u32, u32) {
 
 fn tokens(width: u32, height: u32) -> u32 {
     width.div_ceil(PATCH) * height.div_ceil(PATCH)
+}
+
+/// 切出的一段：在原图里的位置和大小，以及要缩放到的尺寸。
+#[derive(Debug, PartialEq, Eq)]
+struct Tile {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    target: (u32, u32),
+}
+
+/// 长截图的切法。整张缩放后还看得清、只缩了一点（切开得不偿失）时返回 `None`。
+fn tiles(width: u32, height: u32) -> Option<Vec<Tile>> {
+    let (short, long) = (width.min(height), width.max(height));
+    let fitted = fit(width, height);
+    let fitted_short = fitted.0.min(fitted.1);
+    if fitted_short >= READABLE_EDGE || fitted_short * 4 >= short * 3 {
+        return None;
+    }
+    // 每段的短边不超过长边上限；段长取视觉 token 允许的最大值
+    let mut scale = (f64::from(MAX_EDGE) / f64::from(short)).min(1.0);
+    let (short_target, span, step, count) = loop {
+        let short_target = scaled(short, scale);
+        let rows = MAX_VISUAL_TOKENS / short_target.div_ceil(PATCH);
+        let span_target = MAX_EDGE.min(rows * PATCH);
+        // 一段在原图里有多长（浮点转整数是饱和的）
+        let span = ((f64::from(span_target) / scale).floor() as u32).clamp(1, long);
+        let step = span - span / 20;
+        let count = 1 + (long - span).div_ceil(step);
+        if count <= MAX_TILES {
+            break (short_target, span, step, count);
+        }
+        // 段数超了：整体再缩一点，1080×13000 这样缩到 900 多宽切六段，字仍然看得清，
+        // 整张缩放只剩一百多宽
+        scale *= 0.95;
+        if scaled(short, scale) <= fitted_short {
+            return None;
+        }
+    };
+    if count < 2 {
+        return None;
+    }
+    let span_scaled = scaled(span, scale);
+    Some(
+        (0..count)
+            .map(|i| {
+                // 最后一段贴着末尾，和前一段重叠得多一些
+                let start = (i * step).min(long - span);
+                if height >= width {
+                    Tile {
+                        x: 0,
+                        y: start,
+                        width,
+                        height: span,
+                        target: (short_target, span_scaled),
+                    }
+                } else {
+                    Tile {
+                        x: start,
+                        y: 0,
+                        width: span,
+                        height,
+                        target: (span_scaled, short_target),
+                    }
+                }
+            })
+            .collect(),
+    )
 }
 
 /// 缩放后的边长，落在 [1, 原边长] 内（浮点转整数是饱和的）。
@@ -327,6 +454,86 @@ mod tests {
             side > 1900 && tokens(side, side) <= MAX_VISUAL_TOKENS,
             "{side}"
         );
+    }
+
+    #[test]
+    fn tall_screenshots_are_cut_into_readable_tiles() {
+        // 1080×8000 的切法见下一个测试；这里用窄图，debug 下编解码 WebP 很慢
+        let bytes = encoded(200, 5700, ImageFormat::Png);
+        let tiles = normalize_tiled(bytes.clone()).expect("处理");
+        assert_eq!(tiles.len(), 3, "整张缩放会变成 70×2000");
+        let source = image::load_from_memory(&bytes).expect("原图").to_rgb8();
+        for (i, (out, ext)) in tiles.iter().enumerate() {
+            assert!(
+                matches!(*ext, "webp" | "png"),
+                "无损来源切出来也是无损：{ext}"
+            );
+            let tile = image::load_from_memory(out).expect("能解码").to_rgb8();
+            assert_eq!(tile.dimensions(), (200, 2000), "第 {i} 段不用缩放");
+            // 每段比上一段往下 1900（重叠 5%），最后一段贴着末尾
+            let top = [0, 1900, 3700][i];
+            let expected = image::imageops::crop_imm(&source, 0, top, 200, 2000).to_image();
+            assert_eq!(tile, expected, "第 {i} 段像素逐位一致");
+        }
+    }
+
+    #[test]
+    fn tiles_respect_the_limits_and_cover_the_whole_image() {
+        for (w, h) in [
+            (1080, 8000),
+            (600, 3000),
+            (2400, 9000),
+            (5120, 1440),
+            (1000, 2800),
+            (1080, 11_500),
+            // 超过六段的整体再缩一点：宽度仍远比整张缩放（54 像素）清楚
+            (1080, 20_000),
+        ] {
+            let tiles = tiles(w, h).unwrap_or_else(|| panic!("{w}x{h} 应当切段"));
+            let long = w.max(h);
+            let mut covered = 0;
+            for tile in &tiles {
+                let (tw, th) = tile.target;
+                assert!(tw.max(th) <= MAX_EDGE, "{w}x{h}: {tile:?}");
+                assert!(tokens(tw, th) <= MAX_VISUAL_TOKENS, "{w}x{h}: {tile:?}");
+                assert!(tile.x + tile.width <= w && tile.y + tile.height <= h);
+                let (start, span) = if h >= w {
+                    (tile.y, tile.height)
+                } else {
+                    (tile.x, tile.width)
+                };
+                assert!(start < covered || covered == 0, "相邻两段有重叠：{w}x{h}");
+                covered = start + span;
+            }
+            assert_eq!(covered, long, "{w}x{h} 切到了末尾");
+            assert!(tiles.len() <= MAX_TILES as usize);
+            let (fw, fh) = fit(w, h);
+            let tile_short = tiles[0].target.0.min(tiles[0].target.1);
+            assert!(tile_short > fw.min(fh), "{w}x{h}: 切段要比整张缩放清楚");
+        }
+        let long_one = tiles(1080, 20_000).expect("切段");
+        assert_eq!(long_one.len(), MAX_TILES as usize);
+        assert!(long_one[0].target.0 >= 550, "{:?}", long_one[0]);
+        // 手机截图、普通大图整张缩放就看得清
+        for (w, h) in [(1170, 2532), (1080, 2400), (3840, 2160), (700, 2100)] {
+            assert_eq!(tiles(w, h), None, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn tiles_of_photos_are_jpeg_and_ordinary_images_stay_whole() {
+        let tiles = normalize_tiled(encoded(1080, 5000, ImageFormat::Jpeg)).expect("处理");
+        assert_eq!(tiles.len(), 3);
+        assert!(tiles.iter().all(|(_, ext)| *ext == "jpg"));
+        let bytes = encoded(320, 200, ImageFormat::Png);
+        let whole = normalize_tiled(bytes.clone()).expect("处理");
+        assert_eq!(whole, vec![normalize(bytes).expect("处理")]);
+    }
+
+    #[test]
+    fn images_taller_than_the_old_canvas_limit_still_decode() {
+        let (out, _) = normalize(encoded(100, 17_000, ImageFormat::Png)).expect("能处理");
+        assert_eq!(dimensions(&out), (11, 2000));
     }
 
     #[test]

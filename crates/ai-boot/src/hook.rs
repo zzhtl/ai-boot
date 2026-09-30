@@ -15,7 +15,7 @@ use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ai_boot_agent::policy::{self, Decision, HookCall};
+use ai_boot_agent::policy::{self, Decision, HookCall, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -27,6 +27,9 @@ pub struct HookArgs {
     /// 本轮的工作目录：文件工具只能读这里面的东西
     #[arg(long)]
     workdir: PathBuf,
+    /// 工作目录外另外放开读的目录：CLI 把超大的工具结果存成文件放在这里
+    #[arg(long)]
+    read_dir: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -83,7 +86,10 @@ fn respond(args: &HookArgs, raw: &str) -> Result<Option<String>, String> {
             tool_name: &input.tool_name,
             tool_input: &input.tool_input,
         },
-        &args.workdir,
+        Scope {
+            workdir: &args.workdir,
+            readable: &args.read_dir,
+        },
     );
     let output = match (input.hook_event_name.as_str(), decision) {
         (_, Decision::Abstain) => return Ok(None),

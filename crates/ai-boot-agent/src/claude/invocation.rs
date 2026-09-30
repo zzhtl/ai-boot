@@ -9,6 +9,13 @@
 //!   分类器可能拦下写操作（实测放行后写操作不再经过它）。
 //! - `--include-partial-messages`：增量事件里能看出模型在思考还是在写结论，进度卡据此
 //!   显示阶段；长时间一条输出都没有，才说明真的卡住了。
+//! - `--system-prompt-snapshot off`：默认 CLI 在会话第一次请求时把系统提示（含追加的
+//!   规则）记下来，之后续接一直用这份，规则改了老会话用不上（2.1.285 实测）。关掉后
+//!   每次按本次传入的规则渲染。
+//! - `--autocompact`：一轮里上下文涨过这个数就先压缩再继续。每次请求都要带上整段会话，
+//!   窗口越大每一步越慢；轮与轮之间由编排层按上下文大小换新会话。
+//! - `--add-dir`：超大的工具结果 CLI 存成文件、只回一个路径，文件在工作目录外；
+//!   不放开，模型就读不到这份结果（线上出现过）。
 //! - prompt 不在这里：它走 stdin。
 
 use std::path::Path;
@@ -17,6 +24,8 @@ use crate::TurnRequest;
 
 /// 模型能用的内置工具：只有读，且被 `--restricted` 限定在工作目录内。
 const TOOLS: &str = "Read,Glob,Grep";
+/// 自动压缩的窗口（token）。
+const AUTOCOMPACT_TOKENS: &str = "200000";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Invocation {
@@ -29,11 +38,13 @@ pub(crate) enum SessionArg<'a> {
 }
 
 impl Invocation {
+    /// `results_dir` 是 CLI 存放超大工具结果的目录，给了就放开给文件工具读。
     pub(crate) fn build(
         request: &TurnRequest,
         session: SessionArg<'_>,
         mcp_config: &Path,
         settings: &Path,
+        results_dir: Option<&Path>,
     ) -> Self {
         let mut args: Vec<String> = Vec::with_capacity(32);
         let mut push = |flag: &str, value: Option<String>| {
@@ -57,6 +68,11 @@ impl Invocation {
         push("--disable-slash-commands", None);
         push("--permission-mode", Some("auto".into()));
         push("--permission-prompts", Some("none".into()));
+        push("--system-prompt-snapshot", Some("off".into()));
+        push("--autocompact", Some(AUTOCOMPACT_TOKENS.into()));
+        if let Some(dir) = results_dir {
+            push("--add-dir", Some(dir.display().to_string()));
+        }
         if !request.mcp_servers.is_empty() {
             let servers: Vec<String> = request
                 .mcp_servers
@@ -152,6 +168,7 @@ mod tests {
             SessionArg::New("s-1"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
+            Some(Path::new("/c/projects/-w/s-1/tool-results")),
         );
         for flag in [
             "-p",
@@ -169,6 +186,13 @@ mod tests {
         assert_eq!(value_of(&inv, "--session-id"), Some("s-1"));
         assert_eq!(value_of(&inv, "--max-budget-usd"), Some("2.500000"));
         assert_eq!(value_of(&inv, "--effort"), Some("high"));
+        // 规则改了老会话也要按新的来；超大工具结果所在的目录要能读
+        assert_eq!(value_of(&inv, "--system-prompt-snapshot"), Some("off"));
+        assert_eq!(value_of(&inv, "--autocompact"), Some(AUTOCOMPACT_TOKENS));
+        assert_eq!(
+            value_of(&inv, "--add-dir"),
+            Some("/c/projects/-w/s-1/tool-results")
+        );
     }
 
     #[test]
@@ -179,6 +203,7 @@ mod tests {
             SessionArg::Resume("s-2"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
+            None,
         );
         assert!(!inv.args().iter().any(|a| a == "--allowedTools"));
         assert!(
@@ -198,6 +223,7 @@ mod tests {
             SessionArg::Resume("s-2"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
+            None,
         );
         assert_eq!(value_of(&inv, "--allowedTools"), Some("mcp__qtmcp"));
         assert!(!inv.args().iter().any(|a| a.contains("机密的群聊内容")));

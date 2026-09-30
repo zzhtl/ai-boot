@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use super::{Output, TEXT_CHARS, Tools, clip_chars, run};
+use super::{Output, TEXT_BYTES, Tools, clip_bytes, run};
 
 const TEXT_TIMEOUT: Duration = Duration::from_secs(30);
 const RENDER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -28,11 +28,11 @@ pub async fn extract(path: &Path, out_dir: &Path, tools: &Tools) -> Result<Outpu
     let text = String::from_utf8_lossy(&raw).replace('\u{c}', "\n");
     let meaningful = text.chars().filter(|c| !c.is_whitespace()).count();
     if meaningful >= MIN_TEXT_CHARS {
-        let (text, cut) = clip_chars(text.trim(), TEXT_CHARS);
+        let (text, cut) = clip_bytes(text.trim(), TEXT_BYTES);
         return Ok(Output {
             text,
-            images: Vec::new(),
             note: cut.then(|| "内容较长，只放了前面一部分，完整内容见原件".to_owned()),
+            ..Output::default()
         });
     }
 
@@ -60,6 +60,7 @@ pub async fn extract(path: &Path, out_dir: &Path, tools: &Tools) -> Result<Outpu
             images.len()
         )),
         images,
+        saved: None,
     })
 }
 
@@ -136,6 +137,7 @@ pub(super) mod tests {
         Tools {
             office_legacy: true,
             scratch: dir.to_path_buf(),
+            program: PathBuf::from("ai-boot"),
         }
     }
 

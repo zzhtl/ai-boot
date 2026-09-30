@@ -2,8 +2,10 @@
 //! 原件留在工作目录里给 Claude 用 Grep 查。
 //!
 //! 文件内容都是不可信输入：优先用纯 Rust 解析；外部工具（poppler、soffice）一律
-//! 清空环境、限时、限输出，超时即杀。解压类格式先按声明的解压后大小把关。
+//! 清空环境、限时、限输出，超时即杀。解压类格式先按声明的解压后大小把关；表格在
+//! 限了内存的子进程里解析。
 
+mod archive;
 mod image;
 mod office;
 mod pdf;
@@ -14,14 +16,17 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use rustix::process::{Pid, Signal, kill_process_group};
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
-pub use image::{is_image, normalize};
+pub use image::{WORKERS as IMAGE_WORKERS, is_image, normalize, normalize_tiled};
+pub use sheet::child as sheet_child;
 
-/// 单个文件解析出的文字上限（字符）。更长的先压缩（日志保留头尾和出错的行），
-/// 放进 prompt 时各层还有各自的预算。
-pub const TEXT_CHARS: usize = 24 * 1024;
+/// 单个文件解析出的文字上限（字节）。更长的先压缩（日志保留头尾和出错的行）；prompt 里
+/// 各层的预算也按字节算，按字符截的话中文要超出三倍，压缩好的结尾又被截掉。
+pub const TEXT_BYTES: usize = 24 * 1024;
 /// zip 类文档里单个 XML 解压后的上限。
 const XML_LIMIT: u64 = 32 * 1024 * 1024;
 /// 外部命令的 PATH：不继承服务自己的环境。
@@ -34,17 +39,21 @@ pub struct Tools {
     pub office_legacy: bool,
     /// 外部命令的临时目录（soffice 的配置目录也放这里）。
     pub scratch: PathBuf,
+    /// ai-boot 自己的可执行文件：表格在它的 `sheet` 子命令里解析。
+    pub program: PathBuf,
 }
 
 /// 解析结果。
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
-    /// 给模型看的文字，已压缩到 `TEXT_CHARS` 以内。
+    /// 给模型看的文字，已压缩到 `TEXT_BYTES` 以内。
     pub text: String,
-    /// 解析时生成的图片（扫描版 PDF 的页面），放在 `out_dir` 里。
+    /// 解析时生成的图片（扫描版 PDF 的页面、文档里嵌的图），放在 `out_dir` 里。
     pub images: Vec<PathBuf>,
     /// 处理说明：压缩了、只列了清单、转成了图片……
     pub note: Option<String>,
+    /// 另存的全文（在 `out_dir` 里）：原件模型读不了（docx 这类 zip）时代替原件。
+    pub saved: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,16 +65,16 @@ enum Kind {
     Sheet,
     /// 旧版或 OpenDocument 文档，先转成括号里的格式。
     Legacy(&'static str),
-    /// 能列清单的 zip。
-    Zip,
-    /// 其他压缩包。
-    Archive,
+    /// 能解开的压缩包。
+    Archive(archive::Format),
+    /// 解不开的压缩包，括号里是格式名。
+    Unsupported(&'static str),
     Image,
     Binary,
 }
 
 /// 解析一个文件。`path` 是已经存进工作目录的原件，`out_dir` 放派生出的文件
-/// （页面图片），也必须在工作目录里。
+/// （页面图片、全文、解开的压缩包），也必须在工作目录里。
 pub async fn extract(
     path: &Path,
     name: &str,
@@ -74,21 +83,26 @@ pub async fn extract(
     tools: &Tools,
 ) -> Result<Output, String> {
     match detect(name, &bytes) {
-        Kind::Text => Ok(text::extract(&bytes)),
+        Kind::Text => blocking(move || text::extract(&bytes)).await,
         Kind::Pdf => pdf::extract(path, out_dir, tools).await,
-        Kind::Docx => blocking(move || office::docx(&bytes)).await,
-        Kind::Pptx => blocking(move || office::pptx(&bytes)).await,
-        Kind::Sheet => blocking(move || sheet::extract(bytes)).await,
-        Kind::Legacy(target) if tools.office_legacy => office::legacy(path, target, tools).await,
+        Kind::Docx => office::read(path, "docx", bytes, out_dir).await,
+        Kind::Pptx => office::read(path, "pptx", bytes, out_dir).await,
+        Kind::Sheet => sheet::isolated(path, tools).await,
+        Kind::Legacy(target) if tools.office_legacy => {
+            office::legacy(path, target, out_dir, tools).await
+        }
         Kind::Legacy(_) => Err("旧版 Office 文档的转换没有开启".to_owned()),
-        Kind::Zip => blocking(move || office::zip_listing(&bytes)).await,
-        Kind::Archive => Err("压缩包没有解压，请把里面的文件单独发出来".to_owned()),
+        Kind::Archive(format) => archive::extract(format, path, name, bytes, out_dir).await,
+        Kind::Unsupported(format) => Err(format!(
+            "{format} 格式的压缩包解不开，请改成 zip 或 tar.gz 再发（其他附件照常读取）"
+        )),
         Kind::Image => Err("这是图片，不按文件解析".to_owned()),
         Kind::Binary => Err("二进制文件，无法解析".to_owned()),
     }
 }
 
-/// 按内容（魔数）判断，扩展名只用来区分 OLE2 里的 doc/xls/ppt。
+/// 按内容（魔数）判断，扩展名只用来区分 OLE2 里的 doc/xls/ppt。是不是文本要完整
+/// 解码才知道，留给解析时判断，这里只挡掉明显的二进制。
 fn detect(name: &str, bytes: &[u8]) -> Kind {
     let ext = Path::new(name)
         .extension()
@@ -113,17 +127,25 @@ fn detect(name: &str, bytes: &[u8]) -> Kind {
             _ => Kind::Binary,
         };
     }
-    const ARCHIVES: [&[u8]; 5] = [
-        &[0x1F, 0x8B],                         // gzip
-        b"7z\xBC\xAF\x27\x1C",                 // 7z
-        b"Rar!\x1A\x07",                       // rar
-        b"BZh",                                // bzip2
-        &[0xFD, b'7', b'z', b'X', b'Z', 0x00], // xz
-    ];
-    if ARCHIVES.iter().any(|magic| bytes.starts_with(magic)) || ext == "tar" {
-        return Kind::Archive;
+    if bytes.starts_with(&[0x1F, 0x8B]) {
+        return Kind::Archive(archive::Format::Gzip);
     }
-    if text::decode(bytes).is_some() {
+    if archive::is_tar(bytes) || ext == "tar" {
+        return Kind::Archive(archive::Format::Tar);
+    }
+    const UNSUPPORTED: [(&[u8], &str); 4] = [
+        (b"7z\xBC\xAF\x27\x1C", "7z"),
+        (b"Rar!\x1A\x07", "rar"),
+        (b"BZh", "bzip2"),
+        (&[0xFD, b'7', b'z', b'X', b'Z', 0x00], "xz"),
+    ];
+    if let Some(format) = UNSUPPORTED
+        .iter()
+        .find_map(|&(magic, format)| bytes.starts_with(magic).then_some(format))
+    {
+        return Kind::Unsupported(format);
+    }
+    if text::maybe_text(bytes) {
         return Kind::Text;
     }
     Kind::Binary
@@ -158,10 +180,21 @@ async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        // 自成进程组：soffice 是个 shell 包装，真正干活的 soffice.bin 是它的子进程，只杀
+        // 直接子进程会留下孤儿，一直占着配置目录的锁，之后的转换全卡住
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|err| format!("启动 {program} 失败：{err}"))?;
+    // 不管怎么结束（正常退出、超时、调用方不等了）都对整组补一刀；在 child 之后声明，
+    // 先于它析构
+    let group = Group(
+        child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(Pid::from_raw),
+    );
     let Some(mut stdout) = child.stdout.take() else {
         return Err(format!("拿不到 {program} 的输出"));
     };
@@ -175,7 +208,7 @@ async fn run(
         if output.len() > cap {
             // 输出太长：够用了，不等它写完
             output.truncate(cap);
-            let _ = child.start_kill();
+            group.kill();
             let _ = child.wait().await;
             return Ok(output);
         }
@@ -191,17 +224,70 @@ async fn run(
     };
     match tokio::time::timeout(timeout, work).await {
         Ok(result) => result,
-        // 超时：future 被丢弃，kill_on_drop 负责杀进程
+        // 超时：整组由 group 杀掉，直接子进程由 kill_on_drop 回收
         Err(_) => Err(format!("{program} 超过 {} 秒没有完成", timeout.as_secs())),
     }
 }
 
-/// 截到 `limit` 个字符。
-fn clip_chars(text: &str, limit: usize) -> (String, bool) {
-    match text.char_indices().nth(limit) {
-        Some((end, _)) => (text[..end].to_owned(), true),
-        None => (text.to_owned(), false),
+/// 外部命令所在的进程组，析构时整组 SIGKILL。组里还有成员时组 ID 不会被系统复用，
+/// 这一刀只会落在它自己拉起的进程上；没有成员时返回 ESRCH。
+struct Group(Option<Pid>);
+
+impl Group {
+    fn kill(&self) {
+        if let Some(pid) = self.0
+            && let Err(err) = kill_process_group(pid, Signal::KILL)
+            && err != rustix::io::Errno::SRCH
+        {
+            tracing::debug!(%err, "对进程组发送 SIGKILL 失败");
+        }
     }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// 截到 `limit` 个字节以内，落在字符边界上。
+pub(crate) fn clip_bytes(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_owned(), false);
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
+/// 文件名来自聊天或压缩包，是不可信输入：只留字母数字（含中文）和 `.-_`，不能出现
+/// 路径分隔。
+pub fn sanitize(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.');
+    let mut kept: String = cleaned
+        .chars()
+        .rev()
+        .take(80)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if kept.is_empty() {
+        kept = "file".to_owned();
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -223,14 +309,59 @@ mod tests {
             ),
             Kind::Legacy("docx")
         );
-        assert_eq!(detect("a.gz", &[0x1F, 0x8B, 8, 0]), Kind::Archive);
+        assert_eq!(
+            detect("a.txt", &[0x1F, 0x8B, 8, 0]),
+            Kind::Archive(archive::Format::Gzip)
+        );
+        assert_eq!(
+            detect("a.log", b"7z\xBC\xAF\x27\x1C\x00\x04"),
+            Kind::Unsupported("7z")
+        );
         assert_eq!(detect("a.dat", &[0, 1, 2, 3, 0, 0, 0xFF]), Kind::Binary);
+    }
+
+    #[tokio::test]
+    async fn unsupported_archives_name_the_format() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let tools = Tools {
+            office_legacy: false,
+            scratch: dir.path().to_path_buf(),
+            program: PathBuf::from("ai-boot"),
+        };
+        let path = dir.path().join("logs.rar");
+        let err = extract(
+            &path,
+            "logs.rar",
+            b"Rar!\x1A\x07\x01\x00".to_vec(),
+            dir.path(),
+            &tools,
+        )
+        .await
+        .expect_err("不支持");
+        assert!(
+            err.contains("rar") && err.contains("其他附件照常读取"),
+            "{err}"
+        );
     }
 
     #[test]
     fn clipping_respects_char_boundaries() {
-        assert_eq!(clip_chars("中文日志", 2), ("中文".to_owned(), true));
-        assert_eq!(clip_chars("ab", 5), ("ab".to_owned(), false));
+        assert_eq!(clip_bytes("中文日志", 7), ("中文".to_owned(), true));
+        assert_eq!(clip_bytes("ab", 5), ("ab".to_owned(), false));
+    }
+
+    #[test]
+    fn file_names_cannot_escape_the_directory() {
+        assert_eq!(sanitize("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize("错误 日志(1).log"), "错误_日志_1_.log");
+        assert_eq!(sanitize("..."), "file");
+        assert_eq!(
+            sanitize(&format!("{}.log", "长".repeat(200)))
+                .chars()
+                .count(),
+            80
+        );
+        assert!(sanitize(&format!("{}.log", "长".repeat(200))).ends_with(".log"));
     }
 
     #[tokio::test]
@@ -244,6 +375,55 @@ mod tests {
             .expect_err("应当超时");
         assert!(err.contains("没有完成"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// 像 soffice 那样的包装脚本：拉起真正干活的子进程后等它，子进程的 pid 写进文件。
+    fn wrapper(dir: &Path) -> (Command, PathBuf) {
+        let pid_file = dir.join("worker.pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pid_file.display()));
+        (command, pid_file)
+    }
+
+    /// 进程不在了（或者只剩还没被回收的僵尸）。
+    async fn gone(pid_file: &Path) -> bool {
+        let pid = std::fs::read_to_string(pid_file).expect("pid 文件");
+        let stat = format!("/proc/{}/stat", pid.trim());
+        for _ in 0..100 {
+            match std::fs::read_to_string(&stat) {
+                Err(_) => return true,
+                Ok(stat)
+                    if stat
+                        .rsplit(')')
+                        .next()
+                        .is_some_and(|s| s.trim_start().starts_with('Z')) =>
+                {
+                    return true;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn the_whole_process_group_dies_on_timeout_and_when_abandoned() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (command, pid_file) = wrapper(dir.path());
+        let err = run(command, dir.path(), Duration::from_millis(500), 1024)
+            .await
+            .expect_err("应当超时");
+        assert!(err.contains("没有完成"), "{err}");
+        assert!(gone(&pid_file).await, "超时后包装脚本拉起的子进程也要杀掉");
+
+        // 调用方不等了（整轮被取消）：future 被丢弃时同样整组杀掉
+        std::fs::remove_file(&pid_file).expect("删掉旧 pid");
+        let (command, pid_file) = wrapper(dir.path());
+        let abandoned = run(command, dir.path(), Duration::from_secs(30), 1024);
+        let _ = tokio::time::timeout(Duration::from_millis(500), abandoned).await;
+        assert!(gone(&pid_file).await, "future 被丢弃后子进程也要杀掉");
     }
 
     #[tokio::test]

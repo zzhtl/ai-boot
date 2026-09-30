@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub use event::{Activity, AgentEvent, FailKind, McpStatus, Outcome, Started, Step, Usage};
+pub use event::{Activity, AgentEvent, Draft, FailKind, McpStatus, Outcome, Started, Step, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {

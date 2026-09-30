@@ -75,6 +75,12 @@ enum Command {
     /// Agent CLI 调用的工具判决 hook（由 CLI 按 hook 配置调起，不要手动运行）
     #[command(hide = true)]
     Hook(hook::HookArgs),
+    /// 在限了内存的子进程里解析表格（由服务自己调起，不要手动运行）
+    #[command(hide = true)]
+    Sheet {
+        /// 表格文件
+        path: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -82,6 +88,8 @@ fn main() -> ExitCode {
         // hook 是每次工具调用都要起一次的短命进程，stdout 专用于判决：
         // 不初始化日志，也不构建运行时
         Command::Hook(args) => hook::run(&args),
+        // 同样是短命进程，stdout 专用于解析结果
+        Command::Sheet { path } => context::extract::sheet_child(&path),
         Command::Run { config } => serve(&config),
         Command::Doctor { config } => doctor::run(&config),
     }
@@ -155,6 +163,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     ));
 
     let backend = claude_backend(&config.agent);
+    let claude_config_dir = backend.config_dir();
     let info = backend
         .preflight()
         .await
@@ -175,6 +184,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         tools: context::extract::Tools {
             office_legacy: config.context.office_legacy,
             scratch,
+            // 不用 current_exe()：二进制升级替换后它指向「(deleted)」
+            program: config.agent.hook.program.clone(),
         },
         window,
         model: config.agent.model.clone(),
@@ -257,12 +268,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         maintenance::Maintenance {
             store: store.clone(),
             data_dir: data_dir.clone(),
-            // 复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 CLI 的默认位置 ~/.claude
-            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
-                }),
+            // 和传给 claude 的环境一致：复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 ~/.claude
+            claude_config_dir,
         },
         cancel.clone(),
     ));
@@ -307,7 +314,10 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             .context("处理队列已关闭")?;
     }
 
-    let ingest = Arc::new(ingest::Ingest::new(store, whitelist, bot_open_id, jobs_tx));
+    let ingest = Arc::new(
+        ingest::Ingest::new(store, whitelist, bot_open_id, jobs_tx)
+            .with_card_lookup(Arc::clone(&api), config.feishu.app_id.clone()),
+    );
     let mut ws_config = WsConfig::new(config.feishu.app_id.clone(), app_secret);
     ws_config.base_url = config.feishu.base_url.clone();
     let client = WsClient::new(ws_config).context("创建长连接客户端失败")?;

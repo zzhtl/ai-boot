@@ -124,6 +124,7 @@ async fn finish_resolve(env: &Env, answer: &Answer, targets: &[TargetSpec]) {
             session_id: None,
             session_tokens: None,
             history_cursor_ms: None,
+            context_tokens: None,
             now_ms: 3,
         })
         .await

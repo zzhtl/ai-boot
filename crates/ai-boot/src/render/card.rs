@@ -25,6 +25,8 @@ const MIN_SECTION_CHARS: usize = 200;
 const TRUNCATED: &str = "\n\n…（内容过长，已截断）";
 /// 进度卡上露出的最近几步：卡片最后会换成答案，不必把过程全摆出来。
 const RECENT_STEPS: usize = 6;
+/// 进度卡上模型那句进展说明的长度上限。
+const THOUGHT_CHARS: usize = 120;
 /// 一张卡片最多放的图片（截图和流程图合计）和图表；飞书建议图表不超过 5 个。
 pub const MAX_IMAGES: usize = 6;
 const MAX_CHARTS: usize = 5;
@@ -175,10 +177,23 @@ pub struct Progress<'a> {
     /// 读了什么、没读到什么，每行一条。
     pub read: &'a [String],
     pub steps: &'a [String],
+    /// 模型最近一次说明的进展（它在工具调用之间说的话）。
+    pub thought: Option<&'a str>,
+    /// 正在写的结论里已经写完的概述。
+    pub draft: Option<&'a str>,
     pub elapsed: Duration,
     pub notes: &'a [String],
     /// 这一轮的 ID，给了就带「停止」按钮。
     pub stop: Option<&'a str>,
+}
+
+/// 进度卡上的概述还没定稿，链接等答案卡再按白名单放。
+struct NoLinks;
+
+impl LinkPolicy for NoLinks {
+    fn allows(&self, _url: &str) -> bool {
+        false
+    }
 }
 
 /// 分析中。
@@ -187,6 +202,8 @@ pub fn progress(view: &Progress<'_>) -> Value {
         question,
         read,
         steps,
+        thought,
+        draft,
         elapsed,
         notes,
         stop,
@@ -200,15 +217,18 @@ pub fn progress(view: &Progress<'_>) -> Value {
             .collect();
         elements.push(markdown(lines.join("\n")));
     }
-    if !steps.is_empty() {
-        let recent: Vec<String> = steps
-            .iter()
-            .rev()
-            .take(RECENT_STEPS)
-            .rev()
-            .map(|s| format!("- {s}"))
-            .collect();
-        elements.push(markdown(recent.join("\n")));
+    // 结论开始写了就只露结论：过程已经不重要了
+    if let Some(draft) = draft.filter(|d| !d.trim().is_empty()) {
+        elements.push(markdown("**结论（还在写详情）**".to_owned()));
+        elements.extend(markdown_blocks(&truncate(draft, SUMMARY_CHARS), &NoLinks));
+    } else {
+        if let Some(thought) = thought.filter(|t| !t.trim().is_empty()) {
+            elements.push(markdown(format!(
+                "💬 {}",
+                inline_within(thought, THOUGHT_CHARS)
+            )));
+        }
+        progress_steps(&mut elements, steps);
     }
     let mut status = format!("⏱ 已用时 {}", human_duration(elapsed));
     for note in notes {
@@ -227,6 +247,21 @@ pub fn progress(view: &Progress<'_>) -> Value {
         ));
     }
     card("⏳ 分析中", question, "wathet", elements)
+}
+
+/// 最近几步工具调用。
+fn progress_steps(elements: &mut Vec<Value>, steps: &[String]) {
+    if steps.is_empty() {
+        return;
+    }
+    let recent: Vec<String> = steps
+        .iter()
+        .rev()
+        .take(RECENT_STEPS)
+        .rev()
+        .map(|s| format!("- {s}"))
+        .collect();
+    elements.push(markdown(recent.join("\n")));
 }
 
 /// 结构化答案：顶上一段概述，详细内容全部折叠。
@@ -722,11 +757,15 @@ fn confidence_label(confidence: Confidence) -> &'static str {
 
 /// 列表项里的单行文字：脱敏、转义、压成一行。
 fn inline(text: &str) -> String {
+    inline_within(text, 300)
+}
+
+fn inline_within(text: &str, limit: usize) -> String {
     let flat: String = redact(text)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    escape(&truncate(&flat, 300))
+    escape(&truncate(&flat, limit))
 }
 
 fn truncate(text: &str, limit: usize) -> String {

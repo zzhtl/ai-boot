@@ -40,8 +40,16 @@ const JIRA_KEY_LIMIT: usize = 10;
 /// 话题里的合并转发最多展开几条（从新到旧）。
 const THREAD_FORWARDS: usize = 3;
 
+/// 词边界只按 ASCII 算：Unicode 的 `\b` 把汉字也当成词字符，「看下ABC-4818的问题」
+/// 这种紧贴中文的写法会一个都认不出来。
 static JIRA_KEY: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"\b[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}\b").ok());
+    LazyLock::new(|| Regex::new(r"(?-u:\b)[A-Z][A-Z0-9]{1,9}-[0-9]{1,7}(?-u:\b)").ok());
+/// 长得像单号、其实是编码、算法、标准的写法（UTF-8、SHA-256、CVE-2021-44228）：
+/// 当成单号会让 Agent 先去 Jira 白查一遍。
+const NOT_JIRA_PROJECTS: [&str; 17] = [
+    "AES", "CVE", "ECMA", "GB", "HTTP", "IEEE", "ISO", "JDK", "JSR", "MD", "RFC", "SHA", "SM",
+    "SSL", "TLS", "UTF", "WIN",
+];
 
 /// 「最近 20 条」「最新的二十条消息」「近两百条聊天记录」「last 50 messages」。
 /// 「条」后面必须是消息类的词或者句子结束，免得「最近 20 条日志」也被当成要少看聊天记录。
@@ -101,6 +109,8 @@ pub struct TurnContext {
     pub requested_messages: Option<usize>,
     /// 这一轮是接着第几轮的卡片问的（引用卡片或在卡片上补充）。
     pub follows_turn: Option<i64>,
+    /// 引用的是机器人发的卡片。卡片那一轮就在这个会话里时，会话里有它的答案，不用再给一遍。
+    pub quoted_bot_card: bool,
 }
 
 /// 本轮读了什么、没读到什么。落库，也显示在进度卡片上。
@@ -412,7 +422,28 @@ pub async fn collect(
         if let Some(err) = error {
             context.missing.push(format!("群里最近的消息：{err}"));
         }
-        window_lines(&items, bot_open_id, &name_of, &mut context, &mut wanted);
+        // 这些消息也交给了 Agent：游标不前进的话，提问之后才到的几条下一轮会再发一遍
+        newest = newest.max(
+            items
+                .iter()
+                .filter_map(|item| item.create_time.parse::<i64>().ok())
+                .max(),
+        );
+        let forwarded = window_lines(&items, bot_open_id, &name_of, &mut context, &mut wanted);
+        // 群里转发进来的聊天记录（常常是客户那边的对话）就是问题现场，和话题里一样展开
+        for (message_id, sender) in forwarded {
+            forward(
+                api,
+                &message_id,
+                Layer::Shared,
+                &format!("{sender} 在群里转发的聊天记录"),
+                bot_open_id,
+                &name_of,
+                &mut context,
+                &mut wanted,
+            )
+            .await;
+        }
     }
 
     let fetched_ms = started.elapsed().as_millis();
@@ -557,15 +588,14 @@ async fn forward(
     }
 }
 
-/// 提问引用的那条消息。引用的是机器人自己的卡片（引用卡片追问）时没有内容可取。
+/// 提问引用的那条消息。引用机器人自己的卡片也取：卡片所在的会话过了保留期被清掉后，
+/// 卡片上的内容就是模型能拿到的全部前情。
 async fn quoted_item(api: &ApiClient, parent: &str) -> Result<Option<MessageItem>, String> {
     let items = api.get_message(parent).await.map_err(|err| {
         tracing::warn!(%err, "取被引用的消息失败");
         err.to_string()
     })?;
-    Ok(items
-        .into_iter()
-        .find(|item| item.message_id == parent && item.sender.sender_type != "app"))
+    Ok(items.into_iter().find(|item| item.message_id == parent))
 }
 
 /// 不在话题里时，提问引用的那条消息（及其附件、转发）也属于 T1。
@@ -599,9 +629,15 @@ async fn quote(
         )
         .await;
     }
+    let from_bot = item.sender.sender_type == "app";
+    context.quoted_bot_card = from_bot;
     context.quoted = Some(Line {
         at_ms: item.create_time.parse().unwrap_or_default(),
-        sender: name_of(&item.sender.id),
+        sender: if from_bot {
+            "机器人（之前的回答）".to_owned()
+        } else {
+            name_of(&item.sender.id)
+        },
         text: flat.text,
     });
 }
@@ -655,17 +691,20 @@ async fn window_items(
     (fetched, error)
 }
 
-/// 群里最近的消息进 T2；附件从新到旧排，数量有上限时新的更要紧。
+/// 群里最近的消息进 T2；附件从新到旧排，数量有上限时新的更要紧。返回要展开的
+/// 合并转发（消息 ID、转发人），从新到旧，最多 `THREAD_FORWARDS` 条。
 fn window_lines(
     items: &[MessageItem],
     bot_open_id: Option<&str>,
     name_of: &impl Fn(&str) -> String,
     context: &mut TurnContext,
     wanted: &mut Vec<Wanted>,
-) {
+) -> Vec<(String, String)> {
+    let mut forwarded = Vec::new();
     for item in items.iter().rev() {
         let flat = item_flat(item, bot_open_id);
-        let origin = format!("{} 在群里发的", name_of(&item.sender.id));
+        let sender = name_of(&item.sender.id);
+        let origin = format!("{sender} 在群里发的");
         want(
             wanted,
             &item.message_id,
@@ -674,11 +713,15 @@ fn window_lines(
             &origin,
             false,
         );
+        if flat.forwarded && forwarded.len() < THREAD_FORWARDS {
+            forwarded.push((item.message_id.clone(), sender));
+        }
     }
     context.window = items
         .iter()
         .map(|item| line_of(item, bot_open_id, name_of))
         .collect();
+    forwarded
 }
 
 async fn member_names(api: &ApiClient, chat_id: &str) -> HashMap<String, String> {
@@ -814,6 +857,10 @@ fn jira_keys<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<String> {
     for text in texts {
         for found in pattern.find_iter(text) {
             let key = found.as_str().to_owned();
+            let project = key.split('-').next().unwrap_or_default();
+            if NOT_JIRA_PROJECTS.contains(&project) {
+                continue;
+            }
             if !keys.contains(&key) {
                 keys.push(key);
                 if keys.len() == JIRA_KEY_LIMIT {
@@ -912,6 +959,19 @@ mod tests {
             .into_iter(),
         );
         assert_eq!(keys, ["ABC-12", "XYZ-3", "QA2-100"]);
+    }
+
+    #[test]
+    fn jira_keys_next_to_chinese_are_found_and_look_alikes_are_not() {
+        let keys = jira_keys(
+            [
+                "看下ABC-4818的问题",
+                "XYZ-12里说的",
+                "编码用 UTF-8，签名是 SHA-256，漏洞 CVE-2021-44228",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(keys, ["ABC-4818", "XYZ-12"]);
     }
 
     #[test]

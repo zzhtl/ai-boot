@@ -3,6 +3,8 @@
 //! 同一会话的写入都来自它的 actor（串行），跨会话共享的只有收件箱；多条语句的
 //! 写入一律用 `BEGIN IMMEDIATE` 开事务，免得读事务升级成写事务时直接撞上 busy。
 
+use std::collections::HashSet;
+
 use anyhow::Context as _;
 
 use super::Store;
@@ -59,6 +61,8 @@ pub struct Conversation {
     pub agent_session_id: Option<String>,
     pub session_tokens: i64,
     pub history_cursor_ms: Option<i64>,
+    /// 当前 Agent 会话最后一轮结束时带着的上下文（token），0 表示还不知道。
+    pub context_tokens: i64,
 }
 
 macro_rules! conversation_columns {
@@ -77,7 +81,9 @@ macro_rules! conversation_columns {
             $prefix,
             "session_tokens, ",
             $prefix,
-            "history_cursor_ms"
+            "history_cursor_ms, ",
+            $prefix,
+            "context_tokens"
         )
     };
 }
@@ -149,6 +155,8 @@ pub struct FinishedTurn<'a> {
     /// 会话累计用量；后端没报时为 `None`，保留原值。
     pub session_tokens: Option<i64>,
     pub history_cursor_ms: Option<i64>,
+    /// 本轮结束时带着的上下文；后端没报时为 `None`，保留原值。
+    pub context_tokens: Option<i64>,
     pub now_ms: i64,
 }
 
@@ -564,12 +572,14 @@ impl Store {
              SET agent_session_id = COALESCE(?, agent_session_id),
                  session_tokens = COALESCE(?, session_tokens),
                  history_cursor_ms = COALESCE(?, history_cursor_ms),
+                 context_tokens = COALESCE(?, context_tokens),
                  updated_at_ms = ?
              WHERE id = ?",
         )
         .bind(turn.session_id)
         .bind(turn.session_tokens)
         .bind(turn.history_cursor_ms)
+        .bind(turn.context_tokens)
         .bind(turn.now_ms)
         .bind(turn.conversation_id)
         .execute(&mut *tx)
@@ -649,6 +659,15 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .context("查询过期会话失败")?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// 库里现有的全部会话。清扫残留目录时，它们的目录不算残留。
+    pub async fn conversation_ids(&self) -> anyhow::Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM conversations")
+            .fetch_all(&self.pool)
+            .await
+            .context("查询会话失败")?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
@@ -791,6 +810,7 @@ mod tests {
             session_id: Some("s-1"),
             session_tokens: Some(100),
             history_cursor_ms: Some(50),
+            context_tokens: Some(9_000),
             now_ms: 99,
         }
     }
@@ -916,6 +936,7 @@ mod tests {
         assert_eq!(conv.agent_session_id.as_deref(), Some("s-1"));
         assert_eq!(conv.session_tokens, 100);
         assert_eq!(conv.history_cursor_ms, Some(50));
+        assert_eq!(conv.context_tokens, 9_000);
         let by_card = store
             .conversation_by_card("om_card")
             .await

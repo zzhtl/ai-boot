@@ -44,6 +44,15 @@ fn tool_label(tool: &str, input: &Value) -> String {
         "gitlab_repo" => {
             let project = arg("project").unwrap_or_default();
             match (action, arg("path")) {
+                ("search", _) => format!(
+                    "🔍 搜索代码 {project}：{}",
+                    arg("query").unwrap_or_default()
+                ),
+                ("commit", _) => format!(
+                    "💻 GitLab {project}：提交 {}",
+                    arg("git_ref").unwrap_or_default()
+                ),
+                ("blame", Some(path)) => format!("💻 GitLab {project}：追溯 {path}"),
                 (_, Some(path)) => format!("💻 GitLab {project}：{path}"),
                 ("compare", None) => format!(
                     "💻 GitLab {project}：对比 {}…{}",
@@ -131,6 +140,30 @@ mod tests {
             )
             .as_deref(),
             Some("💻 GitLab g/p：src/a.rs")
+        );
+        assert_eq!(
+            call(
+                "mcp__qtmcp__gitlab_repo",
+                json!({"action": "search", "project": "g/p", "query": "Lock wait timeout"})
+            )
+            .as_deref(),
+            Some("🔍 搜索代码 g/p：Lock wait timeout")
+        );
+        assert_eq!(
+            call(
+                "mcp__qtmcp__gitlab_repo",
+                json!({"action": "blame", "project": "g/p", "path": "src/a.rs", "start_line": 10})
+            )
+            .as_deref(),
+            Some("💻 GitLab g/p：追溯 src/a.rs")
+        );
+        assert_eq!(
+            call(
+                "mcp__qtmcp__gitlab_repo",
+                json!({"action": "commit", "project": "g/p", "git_ref": "abc1234"})
+            )
+            .as_deref(),
+            Some("💻 GitLab g/p：提交 abc1234")
         );
         assert_eq!(
             call("Read", json!({"file_path": "/w/context/transcript.md"})).as_deref(),

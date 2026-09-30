@@ -138,6 +138,14 @@ fn usage(total_in: u64, total_out: u64) -> Beat {
     }))
 }
 
+/// 最后一次请求带着这么多上下文。
+fn long_context(tokens: u64) -> Beat {
+    Beat::Event(AgentEvent::Usage(Usage {
+        context_tokens: tokens,
+        ..Usage::default()
+    }))
+}
+
 fn answered(title: &str) -> Beat {
     Beat::Event(AgentEvent::Finished(Outcome::Success {
         structured: Some(answer_json(title)),
@@ -287,6 +295,7 @@ async fn world_full(
             tools: crate::context::extract::Tools {
                 office_legacy: false,
                 scratch: dir.path().join("tmp"),
+                program: "ai-boot".into(),
             },
             window,
             model: Some("opus".into()),
@@ -1754,6 +1763,215 @@ async fn a_group_follow_up_reads_only_what_was_said_since_the_last_turn() {
     assert!(calls[0].contains("start_time=0"), "{calls:?}");
     // 第一轮的提问发在 1790584800（秒），游标之后一秒起
     assert!(calls[1].contains("start_time=1790584801"), "{calls:?}");
+}
+
+/// 等到某次进度卡更新里出现 `text`，返回那张卡片。
+async fn progress_with(w: &World, text: &str) -> String {
+    for _ in 0..200 {
+        let requests = w.server.received_requests().await.expect("请求记录");
+        if let Some(body) = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "PATCH")
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .find(|body| body.contains(text))
+        {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("进度卡上一直没有出现「{text}」");
+}
+
+/// 分析中：模型说的进展和写到一半的结论先露在进度卡上，不用干等整份答案。
+#[tokio::test]
+async fn the_progress_card_shows_what_the_model_found_and_the_conclusion_as_it_is_written() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let w = world(vec![vec![
+        started("s-1"),
+        Beat::Event(AgentEvent::Step(Step::Text(
+            "已定位到代码：登录会按主键更新\n用户表那一行".into(),
+        ))),
+        Beat::Gate(Arc::clone(&gate)),
+        Beat::Event(AgentEvent::Draft(ai_boot_agent::Draft {
+            title: Some("登录锁等待超时".into()),
+            summary: Some("用户表那一行的锁被别的事务占住".into()),
+        })),
+        Beat::Gate(Arc::clone(&gate)),
+        answered("登录锁等待超时"),
+    ]])
+    .await;
+    say(&w, "om_1", "看下这个报错", json!({})).await;
+    let thought = progress_with(&w, "已定位到代码").await;
+    assert!(
+        thought.contains("登录会按主键更新 用户表那一行"),
+        "多行压成一行：{thought}"
+    );
+    gate.notify_one();
+    let draft = progress_with(&w, "用户表那一行的锁被别的事务占住").await;
+    assert!(draft.contains("结论（还在写详情）"), "{draft}");
+    gate.notify_one();
+    until(&w, "结束", all_finished(1)).await;
+}
+
+/// 会话上下文已经很长：下一轮把前几轮收拢成结论、换新会话，之前的答案全文留在
+/// 工作目录里，之后续接新会话。
+#[tokio::test]
+async fn a_long_session_is_compacted_into_conclusions_for_the_next_turn() {
+    let w = world(vec![
+        vec![started("s-1"), long_context(130_000), answered("第一轮")],
+        vec![started("s-2"), long_context(20_000), answered("第二轮")],
+        vec![started("s-2"), answered("第三轮")],
+    ])
+    .await;
+    say(&w, "om_1", "登录报 500", json!({})).await;
+    until(&w, "第一轮结束", all_finished(1)).await;
+    let quote =
+        json!({"parent_id": "om_card_1", "root_id": "om_1", "create_time": "1790588400000"});
+    say(&w, "om_2", "怎么修", quote).await;
+    until(&w, "第二轮结束", all_finished(2)).await;
+    let quote =
+        json!({"parent_id": "om_card_2", "root_id": "om_1", "create_time": "1790588500000"});
+    say(&w, "om_3", "修完要重启吗", quote).await;
+    until(&w, "第三轮结束", all_finished(3)).await;
+
+    let requests = w.backend.requests();
+    assert_eq!(requests[1].session, SessionRef::New, "上下文太长就换新会话");
+    let prompt = &requests[1].prompt;
+    assert!(
+        prompt.starts_with("# 前情（之前的会话上下文太长"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("第一轮：连接池耗尽"),
+        "前几轮的结论要带上：{prompt}"
+    );
+    assert!(prompt.contains("怎么修"));
+    // 第一轮的完整答案留在工作目录里，新会话要细节去这里查
+    let answers = std::fs::read_to_string(requests[0].workdir.join("context/answers.md"))
+        .expect("answers.md");
+    assert!(answers.contains("## 第 1 轮：第一轮"), "{answers}");
+    assert!(answers.contains("调大连接池"));
+    // 新会话不长，接着续接它
+    assert_eq!(requests[2].session, SessionRef::Resume("s-2".into()));
+}
+
+/// 引用的卡片所在的会话已经清掉了：卡片上的旧结论作为提问引用的内容交给模型，
+/// 不然「这个还是不行」里的「这个」无从知道。
+#[tokio::test]
+async fn quoting_a_purged_card_hands_its_old_answer_to_the_model() {
+    let w = world(vec![vec![started("s-1"), answered("接着排查")]]).await;
+    let card = json!({"schema": "2.0", "header": {"title": {"tag": "plain_text", "content": "登录锁等待超时"}},
+                      "body": {"elements": [{"tag": "markdown", "content": "旧结论：用户表那一行的锁被占住"}]}});
+    Mock::given(method("GET"))
+        .and(path("/open-apis/im/v1/messages/om_gone"))
+        .respond_with(ok_items(json!([
+            {"message_id": "om_gone", "msg_type": "interactive", "create_time": "1790500000000",
+             "sender": {"id": "cli_x", "sender_type": "app"},
+             "body": {"content": card.to_string()}}
+        ])))
+        .mount(&w.server)
+        .await;
+    say(
+        &w,
+        "om_1",
+        "这个还是不行",
+        json!({"parent_id": "om_gone", "root_id": "om_gone"}),
+    )
+    .await;
+    until(&w, "结束", all_finished(1)).await;
+    let prompt = &w.backend.requests()[0].prompt;
+    let quoted = prompt.find("## 提问引用的消息").expect("有引用");
+    assert!(
+        prompt[quoted..].contains("机器人（之前的回答）"),
+        "{prompt}"
+    );
+    assert!(
+        prompt[quoted..].contains("旧结论：用户表那一行的锁被占住"),
+        "{prompt}"
+    );
+}
+
+/// 提问之后、开跑之前群里又来了消息：这一轮已经带上了，下一轮不能再发一遍。
+#[tokio::test]
+async fn messages_that_arrived_after_the_question_are_not_sent_again() {
+    let w = world_custom(
+        vec![
+            vec![started("s-1"), answered("第一轮")],
+            vec![started("s-1"), answered("第二轮")],
+        ],
+        DEBOUNCE,
+        Some((500, Duration::ZERO)),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("container_id_type", "chat"))
+        .and(query_param("start_time", "0"))
+        .respond_with(ok_items(json!([chat_text(
+            "om_late",
+            "1790584900000",
+            "我这边也复现了"
+        )])))
+        .with_priority(1)
+        .mount(&w.server)
+        .await;
+    say(&w, "om_1", "登录报 500", json!({})).await;
+    until(&w, "第一轮结束", all_finished(1)).await;
+    assert!(w.backend.requests()[0].prompt.contains("我这边也复现了"));
+    let quote =
+        json!({"parent_id": "om_card_1", "root_id": "om_1", "create_time": "1790588400000"});
+    say(&w, "om_2", "怎么修", quote).await;
+    until(&w, "第二轮结束", all_finished(2)).await;
+    let calls = chat_calls(&w.server.received_requests().await.expect("请求记录"));
+    // 游标跟到这一轮带上的最新一条群消息（1790584900 秒），不是停在提问时间
+    assert!(calls[1].contains("start_time=1790584901"), "{calls:?}");
+}
+
+/// 群里有人把客户那边的聊天记录合并转发进来，再 @ 机器人：转发的内容要展开。
+#[tokio::test]
+async fn a_forward_shared_in_the_group_is_expanded_into_the_group_records() {
+    let w = world_custom(
+        vec![vec![started("s-1"), answered("看了转发")]],
+        DEBOUNCE,
+        Some((30, Duration::ZERO)),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/open-apis/im/v1/messages"))
+        .and(query_param("container_id_type", "chat"))
+        .respond_with(ok_items(json!([
+            {"message_id": "om_wf", "msg_type": "merge_forward", "create_time": "1790584700000",
+             "sender": {"id": "ou_qa", "sender_type": "user"},
+             "body": {"content": "{\"content\":\"Merged and Forwarded Message\"}"}}
+        ])))
+        .with_priority(1)
+        .mount(&w.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/open-apis/im/v1/messages/om_wf"))
+        .respond_with(ok_items(json!([
+            {"message_id": "om_wf", "msg_type": "merge_forward", "create_time": "1790584700000",
+             "sender": {"id": "ou_qa", "sender_type": "user"},
+             "body": {"content": "{\"content\":\"Merged and Forwarded Message\"}"}},
+            {"message_id": "k1", "msg_type": "text", "create_time": "1790583000000",
+             "upper_message_id": "om_wf",
+             "sender": {"id": "ou_customer", "sender_type": "user"},
+             "body": {"content": "{\"text\":\"客户：升级到 3.2.1 后登录一直转圈\"}"}}
+        ])))
+        .mount(&w.server)
+        .await;
+    say(&w, "om_1", "看下上面转发的", json!({})).await;
+    until(&w, "结束", all_finished(1)).await;
+
+    let prompt = &w.backend.requests()[0].prompt;
+    let t2 = prompt.find("# 群聊记录（T2").expect("T2");
+    let forward = prompt.find("在群里转发的聊天记录").expect("转发展开了");
+    assert!(t2 < forward, "{prompt}");
+    assert!(prompt[forward..].contains("升级到 3.2.1 后登录一直转圈"));
+    assert!(
+        !prompt.contains("## 话题里的消息"),
+        "不在话题里就不写话题的标题：{prompt}"
+    );
 }
 
 const DOC_LINK: &str = "https://x.feishu.cn/docx/doxcnAbcdefghijklmnop";

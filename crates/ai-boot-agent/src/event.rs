@@ -15,6 +15,15 @@ pub enum AgentEvent {
     Warning(String),
     /// 模型正在输出。进度卡靠它显示「思考中」「正在整理结论」，也靠它判断是不是卡住了。
     Activity(Activity),
+    /// 结构化答案还在写，其中已经写完的字段。写整份答案要二三十秒，进度卡先露出结论。
+    Draft(Draft),
+}
+
+/// 写到一半的结构化答案里已经完整的字段。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Draft {
+    pub title: Option<String>,
+    pub summary: Option<String>,
 }
 
 /// 模型此刻在做什么。
@@ -94,6 +103,9 @@ pub struct Usage {
     pub cache_creation_tokens: u64,
     /// CLI 给出的估算成本（微美元）。订阅账号下只是参考值；Codex 不提供。
     pub cost_usd_micros: Option<i64>,
+    /// 本轮最后一次请求带上的上下文（输入加缓存读写）。每次请求都要带上整段会话，
+    /// 调用方据此决定下一轮是否把会话收拢成摘要、换新会话。给不出时为 0。
+    pub context_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

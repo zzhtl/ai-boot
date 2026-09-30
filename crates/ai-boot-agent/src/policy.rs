@@ -3,11 +3,12 @@
 //! MCP（qtmcp）的读写全部放行：命令行上用 `--allowedTools` 预先批准，这里也不拦。
 //! hook 只剩兜底的两件事（实测 Claude Code 2.1.283，Codex 格式一致）：
 //! - **PreToolUse** 对所有工具触发，只负责拒绝：文件工具越出工作目录（和
-//!   `--restricted` 双保险）；万一配置漂移冒出执行命令、写文件、上网的工具，也在这里拦下。
+//!   `--restricted` 双保险；CLI 存放超大工具结果的目录另外放开）；万一配置漂移冒出
+//!   执行命令、写文件、上网的工具，也在这里拦下。
 //! - **PermissionRequest** 只在调用需要批准时触发：MCP 工具和结构化输出给 allow，其余 deny。
 //!   hook 自身崩溃或超时时，`--permission-prompts none` 下调用会被自动拒绝。
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
@@ -31,10 +32,24 @@ pub struct HookCall<'a> {
     pub tool_input: &'a Value,
 }
 
-pub fn decide(call: HookCall<'_>, workdir: &Path) -> Decision {
+/// 文件工具能读的范围：工作目录（相对路径按它解析），外加几个只读目录。
+#[derive(Debug, Clone, Copy)]
+pub struct Scope<'a> {
+    pub workdir: &'a Path,
+    /// CLI 存放超大工具结果的目录：结果只以文件的形式交给模型。
+    pub readable: &'a [PathBuf],
+}
+
+impl Scope<'_> {
+    fn roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.workdir).chain(self.readable.iter().map(PathBuf::as_path))
+    }
+}
+
+pub fn decide(call: HookCall<'_>, scope: Scope<'_>) -> Decision {
     match call.event {
         "PermissionRequest" => permission_request(call.tool_name),
-        "PreToolUse" => pre_tool_use(call.tool_name, call.tool_input, workdir),
+        "PreToolUse" => pre_tool_use(call.tool_name, call.tool_input, scope),
         _ => Decision::Abstain,
     }
 }
@@ -47,19 +62,19 @@ fn permission_request(tool: &str) -> Decision {
     Decision::Deny(format!("不允许使用 {tool}"))
 }
 
-fn pre_tool_use(tool: &str, input: &Value, workdir: &Path) -> Decision {
+fn pre_tool_use(tool: &str, input: &Value, scope: Scope<'_>) -> Decision {
     if tool.starts_with(MCP_PREFIX) {
         return Decision::Abstain;
     }
     match tool {
-        "Read" => file_path_check(input, "file_path", workdir, true),
+        "Read" => file_path_check(input, "file_path", scope, true),
         // Glob 的 pattern 是路径模式；Grep 的 pattern 是正则，路径模式在 glob 参数里
         "Glob" | "Grep" => {
-            if let Decision::Deny(reason) = file_path_check(input, "path", workdir, false) {
+            if let Decision::Deny(reason) = file_path_check(input, "path", scope, false) {
                 return Decision::Deny(reason);
             }
             let key = if tool == "Glob" { "pattern" } else { "glob" };
-            pattern_check(input, key, workdir)
+            pattern_check(input, key, scope)
         }
         // 这些工具都没有开放；万一配置漂移让它们出现了，也在这里拦下
         "Bash" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "WebFetch" | "WebSearch"
@@ -68,8 +83,8 @@ fn pre_tool_use(tool: &str, input: &Value, workdir: &Path) -> Decision {
     }
 }
 
-/// 路径参数必须落在工作目录内（按真实路径比较，挡住 `..` 和符号链接逃逸）。
-fn file_path_check(input: &Value, key: &str, workdir: &Path, required: bool) -> Decision {
+/// 路径参数必须落在可读范围内（按真实路径比较，挡住 `..` 和符号链接逃逸）。
+fn file_path_check(input: &Value, key: &str, scope: Scope<'_>, required: bool) -> Decision {
     let Some(raw) = input.get(key).and_then(Value::as_str) else {
         return if required {
             Decision::Deny(format!("缺少参数 {key}"))
@@ -77,28 +92,31 @@ fn file_path_check(input: &Value, key: &str, workdir: &Path, required: bool) -> 
             Decision::Abstain
         };
     };
-    if inside(workdir, Path::new(raw)) {
+    if inside(scope, Path::new(raw)) {
         Decision::Abstain
     } else {
         Decision::Deny(format!("只能读取工作目录内的文件：{raw}"))
     }
 }
 
-fn inside(workdir: &Path, path: &Path) -> bool {
+fn inside(scope: Scope<'_>, path: &Path) -> bool {
     let full = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        workdir.join(path)
+        scope.workdir.join(path)
     };
-    match (full.canonicalize(), workdir.canonicalize()) {
-        (Ok(full), Ok(root)) => full.starts_with(root),
-        // 不存在的路径无从判断，按越界处理：读不存在的文件本来也读不到
-        _ => false,
-    }
+    // 不存在的路径无从判断，按越界处理：读不存在的文件本来也读不到
+    let Ok(full) = full.canonicalize() else {
+        return false;
+    };
+    scope
+        .roots()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| full.starts_with(root))
 }
 
-/// 路径模式不能跳出工作目录：不许 `..`，绝对路径必须在工作目录内。
-fn pattern_check(input: &Value, key: &str, workdir: &Path) -> Decision {
+/// 路径模式不能跳出可读范围：不许 `..`，绝对路径必须在范围内。
+fn pattern_check(input: &Value, key: &str, scope: Scope<'_>) -> Decision {
     let Some(raw) = input.get(key).and_then(Value::as_str) else {
         return Decision::Abstain;
     };
@@ -107,10 +125,11 @@ fn pattern_check(input: &Value, key: &str, workdir: &Path) -> Decision {
         return Decision::Deny(format!("模式里不允许出现 ..：{raw}"));
     }
     if pattern.is_absolute() {
-        let root = workdir
-            .canonicalize()
-            .unwrap_or_else(|_| workdir.to_path_buf());
-        if !pattern.starts_with(&root) {
+        let allowed = scope.roots().any(|root| {
+            let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            pattern.starts_with(root)
+        });
+        if !allowed {
             return Decision::Deny(format!("只能在工作目录内检索：{raw}"));
         }
     }
@@ -121,6 +140,14 @@ fn pattern_check(input: &Value, key: &str, workdir: &Path) -> Decision {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 只有工作目录，没有额外的可读目录。
+    fn only(workdir: &Path) -> Scope<'_> {
+        Scope {
+            workdir,
+            readable: &[],
+        }
+    }
 
     fn call<'a>(event: &'a str, tool: &'a str, input: &'a Value) -> HookCall<'a> {
         HookCall {
@@ -141,14 +168,14 @@ mod tests {
             assert_eq!(
                 decide(
                     call("PermissionRequest", "mcp__qtmcp__jira_issue", &input),
-                    dir.path()
+                    only(dir.path())
                 ),
                 Decision::Allow
             );
             assert_eq!(
                 decide(
                     call("PreToolUse", "mcp__qtmcp__jira_issue", &input),
-                    dir.path()
+                    only(dir.path())
                 ),
                 Decision::Abstain
             );
@@ -161,14 +188,14 @@ mod tests {
         let command = json!({"command": "id"});
         for event in ["PermissionRequest", "PreToolUse"] {
             assert!(matches!(
-                decide(call(event, "Bash", &command), dir.path()),
+                decide(call(event, "Bash", &command), only(dir.path())),
                 Decision::Deny(_)
             ));
         }
         assert!(matches!(
             decide(
                 call("PermissionRequest", "Write", &json!({"file_path": "a"})),
-                dir.path()
+                only(dir.path())
             ),
             Decision::Deny(_)
         ));
@@ -182,12 +209,15 @@ mod tests {
         assert_eq!(
             decide(
                 call("PermissionRequest", "StructuredOutput", &answer),
-                dir.path()
+                only(dir.path())
             ),
             Decision::Allow
         );
         assert_eq!(
-            decide(call("PreToolUse", "StructuredOutput", &answer), dir.path()),
+            decide(
+                call("PreToolUse", "StructuredOutput", &answer),
+                only(dir.path())
+            ),
             Decision::Abstain
         );
     }
@@ -203,7 +233,7 @@ mod tests {
 
         let read = |path: &str| {
             let input = json!({"file_path": path});
-            decide(call("PreToolUse", "Read", &input), dir.path())
+            decide(call("PreToolUse", "Read", &input), only(dir.path()))
         };
         assert_eq!(read("a.txt"), Decision::Abstain);
         assert_eq!(
@@ -218,7 +248,8 @@ mod tests {
     #[test]
     fn glob_and_grep_cannot_search_outside_the_workdir() {
         let dir = tempfile::tempdir().expect("临时目录");
-        let check = |tool: &str, input: Value| decide(call("PreToolUse", tool, &input), dir.path());
+        let check =
+            |tool: &str, input: Value| decide(call("PreToolUse", tool, &input), only(dir.path()));
         assert_eq!(
             check("Glob", json!({"pattern": "**/*.log"})),
             Decision::Abstain
@@ -251,10 +282,52 @@ mod tests {
     }
 
     #[test]
+    fn oversized_tool_results_can_be_read_but_nothing_else_outside() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let results = tempfile::tempdir().expect("工具结果目录");
+        std::fs::write(results.path().join("mcp-qtmcp-log.txt"), "x").expect("写文件");
+        let sibling = tempfile::tempdir().expect("别的目录");
+        std::fs::write(sibling.path().join("secret"), "x").expect("写文件");
+        let readable = [results.path().to_path_buf()];
+        let scope = Scope {
+            workdir: dir.path(),
+            readable: &readable,
+        };
+        let check = |tool: &str, input: Value| decide(call("PreToolUse", tool, &input), scope);
+        let saved = results
+            .path()
+            .join("mcp-qtmcp-log.txt")
+            .display()
+            .to_string();
+        assert_eq!(
+            check("Read", json!({"file_path": saved})),
+            Decision::Abstain
+        );
+        assert_eq!(
+            check(
+                "Grep",
+                json!({"pattern": "ERROR", "path": results.path().display().to_string()})
+            ),
+            Decision::Abstain
+        );
+        let secret = sibling.path().join("secret").display().to_string();
+        assert!(matches!(
+            check("Read", json!({"file_path": secret})),
+            Decision::Deny(_)
+        ));
+        // 从工具结果目录往上跳出去也不行
+        let escape = format!("{}/../secret", results.path().display());
+        assert!(matches!(
+            check("Read", json!({"file_path": escape})),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
     fn other_hook_events_are_left_alone() {
         let dir = tempfile::tempdir().expect("临时目录");
         assert_eq!(
-            decide(call("PostToolUse", "Read", &json!({})), dir.path()),
+            decide(call("PostToolUse", "Read", &json!({})), only(dir.path())),
             Decision::Abstain
         );
     }

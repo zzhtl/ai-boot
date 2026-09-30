@@ -186,3 +186,51 @@ fn codex_payloads_get_the_same_decisions() {
         "allow"
     );
 }
+
+#[test]
+fn the_cli_saved_tool_results_are_readable_through_the_read_dir_flag() {
+    let work = tempfile::tempdir().expect("工作目录");
+    let results = tempfile::tempdir().expect("工具结果目录");
+    let saved = results.path().join("mcp-qtmcp-jenkins_build-1.txt");
+    std::fs::write(&saved, "BUILD FAILED").expect("写文件");
+    let run = |file: &std::path::Path| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ai-boot"))
+            .args(["hook", "--backend", "claude", "--workdir"])
+            .arg(work.path())
+            .arg("--read-dir")
+            .arg(results.path())
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("启动 hook");
+        let input = claude_input("PreToolUse", "Read", json!({"file_path": file}));
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(&input)
+            .expect("写入");
+        let output = child.wait_with_output().expect("等待 hook");
+        Reply {
+            code: output.status.code(),
+            stdout: String::from_utf8(output.stdout).expect("UTF-8"),
+        }
+    };
+    let allowed = run(&saved);
+    assert_eq!(allowed.code, Some(0));
+    assert!(
+        allowed.stdout.trim().is_empty(),
+        "不表态：{}",
+        allowed.stdout
+    );
+
+    let outside = tempfile::NamedTempFile::new().expect("别处的文件");
+    let denied = run(outside.path());
+    assert_eq!(denied.code, Some(0));
+    assert_eq!(
+        parsed(&denied)["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+}

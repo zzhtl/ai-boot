@@ -9,7 +9,7 @@ use secrecy::SecretString;
 use serde_json::Value;
 
 use super::attach::{Attachment, Layer, MAX_DOWNLOAD, Workspace};
-use super::extract::{self, TEXT_CHARS};
+use super::extract::{self, TEXT_BYTES};
 use super::links::{DocKind, DocLink};
 
 /// 每轮最多读几篇文档。
@@ -463,11 +463,9 @@ impl Reading<'_> {
     }
 }
 
+/// 按字节截：prompt 各层的预算是字节，按字符截的中文要超出三倍。
 fn clip(text: &str) -> (String, bool) {
-    match text.char_indices().nth(TEXT_CHARS) {
-        Some((end, _)) => (text[..end].to_owned(), true),
-        None => (text.to_owned(), false),
-    }
+    extract::clip_bytes(text, TEXT_BYTES)
 }
 
 /// 表格、多维表格的单元格：文字、数字、链接、人员、选项……都拍成一行字。
@@ -533,6 +531,7 @@ mod tests {
         let tools = Tools {
             office_legacy: false,
             scratch: dir.path().join("tmp"),
+            program: PathBuf::from("ai-boot"),
         };
         Mock::given(method("POST"))
             .and(path("/open-apis/drive/v1/metas/batch_query"))

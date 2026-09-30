@@ -55,6 +55,9 @@ const DENY_TEXT: &str = "你没有使用这个机器人的权限。";
 const BUILTIN_TOOLS: [&str; 4] = ["Read", "Glob", "Grep", "StructuredOutput"];
 /// 落库的提问文字上限：只用来给续接失败的会话补前情。
 const QUESTION_KEEP_CHARS: usize = 4000;
+/// 上一轮结束时上下文超过这么多（token），这一轮就把前几轮的结论收拢成摘要、换新
+/// 会话。每次请求都要带上整段会话，越长每一步越慢；一轮之内由 CLI 的自动压缩兜底。
+const COMPACT_AT_TOKENS: i64 = 120_000;
 
 pub struct Settings {
     pub data_dir: PathBuf,
@@ -120,6 +123,18 @@ struct Attempt {
     session_id: Option<String>,
     /// 是按停止按钮停下的。
     stopped: bool,
+    /// 从启动进程算起，各阶段开始的时刻：慢的时候看得出慢在哪一段。
+    timings: Timings,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Timings {
+    /// CLI 报告会话已启动（加载完 MCP）。
+    started: Option<Duration>,
+    /// 模型开始写最终的结构化答案。
+    concluding: Option<Duration>,
+    /// 结束。
+    finished: Option<Duration>,
 }
 
 /// 一轮的结局：最终卡片和要落库的内容。
@@ -134,6 +149,8 @@ struct Report {
     tool_calls: i64,
     session_id: Option<String>,
     session_tokens: Option<i64>,
+    /// 本轮结束时带着的上下文，下一轮据此决定要不要换新会话。
+    context_tokens: Option<i64>,
     cursor: Option<i64>,
 }
 
@@ -151,6 +168,7 @@ impl Report {
             tool_calls: 0,
             session_id: None,
             session_tokens: None,
+            context_tokens: None,
             cursor: None,
         }
     }
@@ -167,14 +185,27 @@ struct Screen<'a> {
     stop: &'a CancellationToken,
 }
 
+/// 分析过程中进度卡上会变的部分。
+#[derive(Default)]
+struct Live<'a> {
+    steps: &'a [String],
+    /// 模型最近一次说明的进展。
+    thought: Option<&'a str>,
+    /// 正在写的结论里已经写完的概述。
+    draft: Option<&'a str>,
+    notes: &'a [String],
+}
+
 impl Screen<'_> {
-    fn progress(&self, steps: &[String], notes: &[String], stoppable: bool) -> Value {
+    fn progress(&self, live: &Live<'_>, stoppable: bool) -> Value {
         card::progress(&card::Progress {
             question: self.preview,
             read: self.read,
-            steps,
+            steps: live.steps,
+            thought: live.thought,
+            draft: live.draft,
             elapsed: self.started_at.elapsed(),
-            notes,
+            notes: live.notes,
             stop: stoppable.then_some(self.spec.turn_id.as_str()),
         })
     }
@@ -508,7 +539,11 @@ impl Runner {
             .data_dir
             .join("sessions")
             .join(&conversation.id);
-        let resume = conversation.agent_session_id.clone();
+        // 会话已经很长：前几轮只带结论，聊天记录和之前的答案都在工作目录里，要细节它自己查
+        let compact = conversation.agent_session_id.is_some()
+            && conversation.context_tokens >= COMPACT_AT_TOKENS;
+        let resume = conversation.agent_session_id.clone().filter(|_| !compact);
+        let fresh = conversation.agent_session_id.is_none();
         // 连发并进来的消息（先发截图、再打字提问）也显示在进度卡的「问题」里
         let bot = self.bot_open_id.get().map(String::as_str);
         let joined = inputs
@@ -536,19 +571,13 @@ impl Runner {
         };
         let gathering = Instant::now();
         let context = self
-            .gather(
-                &inputs,
-                &workdir,
-                spec.seq,
-                resume.is_none(),
-                conversation,
-                screen,
-            )
+            .gather(&inputs, &workdir, spec.seq, fresh, conversation, screen)
             .await;
+        let gathered = gathering.elapsed();
         let manifest = context.manifest();
         tracing::info!(
             turn = %spec.turn_id,
-            elapsed_ms = gathering.elapsed().as_millis(),
+            elapsed_ms = gathered.as_millis(),
             messages = manifest.messages,
             images = manifest.images,
             files = manifest.files,
@@ -557,7 +586,14 @@ impl Runner {
         let read = read_lines(&manifest);
         screen.read = &read;
         // 跟启动 Agent 一起进行：每次更新卡片都要一个来回，不值得让 Agent 等它
-        let read_card = screen.progress(&[], &[PHASE_STARTING.to_owned()], true);
+        let starting = [PHASE_STARTING.to_owned()];
+        let read_card = screen.progress(
+            &Live {
+                notes: &starting,
+                ..Live::default()
+            },
+            true,
+        );
 
         let question: String = context.question.chars().take(QUESTION_KEEP_CHARS).collect();
         let manifest_json = serde_json::to_string(&manifest).ok();
@@ -574,6 +610,21 @@ impl Runner {
                 (
                     SessionRef::Resume(session_id.clone()),
                     prompt,
+                    Transcript::Append(appended),
+                )
+            }
+            None if !fresh => {
+                tracing::info!(
+                    conversation = %conversation.id,
+                    context_tokens = conversation.context_tokens,
+                    "会话上下文已经很长，前几轮收拢成结论摘要，换新会话"
+                );
+                let prior = self.priors(conversation, spec.seq).await;
+                // 本轮新增的照常追加进完整记录
+                let (_, appended) = prompt::follow_up(&context, spec.seq);
+                (
+                    SessionRef::New,
+                    prompt::recovered(&context, &prior, prompt::Handoff::Compacted),
                     Transcript::Append(appended),
                 )
             }
@@ -612,7 +663,7 @@ impl Runner {
             // 不再从飞书重拉、重发：告诉新会话去哪里查，只给本轮新增的
             tracing::warn!(conversation = %conversation.id, "会话续接不上，新开会话，之前的上下文让它从工作目录读");
             let prior = self.priors(conversation, spec.seq).await;
-            let prompt = prompt::recovered(&context, &prior);
+            let prompt = prompt::recovered(&context, &prior, prompt::Handoff::Lost);
             resumed = false;
             let images = absolute_images(&workdir, &context);
             attempt = self
@@ -632,17 +683,42 @@ impl Runner {
             .first()
             .is_some_and(|r| context::is_card_input(&r.message.message_id))
             .then_some(question.as_str());
-        self.report(
-            spec,
-            conversation,
-            &workdir,
-            asked,
-            attempt,
-            resumed,
-            cursor,
-            started_at.elapsed(),
-        )
-        .await
+        let timings = attempt.timings;
+        let report = self
+            .report(
+                spec,
+                conversation,
+                &workdir,
+                asked,
+                attempt,
+                resumed,
+                cursor,
+                started_at.elapsed(),
+            )
+            .await;
+        let millis = |d: Option<Duration>| d.map(|d| d.as_millis()).unwrap_or_default();
+        tracing::info!(
+            turn = %spec.turn_id,
+            gather_ms = gathered.as_millis(),
+            cli_started_ms = millis(timings.started),
+            concluding_ms = millis(timings.concluding),
+            finished_ms = millis(timings.finished),
+            context_tokens = report.context_tokens.unwrap_or_default(),
+            "本轮各阶段耗时（后三项从启动 Agent 算起）"
+        );
+        // 答案也留一份在工作目录：换新会话后前几轮只带结论，要看全文去这里查
+        if let Some(answer) = report
+            .answer_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<answer::Answer>(json).ok())
+            && let Err(err) = append_answer(
+                &workdir,
+                &prompt::answer_record(spec.seq, &question, &answer),
+            )
+        {
+            tracing::warn!(%err, "答案没能写进工作目录");
+        }
+        report
     }
 
     /// 生成闭环方案：续接会话，只给要求；续接不上就新开会话、用前几轮的结论补
@@ -815,7 +891,7 @@ impl Runner {
                     read: &read,
                     ..screen
                 }
-                .progress(&[], &[], true);
+                .progress(&Live::default(), true);
                 self.update(screen.card_id, &card).await;
                 tokio::select! {
                     () = done.cancelled() => break,
@@ -889,6 +965,10 @@ impl Runner {
             && turn.conversation_id == conversation.id
         {
             context.follows_turn = Some(turn.seq);
+            // 引用的卡片就是这个会话里的一轮：会话里有那一轮的答案，不用再给一遍
+            if context.quoted_bot_card {
+                context.quoted = None;
+            }
         }
         if !context.doc_links.is_empty() {
             let asker = inputs
@@ -1020,6 +1100,7 @@ impl Runner {
                 self_check: None,
                 session_id: None,
                 stopped: false,
+                timings: Timings::default(),
             },
         };
         // 本轮生成的 MCP、hook 配置用完即删
@@ -1040,6 +1121,7 @@ impl Runner {
             .map(|s| s.name.as_str())
             .collect();
         let pre_assigned = handle.session_id.clone();
+        let spawned = Instant::now();
         let mut result = Attempt {
             outcome: Outcome::Interrupted,
             model: self.settings.model.clone().unwrap_or_default(),
@@ -1048,9 +1130,12 @@ impl Runner {
             self_check: None,
             session_id: None,
             stopped: false,
+            timings: Timings::default(),
         };
         let mut steps: Vec<String> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut thought: Option<String> = None;
+        let mut draft: Option<String> = None;
         let mut dirty = false;
         let mut phase = PHASE_STARTING;
         let mut last_output = Instant::now();
@@ -1073,8 +1158,12 @@ impl Runner {
                         phase = next;
                         dirty = true;
                     }
+                    if phase == PHASE_CONCLUDING && result.timings.concluding.is_none() {
+                        result.timings.concluding = Some(spawned.elapsed());
+                    }
                     match event {
                         AgentEvent::Started(started) => {
+                            result.timings.started = Some(spawned.elapsed());
                             tracing::info!(
                                 turn = %screen.spec.turn_id,
                                 model = %started.model,
@@ -1101,14 +1190,25 @@ impl Runner {
                             if let ai_boot_agent::Step::RateLimited { resets_at, .. } = &step {
                                 notes.push(rate_limit_note(*resets_at));
                             }
+                            // 模型在工具调用之间说的进展，比工具名更能让人判断要不要等
+                            if let ai_boot_agent::Step::Text(text) = &step {
+                                thought = Some(text.clone());
+                                dirty = true;
+                            }
                             if let Some(label) = steps::label(&step) {
                                 steps.push(label);
                                 dirty = true;
                             }
                         }
+                        AgentEvent::Draft(ai_boot_agent::Draft { summary: Some(summary), .. }) => {
+                            draft = Some(summary);
+                            dirty = true;
+                        }
+                        AgentEvent::Draft(_) => {}
                         AgentEvent::Usage(usage) => result.usage = Some(usage),
                         AgentEvent::Finished(outcome) => {
                             result.outcome = outcome;
+                            result.timings.finished = Some(spawned.elapsed());
                             break;
                         }
                         AgentEvent::Warning(message) => {
@@ -1141,7 +1241,13 @@ impl Runner {
                             ));
                         }
                         shown.extend(notes.iter().cloned());
-                        let progress = screen.progress(&steps, &shown, !result.stopped);
+                        let live = Live {
+                            steps: &steps,
+                            thought: thought.as_deref(),
+                            draft: draft.as_deref(),
+                            notes: &shown,
+                        };
+                        let progress = screen.progress(&live, !result.stopped);
                         self.update(screen.card_id, &progress).await;
                     }
                 }
@@ -1283,6 +1389,14 @@ impl Runner {
             tokens,
             tool_calls: i64::try_from(attempt.tool_calls).unwrap_or(i64::MAX),
             session_tokens: cumulative.filter(|_| started),
+            context_tokens: match attempt.usage {
+                Some(usage) if started && usage.context_tokens > 0 => {
+                    Some(i64::try_from(usage.context_tokens).unwrap_or(i64::MAX))
+                }
+                // 新会话没报上下文（比如中途被停）：旧会话的数不能留着，不然下一轮又换
+                _ if started && !resumed => Some(0),
+                _ => None,
+            },
             session_id: attempt.session_id,
             // Agent 没起来就没看到这些消息，游标不前进
             cursor: cursor.filter(|_| started),
@@ -1433,6 +1547,7 @@ impl Runner {
             session_id: report.session_id.as_deref(),
             session_tokens: report.session_tokens,
             history_cursor_ms: report.cursor,
+            context_tokens: report.context_tokens,
             now_ms: now_ms(),
         };
         if let Err(err) = self.store.finish_turn(&finished).await {
@@ -1456,7 +1571,7 @@ impl Runner {
                 Some(Prior {
                     seq: row.seq,
                     question: row.question.unwrap_or_default(),
-                    conclusion: format!("{}：{}", answer.title, answer.summary),
+                    conclusion: prompt::conclusion_of(&answer),
                 })
             })
             .collect()
@@ -1748,6 +1863,15 @@ fn prepare_dir(dir: &Path) -> std::io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
+}
+
+/// 追加到工作目录里的 `context/answers.md`。
+fn append_answer(workdir: &Path, record: &str) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(workdir.join("context").join(prompt::ANSWERS_FILE))?
+        .write_all(record.as_bytes())
 }
 
 fn write_transcript(workdir: &Path, transcript: &Transcript) -> std::io::Result<()> {

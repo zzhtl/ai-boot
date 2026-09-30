@@ -3,6 +3,10 @@
 //! 会话 ID 由我们预先分配（`--session-id`），所以启动那一刻就能落库，崩溃后
 //! 也能续接。MCP 与 hook 的配置文件写在 `run_dir`（工作目录之外），模型读不到，
 //! 也不会被当成项目配置加载。
+//!
+//! 超大的工具结果（整页 Confluence、长日志）CLI 不放进上下文，而是存到
+//! `<配置目录>/projects/<工作目录>/<会话>/tool-results/` 下、只回一个路径。这个目录
+//! 在工作目录外，得同时交给 `--add-dir` 和 hook，模型才读得到。
 
 pub mod decode;
 mod invocation;
@@ -51,7 +55,24 @@ impl ClaudeBackend {
         Self { config }
     }
 
-    fn write_run_files(&self, request: &TurnRequest) -> Result<(PathBuf, PathBuf), AgentError> {
+    /// CLI 的配置目录：会话记录、超大工具结果都在它下面。按实际传给 CLI 的环境算，
+    /// 和 CLI 自己的取法一致：有 `CLAUDE_CONFIG_DIR` 用它，否则是 `~/.claude`。
+    pub fn config_dir(&self) -> Option<PathBuf> {
+        let var = |name: &str| {
+            self.config
+                .env
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| PathBuf::from(value))
+        };
+        var("CLAUDE_CONFIG_DIR").or_else(|| var("HOME").map(|home| home.join(".claude")))
+    }
+
+    fn write_run_files(
+        &self,
+        request: &TurnRequest,
+        results_dir: Option<&Path>,
+    ) -> Result<(PathBuf, PathBuf), AgentError> {
         create_private_dir(&request.run_dir)?;
 
         let servers: serde_json::Map<String, serde_json::Value> = request
@@ -71,11 +92,15 @@ impl ClaudeBackend {
         let mcp_path = request.run_dir.join(MCP_CONFIG_FILE);
         write_private(&mcp_path, &json!({ "mcpServers": servers }))?;
 
-        let command = format!(
+        let mut command = format!(
             "{} hook --backend claude --workdir {}",
             shell_quote(&self.config.hook_program.display().to_string()),
             shell_quote(&request.workdir.display().to_string()),
         );
+        if let Some(dir) = results_dir {
+            command.push_str(" --read-dir ");
+            command.push_str(&shell_quote(&dir.display().to_string()));
+        }
         let hook = json!([{
             "matcher": "",
             "hooks": [{
@@ -103,16 +128,29 @@ impl AgentBackend for ClaudeBackend {
         if !request.workdir.is_dir() {
             return Err(AgentError::MissingWorkdir(request.workdir));
         }
-        let (mcp_path, settings_path) = self.write_run_files(&request)?;
         let session_id = match &request.session {
             SessionRef::New => uuid::Uuid::now_v7().to_string(),
             SessionRef::Resume(id) => id.clone(),
         };
+        // 先建好：hook 按真实路径判断，不存在的目录没法比
+        let results_dir = self
+            .config_dir()
+            .map(|dir| results_dir(&dir, &request.workdir, &session_id));
+        if let Some(dir) = &results_dir {
+            create_private_dir(dir)?;
+        }
+        let (mcp_path, settings_path) = self.write_run_files(&request, results_dir.as_deref())?;
         let session = match &request.session {
             SessionRef::New => SessionArg::New(&session_id),
             SessionRef::Resume(_) => SessionArg::Resume(&session_id),
         };
-        let invocation = Invocation::build(&request, session, &mcp_path, &settings_path);
+        let invocation = Invocation::build(
+            &request,
+            session,
+            &mcp_path,
+            &settings_path,
+            results_dir.as_deref(),
+        );
         tracing::debug!(
             target: "claude::invocation",
             command = %invocation.command_line(&self.config.program.display().to_string()),
@@ -161,6 +199,24 @@ impl AgentBackend for ClaudeBackend {
             recorded_version: Some(RECORDED_VERSION),
         })
     }
+}
+
+/// CLI 按工作目录存会话：目录名是路径里所有非字母数字字符换成 `-`。
+pub fn project_slug(workdir: &Path) -> String {
+    workdir
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// 某个会话的超大工具结果存放的目录。
+fn results_dir(config_dir: &Path, workdir: &Path, session_id: &str) -> PathBuf {
+    config_dir
+        .join("projects")
+        .join(project_slug(workdir))
+        .join(session_id)
+        .join("tool-results")
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), AgentError> {
@@ -237,8 +293,9 @@ mod tests {
         let run = root.path().join("run");
         let work = root.path().join("work dir");
         std::fs::create_dir(&work).expect("工作目录");
+        let results = root.path().join("claude/projects/x/s/tool-results");
         let (mcp, settings) = backend()
-            .write_run_files(&request(run.clone(), work))
+            .write_run_files(&request(run.clone(), work), Some(&results))
             .expect("写配置");
 
         let mcp: serde_json::Value =
@@ -259,6 +316,11 @@ mod tests {
             assert!(
                 command.starts_with("'/opt/ai boot/bin/ai-boot' hook --backend claude --workdir '")
             );
+            // 超大工具结果的目录也交给 hook，否则模型读它时会被拦下
+            assert!(
+                command.ends_with(&format!("--read-dir {}", results.display())),
+                "{command}"
+            );
         }
 
         use std::os::unix::fs::PermissionsExt as _;
@@ -267,5 +329,42 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn oversized_tool_results_live_under_the_config_dir_the_cli_actually_uses() {
+        let with_env = |env: &[(&str, &str)]| {
+            ClaudeBackend::new(ClaudeConfig {
+                env: env
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect(),
+                ..backend().config
+            })
+        };
+        assert_eq!(
+            with_env(&[("HOME", "/home/u")]).config_dir(),
+            Some(PathBuf::from("/home/u/.claude"))
+        );
+        assert_eq!(
+            with_env(&[
+                ("HOME", "/home/u"),
+                ("CLAUDE_CONFIG_DIR", "/var/lib/ai-boot/claude")
+            ])
+            .config_dir(),
+            Some(PathBuf::from("/var/lib/ai-boot/claude"))
+        );
+        assert_eq!(with_env(&[]).config_dir(), None);
+        // 和线上看到的路径一致：/var/lib/ai-boot/sessions/<会话> → -var-lib-ai-boot-sessions-<会话>
+        assert_eq!(
+            results_dir(
+                Path::new("/home/u/.claude"),
+                Path::new("/var/lib/ai-boot/sessions/01a0ecb0-f185"),
+                "s-1"
+            ),
+            PathBuf::from(
+                "/home/u/.claude/projects/-var-lib-ai-boot-sessions-01a0ecb0-f185/s-1/tool-results"
+            )
+        );
     }
 }

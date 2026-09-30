@@ -1,8 +1,11 @@
 //! Office 文档：docx、pptx 是 zip 里的 XML，逐事件读出文字；doc、ppt、odt、odp
 //! 先用 soffice 转成新格式再读。
+//!
+//! 原件是 zip，模型读不了：全文另存一份纯文本给它 Grep，嵌在里面的截图按图片交给它。
 
 use std::io::{Cursor, Read as _};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use quick_xml::Reader;
@@ -10,10 +13,15 @@ use quick_xml::events::{BytesRef, BytesStart, Event};
 use tokio::process::Command;
 use zip::ZipArchive;
 
-use super::{Kind, Output, TEXT_CHARS, Tools, XML_LIMIT, blocking, clip_chars, run};
+use super::archive::Format;
+use super::image::{WORKERS, normalize_tiled};
+use super::{Kind, Output, TEXT_BYTES, Tools, XML_LIMIT, blocking, clip_bytes, run, sanitize};
 
 const MAX_SLIDES: usize = 100;
-const LISTING_ENTRIES: usize = 100;
+/// 每份文档最多交给模型几张图（长截图切出的段也算）：每轮一共才 20 张。
+const DOC_IMAGES: usize = 10;
+/// 另存的全文上限，更长的只存前面。
+const FULL_TEXT: usize = 8 * 1024 * 1024;
 const SOFFICE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// soffice 同一个配置目录不能并发使用，转换一个一个来。
@@ -42,7 +50,7 @@ pub(super) fn zip_kind(bytes: &[u8]) -> Kind {
         "application/vnd.oasis.opendocument.spreadsheet" => Kind::Sheet,
         "application/vnd.oasis.opendocument.text" => Kind::Legacy("docx"),
         "application/vnd.oasis.opendocument.presentation" => Kind::Legacy("pptx"),
-        _ => Kind::Zip,
+        _ => Kind::Archive(Format::Zip),
     }
 }
 
@@ -98,8 +106,16 @@ fn heading_level(element: &BytesStart<'_>) -> Option<usize> {
     (1..=6).contains(&level).then_some(level)
 }
 
-pub(super) fn docx(bytes: &[u8]) -> Result<Output, String> {
-    let xml = read_entry(&mut open(bytes)?, "word/document.xml")?;
+/// 解析出的文档：全文，和嵌在里面的图片在 zip 里的条目名。
+pub(super) struct Document {
+    pub text: String,
+    pub media: Vec<String>,
+    pub note: Option<String>,
+}
+
+pub(super) fn docx(bytes: &[u8]) -> Result<Document, String> {
+    let mut archive = open(bytes)?;
+    let xml = read_entry(&mut archive, "word/document.xml")?;
     let mut reader = Reader::from_reader(xml.as_slice());
     reader.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -168,14 +184,18 @@ pub(super) fn docx(bytes: &[u8]) -> Result<Output, String> {
             _ => {}
         }
         buf.clear();
-        if out.len() > TEXT_CHARS * 4 {
+        if out.len() > FULL_TEXT {
             break;
         }
     }
-    Ok(finish(&out))
+    Ok(Document {
+        note: truncated(&out),
+        text: out,
+        media: media(&archive, "word/media/"),
+    })
 }
 
-pub(super) fn pptx(bytes: &[u8]) -> Result<Output, String> {
+pub(super) fn pptx(bytes: &[u8]) -> Result<Document, String> {
     let mut archive = open(bytes)?;
     let mut slides: Vec<(u32, String)> = archive
         .file_names()
@@ -196,15 +216,134 @@ pub(super) fn pptx(bytes: &[u8]) -> Result<Output, String> {
         if !text.is_empty() {
             out.push_str(&format!("## 第 {index} 页\n{text}\n"));
         }
-        if out.len() > TEXT_CHARS * 4 {
+        if out.len() > FULL_TEXT {
             break;
         }
     }
-    let mut output = finish(&out);
-    if slides.len() > MAX_SLIDES {
-        output.note = Some(format!("只读了前 {MAX_SLIDES} 页"));
+    let note = if slides.len() > MAX_SLIDES {
+        Some(format!("只读了前 {MAX_SLIDES} 页"))
+    } else {
+        truncated(&out)
+    };
+    Ok(Document {
+        note,
+        text: out,
+        media: media(&archive, "ppt/media/"),
+    })
+}
+
+fn truncated(text: &str) -> Option<String> {
+    (text.len() > FULL_TEXT).then(|| format!("文档很长，只读了前 {} MB 的文字", FULL_TEXT >> 20))
+}
+
+/// 文档里嵌的图片：只要模型能看的格式，emf、wmf 这类矢量图跳过。按编号排（image2 在
+/// image10 前面），大致就是在文档里出现的顺序。
+fn media(archive: &ZipArchive<Cursor<&[u8]>>, prefix: &str) -> Vec<String> {
+    let mut found: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(|name| {
+            let (stem, ext) = name.strip_prefix(prefix)?.rsplit_once('.')?;
+            let wanted = matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+            );
+            let number = stem
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .unwrap_or(u32::MAX);
+            wanted.then(|| (number, name.to_owned()))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
+/// docx、pptx：解析，全文存到原件旁边，嵌入的图片按截图处理。
+pub(super) async fn read(
+    path: &Path,
+    format: &'static str,
+    bytes: Vec<u8>,
+    out_dir: &Path,
+) -> Result<Output, String> {
+    let bytes = Arc::new(bytes);
+    let parsed = Arc::clone(&bytes);
+    let document = match format {
+        "pptx" => blocking(move || pptx(&parsed)).await?,
+        _ => blocking(move || docx(&parsed)).await?,
+    };
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document");
+    let mut notes: Vec<String> = document.note.into_iter().collect();
+    let saved = if document.text.trim().is_empty() {
+        None
+    } else {
+        let saved = path.with_file_name(format!("{name}.txt"));
+        tokio::fs::write(&saved, document.text.as_bytes())
+            .await
+            .map_err(|err| format!("保存失败：{err}"))?;
+        Some(saved)
+    };
+    let (text, cut) = clip_bytes(document.text.trim(), TEXT_BYTES);
+    if cut {
+        notes.push("内容较长，只放了前面一部分，完整内容见原件".to_owned());
     }
-    Ok(output)
+    let mut images = Vec::new();
+    let mut failed = 0;
+    for entry in &document.media {
+        if images.len() >= DOC_IMAGES {
+            notes.push(format!(
+                "文档里有 {} 张图片，只取了前面的 {DOC_IMAGES} 张",
+                document.media.len()
+            ));
+            break;
+        }
+        // 文件名跟着文档里的条目名走（image2.png → 原件名-image2.webp），对得上号
+        let stem = sanitize(
+            Path::new(entry.as_str())
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image"),
+        );
+        let (bytes, entry) = (Arc::clone(&bytes), entry.clone());
+        // 和聊天里的图共用解码的并发：一张大图解码后要几十 MB 内存
+        let tiles = match WORKERS.acquire().await {
+            Ok(_permit) => {
+                blocking(move || normalize_tiled(read_entry(&mut open(&bytes)?, &entry)?)).await
+            }
+            Err(err) => Err(format!("处理图片失败：{err}")),
+        };
+        let Ok(tiles) = tiles else {
+            failed += 1;
+            continue;
+        };
+        let single = tiles.len() == 1;
+        for (t, (data, ext)) in tiles.into_iter().enumerate() {
+            if images.len() >= DOC_IMAGES {
+                break;
+            }
+            let file = if single {
+                format!("{name}-{stem}.{ext}")
+            } else {
+                format!("{name}-{stem}-{}.{ext}", t + 1)
+            };
+            let image = out_dir.join(file);
+            tokio::fs::write(&image, &data)
+                .await
+                .map_err(|err| format!("保存失败：{err}"))?;
+            images.push(image);
+        }
+    }
+    if failed > 0 {
+        notes.push(format!("{failed} 张图片无法处理"));
+    }
+    Ok(Output {
+        text,
+        images,
+        note: (!notes.is_empty()).then(|| notes.join("；")),
+        saved,
+    })
 }
 
 fn slide_text(xml: &[u8]) -> Result<String, String> {
@@ -242,57 +381,28 @@ fn slide_text(xml: &[u8]) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-fn finish(text: &str) -> Output {
-    let (text, cut) = clip_chars(text.trim(), TEXT_CHARS);
-    Output {
-        text,
-        images: Vec::new(),
-        note: cut.then(|| "内容较长，只放了前面一部分，完整内容见原件".to_owned()),
-    }
-}
-
-/// 普通 zip：不解压，只列清单。
-pub(super) fn zip_listing(bytes: &[u8]) -> Result<Output, String> {
-    let mut archive = open(bytes)?;
-    let total = archive.len();
-    let mut lines = Vec::new();
-    for i in 0..total.min(LISTING_ENTRIES) {
-        let file = archive
-            .by_index_raw(i)
-            .map_err(|err| format!("压缩包无法读取：{err}"))?;
-        lines.push(format!("{}（{} 字节）", file.name(), file.size()));
-    }
-    if total > LISTING_ENTRIES {
-        lines.push(format!("…（共 {total} 个文件）"));
-    }
-    Ok(Output {
-        text: lines.join("\n"),
-        images: Vec::new(),
-        note: Some("压缩包没有解压，只列了文件清单；需要里面的内容请单独发出来".to_owned()),
-    })
-}
-
 /// 旧版 Office 与 OpenDocument：soffice 转成 docx/pptx 再读。
 pub(super) async fn legacy(
     path: &Path,
     target: &'static str,
+    out_dir: &Path,
     tools: &Tools,
 ) -> Result<Output, String> {
-    let _serial = SOFFICE.lock().await;
-    let out_dir = tools
-        .scratch
-        .join(format!("soffice-{}", uuid::Uuid::now_v7()));
-    let result = convert(path, target, &out_dir, tools).await;
-    if let Err(err) = tokio::fs::remove_dir_all(&out_dir).await
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::debug!(%err, dir = %out_dir.display(), "清理转换目录失败");
-    }
-    let bytes = result?;
-    let mut output = match target {
-        "pptx" => blocking(move || pptx(&bytes)).await?,
-        _ => blocking(move || docx(&bytes)).await?,
+    // 锁只管转换：之后处理嵌入的图片还要排队等解码的名额，不该占着 soffice
+    let result = {
+        let _serial = SOFFICE.lock().await;
+        let soffice_dir = tools
+            .scratch
+            .join(format!("soffice-{}", uuid::Uuid::now_v7()));
+        let result = convert(path, target, &soffice_dir, tools).await;
+        if let Err(err) = tokio::fs::remove_dir_all(&soffice_dir).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(%err, dir = %soffice_dir.display(), "清理转换目录失败");
+        }
+        result
     };
+    let mut output = read(path, target, result?, out_dir).await?;
     let converted = "由 soffice 转换后读取".to_owned();
     output.note = Some(match output.note {
         Some(note) => format!("{converted}；{note}"),
@@ -344,13 +454,33 @@ pub(super) mod tests {
 
     /// 把若干个文件打成 zip。
     pub fn zip_of(entries: &[(&str, &str)]) -> Vec<u8> {
+        let entries: Vec<(&str, &[u8])> = entries
+            .iter()
+            .map(|(name, content)| (*name, content.as_bytes()))
+            .collect();
+        zip_bytes(&entries)
+    }
+
+    pub fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default();
         for (name, content) in entries {
             writer.start_file(*name, options).expect("写条目");
-            writer.write_all(content.as_bytes()).expect("写内容");
+            writer.write_all(content).expect("写内容");
         }
         writer.finish().expect("完成").into_inner()
+    }
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let image =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+                image::Rgb([(x % 256) as u8, (y % 256) as u8, 9])
+            }));
+        let mut out = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .expect("编码");
+        out
     }
 
     pub const DOCUMENT: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -370,9 +500,87 @@ pub(super) mod tests {
         assert_eq!(zip_kind(&bytes), Kind::Docx);
         let output = docx(&bytes).expect("解析");
         assert_eq!(
-            output.text,
+            output.text.trim(),
             "# 故障复盘\n根因：连接池 耗尽 & 未告警\n| 版本 | 现象 |\n| 3.2.1 | 登录 500 偶发 |\n结论\t扩容"
         );
+    }
+
+    /// 全文另存成原件旁边的 .txt（`saved` 指向它），嵌入的截图交给模型，矢量图跳过。
+    #[tokio::test]
+    async fn docx_full_text_is_saved_and_embedded_images_are_kept() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let paragraphs: String = (0..3000)
+            .map(|i| format!("<w:p><w:r><w:t>第 {i} 段：排查记录，连接池耗尽</w:t></w:r></w:p>"))
+            .collect();
+        let document = DOCUMENT.replace("<w:body>", &format!("<w:body>{paragraphs}"));
+        let (shot, logo) = (png(400, 300), png(64, 64));
+        let bytes = zip_bytes(&[
+            ("word/document.xml", document.as_bytes()),
+            ("word/media/image10.png", &logo),
+            ("word/media/image2.png", &shot),
+            ("word/media/image3.emf", b"vector"),
+            ("word/media/image4.png", b"broken"),
+        ]);
+        let path = dir.path().join("03-复盘.docx");
+        std::fs::write(&path, &bytes).expect("写原件");
+        let output = read(&path, "docx", bytes, dir.path()).await.expect("解析");
+
+        let saved = output.saved.as_ref().expect("另存了全文");
+        assert_eq!(saved, &dir.path().join("03-复盘.docx.txt"));
+        let full = std::fs::read_to_string(saved).expect("全文");
+        assert!(full.contains("第 2999 段") && full.contains("结论\t扩容"));
+        assert!(output.text.len() <= TEXT_BYTES);
+        assert!(
+            !output.text.contains("第 2999 段"),
+            "prompt 里只放前面一部分"
+        );
+        let note = output.note.as_deref().unwrap_or_default();
+        assert!(note.contains("只放了前面一部分"), "{note}");
+        assert!(note.contains("1 张图片无法处理"), "{note}");
+
+        let names: Vec<String> = output
+            .images
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names[0].starts_with("03-复盘.docx-image2."),
+            "按编号排：{names:?}"
+        );
+        assert!(names[1].starts_with("03-复盘.docx-image10."), "{names:?}");
+        assert!(
+            output
+                .images
+                .iter()
+                .all(|p| p.starts_with(dir.path()) && p.exists())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_contributes_at_most_ten_images() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let shot = png(32, 32);
+        let names: Vec<String> = (1..=12)
+            .map(|i| format!("ppt/media/image{i}.png"))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("ppt/presentation.xml", b"<p/>")];
+        entries.extend(names.iter().map(|n| (n.as_str(), shot.as_slice())));
+        let bytes = zip_bytes(&entries);
+        let path = dir.path().join("01-deck.pptx");
+        let output = read(&path, "pptx", bytes, dir.path()).await.expect("解析");
+        assert_eq!(output.images.len(), DOC_IMAGES);
+        assert!(
+            output
+                .note
+                .is_some_and(|n| n.contains("只取了前面的 10 张"))
+        );
+        assert_eq!(output.saved, None, "没有文字就不另存");
     }
 
     #[test]
@@ -392,18 +600,15 @@ pub(super) mod tests {
         assert_eq!(zip_kind(&bytes), Kind::Pptx);
         let output = pptx(&bytes).expect("解析");
         assert_eq!(
-            output.text,
+            output.text.trim(),
             "## 第 1 页\n背景\n要点\n## 第 2 页\n方案\n要点\n## 第 10 页\n结论\n要点"
         );
     }
 
     #[test]
-    fn a_plain_zip_is_only_listed() {
+    fn a_plain_zip_is_an_archive() {
         let bytes = zip_of(&[("logs/app.log", "x"), ("logs/gc.log", "yy")]);
-        assert_eq!(zip_kind(&bytes), Kind::Zip);
-        let output = zip_listing(&bytes).expect("清单");
-        assert_eq!(output.text, "logs/app.log（1 字节）\nlogs/gc.log（2 字节）");
-        assert!(output.note.is_some_and(|n| n.contains("没有解压")));
+        assert_eq!(zip_kind(&bytes), Kind::Archive(Format::Zip));
     }
 
     #[test]
@@ -427,6 +632,7 @@ pub(super) mod tests {
         let tools = Tools {
             office_legacy: true,
             scratch: dir.path().to_path_buf(),
+            program: std::path::PathBuf::from("ai-boot"),
         };
         // 先用 soffice 从纯文本造一个旧版 .doc
         let source = dir.path().join("note.txt");
@@ -445,8 +651,13 @@ pub(super) mod tests {
             .await
             .expect("造 doc");
         let doc = made.join("note.doc");
-        let output = legacy(&doc, "docx", &tools).await.expect("转换");
+        let output = legacy(&doc, "docx", &made, &tools).await.expect("转换");
         assert!(output.text.contains("旧版文档里的排查记录"), "{output:?}");
+        assert_eq!(
+            output.saved,
+            Some(made.join("note.doc.txt")),
+            "全文存在原件旁边"
+        );
         assert!(output.note.is_some_and(|n| n.contains("soffice")));
     }
 }

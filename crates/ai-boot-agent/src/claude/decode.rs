@@ -12,7 +12,9 @@
 
 use serde_json::Value;
 
-use crate::event::{Activity, AgentEvent, FailKind, McpStatus, Outcome, Started, Step, Usage};
+use crate::event::{
+    Activity, AgentEvent, Draft, FailKind, McpStatus, Outcome, Started, Step, Usage,
+};
 
 /// 工具结果摘要的长度上限（字符）。
 const PREVIEW_LIMIT: usize = 400;
@@ -23,13 +25,29 @@ const TEXT_LIMIT: usize = 1000;
 const PRE_TOOL_USE_PREFIX: &str = "PreToolUse:";
 const HOOK_ERROR_MARK: &str = " hook error: ";
 
-/// 逐行解码。无状态：每行都是自包含的一条事件。
+/// 逐行解码。每行都是自包含的一条事件，只有两件事要跨行记：结构化答案的增量片段
+/// （拼起来才看得出哪些字段写完了），和最近一次请求带上的上下文（终态时一起报）。
 #[derive(Debug, Default)]
-pub struct Decoder;
+pub struct Decoder {
+    /// 正在写的结构化答案。
+    answer: Option<PartialAnswer>,
+    /// 已经报过的草稿：字段没变就不再报。
+    draft: Draft,
+    context_tokens: u64,
+}
+
+/// `StructuredOutput` 工具调用的内容块：序号和已收到的 JSON 片段。
+#[derive(Debug)]
+struct PartialAnswer {
+    index: u64,
+    json: String,
+    /// 标题和概述都拿到了：后面的片段不用再拼。
+    done: bool,
+}
 
 impl Decoder {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     /// 解一行。一行可能产出零到多条事件（一条 assistant 事件里可以有多个内容块）。
@@ -50,11 +68,16 @@ impl Decoder {
         };
         match value.get("type").and_then(Value::as_str) {
             Some("system") => system(&value),
-            Some("assistant") => assistant(&value),
+            Some("assistant") => {
+                if let Some(tokens) = context_of(&value) {
+                    self.context_tokens = tokens;
+                }
+                assistant(&value)
+            }
             Some("user") => user(&value),
-            Some("result") => result(&value),
+            Some("result") => result(&value, self.context_tokens),
             Some("rate_limit_event") => rate_limit(&value),
-            Some("stream_event") => stream_event(&value),
+            Some("stream_event") => self.stream_event(&value),
             Some(other) => vec![AgentEvent::Warning(format!(
                 "stream-json 出现未知事件类型 `{other}`，已忽略"
             ))],
@@ -70,6 +93,155 @@ impl crate::process::Decode for Decoder {
     fn line(&mut self, line: &str) -> Vec<AgentEvent> {
         Decoder::line(self, line)
     }
+}
+
+impl Decoder {
+    /// `--include-partial-messages` 的增量事件：完整内容随后还会以 assistant 事件出现，
+    /// 这里只取「模型在做什么」，以及结构化答案里已经写完的标题和概述。结构化答案是
+    /// 模型调用 `StructuredOutput` 工具写出来的，参数按 JSON 片段一段段流过来。
+    fn stream_event(&mut self, value: &Value) -> Vec<AgentEvent> {
+        let index = value.pointer("/event/index").and_then(Value::as_u64);
+        let mut events = Vec::new();
+        let activity = match value.pointer("/event/type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let block = value.pointer("/event/content_block");
+                match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
+                    Some("thinking" | "redacted_thinking") => Activity::Thinking,
+                    Some("text") => Activity::Writing,
+                    Some("tool_use")
+                        if block.and_then(|b| string_at(b, "name")).as_deref()
+                            == Some("StructuredOutput") =>
+                    {
+                        self.answer = index.map(|index| PartialAnswer {
+                            index,
+                            json: String::new(),
+                            done: false,
+                        });
+                        Activity::Concluding
+                    }
+                    _ => Activity::Streaming,
+                }
+            }
+            Some("content_block_delta") => {
+                if let Some(draft) = self.answer_delta(index, value) {
+                    events.push(AgentEvent::Draft(draft));
+                }
+                Activity::Streaming
+            }
+            // 序号只在一条消息内有效
+            Some("message_start") => {
+                self.answer = None;
+                Activity::Streaming
+            }
+            _ => Activity::Streaming,
+        };
+        events.insert(0, AgentEvent::Activity(activity));
+        events
+    }
+
+    /// 结构化答案的一段参数片段。标题或概述刚写完时返回新的草稿。
+    fn answer_delta(&mut self, index: Option<u64>, value: &Value) -> Option<Draft> {
+        let answer = self.answer.as_mut().filter(|a| Some(a.index) == index)?;
+        if answer.done {
+            return None;
+        }
+        answer
+            .json
+            .push_str(value.pointer("/event/delta/partial_json")?.as_str()?);
+        let title = completed_string(&answer.json, "title");
+        let summary = completed_string(&answer.json, "summary");
+        answer.done = title.is_some() && summary.is_some();
+        // 答案被 schema 校验打回、重写时，先保留上一次的
+        let draft = Draft {
+            title: title.or_else(|| self.draft.title.clone()),
+            summary: summary.or_else(|| self.draft.summary.clone()),
+        };
+        if draft == self.draft {
+            return None;
+        }
+        self.draft = draft.clone();
+        Some(draft)
+    }
+}
+
+/// 写到一半的 JSON 对象里，顶层字段 `key` 的字符串值；值的结束引号还没出现（或者
+/// 这个字段还没写到）就返回 `None`。
+fn completed_string(partial: &str, key: &str) -> Option<String> {
+    let bytes = partial.as_bytes();
+    let mut depth = 0_usize;
+    // 顶层下一个字符串是字段名
+    let mut expect_key = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = depth == 1 && bytes[i] == b'{';
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' => {
+                expect_key = depth == 1;
+                i += 1;
+            }
+            b'"' => {
+                let end = string_end(bytes, i)?;
+                if !(depth == 1 && expect_key) {
+                    i = end + 1;
+                    continue;
+                }
+                expect_key = false;
+                let name: String = serde_json::from_str(&partial[i..=end]).ok()?;
+                let colon = skip_space(bytes, end + 1)?;
+                if bytes[colon] != b':' {
+                    i = colon;
+                    continue;
+                }
+                let start = skip_space(bytes, colon + 1)?;
+                if name == key {
+                    if bytes[start] != b'"' {
+                        return None;
+                    }
+                    let value_end = string_end(bytes, start)?;
+                    return serde_json::from_str(&partial[start..=value_end]).ok();
+                }
+                i = start;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 从 `start` 处的引号开始的字符串在哪里结束（结束引号的下标），还没结束返回 `None`。
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// 跳过空白，返回下一个字符的下标；到末尾了返回 `None`。
+fn skip_space(bytes: &[u8], from: usize) -> Option<usize> {
+    (from..bytes.len()).find(|&i| !bytes[i].is_ascii_whitespace())
+}
+
+/// 一次请求带上的上下文：输入加缓存读写。同一次请求的每个内容块都带着同一份用量。
+fn context_of(value: &Value) -> Option<u64> {
+    let usage = value.pointer("/message/usage")?;
+    Some(
+        u64_at(usage, "input_tokens")
+            + u64_at(usage, "cache_creation_input_tokens")
+            + u64_at(usage, "cache_read_input_tokens"),
+    )
 }
 
 fn system(value: &Value) -> Vec<AgentEvent> {
@@ -120,29 +292,6 @@ fn system(value: &Value) -> Vec<AgentEvent> {
         ))],
         None => Vec::new(),
     }
-}
-
-/// `--include-partial-messages` 的增量事件：完整内容随后还会以 assistant 事件出现，
-/// 这里只取「模型在做什么」。结构化答案是模型调用 `StructuredOutput` 工具写出来的。
-fn stream_event(value: &Value) -> Vec<AgentEvent> {
-    let activity = match value.pointer("/event/type").and_then(Value::as_str) {
-        Some("content_block_start") => {
-            let block = value.pointer("/event/content_block");
-            match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
-                Some("thinking" | "redacted_thinking") => Activity::Thinking,
-                Some("text") => Activity::Writing,
-                Some("tool_use")
-                    if block.and_then(|b| string_at(b, "name")).as_deref()
-                        == Some("StructuredOutput") =>
-                {
-                    Activity::Concluding
-                }
-                _ => Activity::Streaming,
-            }
-        }
-        _ => Activity::Streaming,
-    };
-    vec![AgentEvent::Activity(activity)]
 }
 
 fn assistant(value: &Value) -> Vec<AgentEvent> {
@@ -222,8 +371,11 @@ fn rate_limit(value: &Value) -> Vec<AgentEvent> {
     })]
 }
 
-fn result(value: &Value) -> Vec<AgentEvent> {
-    let usage = usage_of(value);
+fn result(value: &Value, context_tokens: u64) -> Vec<AgentEvent> {
+    let usage = Usage {
+        context_tokens,
+        ..usage_of(value)
+    };
     let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
     let terminal = value
         .get("terminal_reason")
@@ -482,6 +634,104 @@ mod tests {
             ),
             FailKind::Api
         );
+    }
+
+    #[test]
+    fn a_field_counts_as_written_only_once_its_closing_quote_arrives() {
+        let full = r#"{"kind": "diagnosis", "title": "登录超时 \"1205\"", "status": "partial", "summary": "锁等待\n超时", "sections": [{"title": "x"}]}"#;
+        assert_eq!(
+            completed_string(full, "title").as_deref(),
+            Some("登录超时 \"1205\"")
+        );
+        assert_eq!(
+            completed_string(full, "summary").as_deref(),
+            Some("锁等待\n超时")
+        );
+        // 嵌套对象里的同名字段不算
+        let nested = r#"{"sections": [{"title": "段落"}], "title": "顶层"#;
+        assert_eq!(completed_string(nested, "title"), None);
+        // 每一个前缀都不能报出没写完的值
+        for end in 0..full.len() {
+            if !full.is_char_boundary(end) {
+                continue;
+            }
+            let partial = &full[..end];
+            if let Some(summary) = completed_string(partial, "summary") {
+                assert_eq!(summary, "锁等待\n超时", "{partial}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_draft_follows_the_structured_answer_as_it_streams() {
+        let mut decoder = Decoder::new();
+        let mut drafts = Vec::new();
+        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"StructuredOutput","input":{}}}}"#;
+        drafts.extend(decoder.line(start));
+        let pieces = [
+            r#"{"kind": "diagnosis", "ti"#,
+            r#"tle": "登录超时", "status": "par"#,
+            r#"tial", "summary": "锁等待"#,
+            r#"超时", "sections": []}"#,
+        ];
+        for piece in pieces {
+            let delta = serde_json::json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "index": 1,
+                          "delta": {"type": "input_json_delta", "partial_json": piece}}
+            });
+            drafts.extend(decoder.line(&delta.to_string()));
+        }
+        let drafts: Vec<Draft> = drafts
+            .into_iter()
+            .filter_map(|e| match e {
+                AgentEvent::Draft(draft) => Some(draft),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drafts,
+            [
+                Draft {
+                    title: Some("登录超时".into()),
+                    summary: None
+                },
+                Draft {
+                    title: Some("登录超时".into()),
+                    summary: Some("锁等待超时".into())
+                },
+            ]
+        );
+        // 别的内容块的片段不算
+        let other = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"summary\": \"x\"}"}}}"#;
+        assert!(
+            !decoder
+                .line(other)
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Draft(_)))
+        );
+    }
+
+    #[test]
+    fn the_last_request_context_is_reported_with_the_usage() {
+        let mut decoder = Decoder::new();
+        for (input, created, read) in [(10, 6_000, 0), (8, 400, 6_010)] {
+            let line = serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [], "usage": {
+                    "input_tokens": input,
+                    "cache_creation_input_tokens": created,
+                    "cache_read_input_tokens": read
+                }}
+            });
+            decoder.line(&line.to_string());
+        }
+        let events = decoder.line(r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"m":{"inputTokens":18,"outputTokens":5}}}"#);
+        let Some(AgentEvent::Usage(usage)) = events.first() else {
+            panic!("应当先报用量：{events:?}");
+        };
+        assert_eq!(usage.context_tokens, 6_418);
+        assert_eq!(usage.input_tokens, 18);
     }
 
     #[test]

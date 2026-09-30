@@ -8,9 +8,11 @@
 //!   会有已经超过保留期的数据。
 //! - 清掉崩溃留下的运行目录和临时目录。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use ai_boot_agent::claude::project_slug;
 use tokio_util::sync::CancellationToken;
 
 use crate::store::{Store, now_ms};
@@ -89,11 +91,22 @@ impl Maintenance {
             Err(err) => tracing::warn!("{err:#}"),
         }
         // 库里已经没有记录的残留：崩溃或手工删库留下的工作目录，以及 Claude 那边
-        // 对应的会话目录（只动机器人工作目录对应的那些，不碰用户自己的项目）
-        sweep(&sessions, RETENTION).await;
-        if let Some(config) = &self.claude_config_dir {
-            let prefix = format!("{}-", project_slug(&sessions));
-            sweep_prefixed(&config.join("projects"), &prefix, RETENTION).await;
+        // 对应的会话目录（只动机器人工作目录对应的那些，不碰用户自己的项目）。库里还有的
+        // 不算残留：上面跳过的在跑、刚来消息的过期会话，目录根的修改时间在第一轮之后
+        // 就不变了，只看时间会把它们正在用的目录删掉
+        match self.store.conversation_ids().await {
+            Ok(alive) => {
+                sweep_except(&sessions, "", RETENTION, &alive).await;
+                if let Some(config) = &self.claude_config_dir {
+                    let prefix = format!("{}-", project_slug(&sessions));
+                    let alive: HashSet<String> = alive
+                        .iter()
+                        .map(|id| project_slug(&sessions.join(id)))
+                        .collect();
+                    sweep_except(&config.join("projects"), &prefix, RETENTION, &alive).await;
+                }
+            }
+            Err(err) => tracing::warn!("{err:#}，这次不清扫残留目录"),
         }
         if deleted > 0
             && let Err(err) = self.store.compact().await
@@ -140,15 +153,6 @@ impl Maintenance {
     }
 }
 
-/// Claude 按工作目录存会话：目录名是路径里所有非字母数字字符换成 `-`。
-fn project_slug(workdir: &Path) -> String {
-    workdir
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
 async fn remove(path: &Path) {
     if let Err(err) = tokio::fs::remove_dir_all(path).await
         && err.kind() != std::io::ErrorKind::NotFound
@@ -159,19 +163,19 @@ async fn remove(path: &Path) {
 
 /// 删掉目录下超过 `age` 没动过的子目录和文件。
 async fn sweep(dir: &Path, age: Duration) {
-    sweep_prefixed(dir, "", age).await;
+    sweep_except(dir, "", age, &HashSet::new()).await;
 }
 
-/// 同 [`sweep`]，只看名字以 `prefix` 开头的。
-async fn sweep_prefixed(dir: &Path, prefix: &str, age: Duration) {
+/// 同 [`sweep`]，只看名字以 `prefix` 开头的，`keep` 里的名字不动。
+async fn sweep_except(dir: &Path, prefix: &str, age: Duration, keep: &HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let now = SystemTime::now();
-    for entry in entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
-    {
+    for entry in entries.filter_map(Result::ok).filter(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.starts_with(prefix) && !keep.contains(&name)
+    }) {
         let old = entry
             .metadata()
             .and_then(|m| m.modified())
@@ -286,6 +290,7 @@ mod tests {
                 session_id: None,
                 session_tokens: None,
                 history_cursor_ms: None,
+                context_tokens: None,
                 now_ms: now - 3 * day,
             })
             .await
@@ -298,6 +303,17 @@ mod tests {
             std::fs::write(workdir.join("attachments/1/00-image.webp"), b"x").expect("附件");
             std::fs::create_dir_all(claude.join("projects").join(project_slug(&workdir)))
                 .expect("Claude 会话");
+        }
+        // busy 的目录根在第一轮之后就不再变：修改时间早就超过保留期了，也不能当残留删
+        let long_ago = SystemTime::now() - Duration::from_secs(40 * 24 * 3600);
+        let busy = data.join("sessions").join("busy");
+        for dir in [
+            busy.clone(),
+            claude.join("projects").join(project_slug(&busy)),
+        ] {
+            std::fs::File::open(&dir)
+                .and_then(|f| f.set_modified(long_ago))
+                .expect("改修改时间");
         }
         // 用户自己的 Claude 项目不能碰
         let own = claude.join("projects").join("-home-u-code");
