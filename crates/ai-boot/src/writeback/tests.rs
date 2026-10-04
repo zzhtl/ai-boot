@@ -33,6 +33,7 @@ fn answer(keys: &[&str]) -> Answer {
         }],
         open_questions: vec![],
         references: vec![],
+        files: vec![],
         jira_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
         image_keys: Default::default(),
     }

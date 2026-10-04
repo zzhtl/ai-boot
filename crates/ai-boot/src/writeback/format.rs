@@ -391,6 +391,7 @@ mod tests {
                 title: "ABC-12".into(),
                 url: "https://jira.example.com/browse/ABC-12".into(),
             }],
+            files: vec![],
             jira_keys: vec!["ABC-12".into()],
             image_keys: Default::default(),
         }

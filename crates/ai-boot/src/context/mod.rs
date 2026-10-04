@@ -188,6 +188,21 @@ pub struct Gathering {
 const BACKEND_PREFIXES: [&str; 2] = ["claude", "codex"];
 
 /// 拆出开头的 `/claude`、`/codex`。
+/// 「清空上下文」指令：整条消息就是这句话，可以带「重新开始」这样几个字的尾巴和标点；
+/// 在一句提问里顺带提到的不算，免得误删。也认 `/clear`。
+pub fn is_clear_command(text: &str) -> bool {
+    const COMMAND: &str = "清空上下文";
+    /// 指令后面最多还能有几个字（不算标点和空白），比如「重新开始」。
+    const TAIL_CHARS: usize = 4;
+    if text.trim().eq_ignore_ascii_case("/clear") {
+        return true;
+    }
+    let words: String = text.chars().filter(|c| c.is_alphanumeric()).collect();
+    words
+        .strip_prefix(COMMAND)
+        .is_some_and(|tail| tail.chars().count() <= TAIL_CHARS)
+}
+
 pub fn split_backend_prefix(text: &str) -> (Option<&'static str>, &str) {
     let trimmed = text.trim_start();
     for name in BACKEND_PREFIXES {
@@ -989,6 +1004,29 @@ mod tests {
             split_backend_prefix("问一下 /codex"),
             (None, "问一下 /codex")
         );
+    }
+
+    #[test]
+    fn only_a_bare_clear_command_clears_the_context() {
+        for text in [
+            "清空上下文",
+            " 清空上下文。",
+            "清空上下文，重新开始",
+            "清空上下文吧",
+            "/clear",
+            "/CLEAR ",
+        ] {
+            assert!(is_clear_command(text), "{text}");
+        }
+        for text in [
+            "",
+            "不要清空上下文",
+            "清空上下文之后帮我看下这个报错",
+            "怎么清空上下文",
+            "/clear 一下这个问题的缓存",
+        ] {
+            assert!(!is_clear_command(text), "{text}");
+        }
     }
 
     #[test]

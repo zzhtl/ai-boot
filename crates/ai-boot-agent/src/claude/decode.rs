@@ -24,6 +24,8 @@ const TEXT_LIMIT: usize = 1000;
 /// 事件。实测格式：`PreToolUse:<工具名> hook error: <原因>`。
 const PRE_TOOL_USE_PREFIX: &str = "PreToolUse:";
 const HOOK_ERROR_MARK: &str = " hook error: ";
+/// 标题和概述里被写成 `\uXXXX` 的汉字达到这么多个，就认为这次答案在转义输出中文。
+const ESCAPED_CJK_WARN: usize = 10;
 
 /// 逐行解码。每行都是自包含的一条事件，只有两件事要跨行记：结构化答案的增量片段
 /// （拼起来才看得出哪些字段写完了），和最近一次请求带上的上下文（终态时一起报）。
@@ -43,6 +45,8 @@ struct PartialAnswer {
     json: String,
     /// 标题和概述都拿到了：后面的片段不用再拼。
     done: bool,
+    /// 已经检查过中文有没有被转义。
+    checked: bool,
 }
 
 impl Decoder {
@@ -116,6 +120,7 @@ impl Decoder {
                             index,
                             json: String::new(),
                             done: false,
+                            checked: false,
                         });
                         Activity::Concluding
                     }
@@ -125,6 +130,9 @@ impl Decoder {
             Some("content_block_delta") => {
                 if let Some(draft) = self.answer_delta(index, value) {
                     events.push(AgentEvent::Draft(draft));
+                }
+                if let Some(warning) = self.escape_warning() {
+                    events.push(AgentEvent::Warning(warning));
                 }
                 Activity::Streaming
             }
@@ -162,6 +170,45 @@ impl Decoder {
         self.draft = draft.clone();
         Some(draft)
     }
+
+    /// 标题和概述写完时看一眼：模型偶尔把整份答案的中文写成 `\uXXXX`，解析出来一样，
+    /// 生成的 token 却多两三倍，写结论要多等一两分钟。只报一次，留在日志里看有多常见。
+    fn escape_warning(&mut self) -> Option<String> {
+        let answer = self.answer.as_mut().filter(|a| a.done && !a.checked)?;
+        answer.checked = true;
+        let escaped = escaped_cjk(&answer.json);
+        (escaped >= ESCAPED_CJK_WARN).then(|| {
+            format!("结构化答案的中文被写成了 \\uXXXX 转义（标题和概述里有 {escaped} 个），这一轮写结论会慢两三倍")
+        })
+    }
+}
+
+/// JSON 原文里被写成 `\uXXXX` 的常用汉字个数。成对跳过转义序列，`\\u4e2d`（字面的
+/// 反斜杠加 u）不算。
+fn escaped_cjk(json: &str) -> usize {
+    let bytes = json.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let hex = bytes
+            .get(i + 2..i + 6)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u32::from_str_radix(h, 16).ok());
+        match (bytes.get(i + 1), hex) {
+            (Some(b'u'), Some(code)) => {
+                if (0x4E00..=0x9FFF).contains(&code) {
+                    count += 1;
+                }
+                i += 6;
+            }
+            _ => i += 2,
+        }
+    }
+    count
 }
 
 /// 写到一半的 JSON 对象里，顶层字段 `key` 的字符串值；值的结束引号还没出现（或者
@@ -287,6 +334,12 @@ fn system(value: &Value) -> Vec<AgentEvent> {
         Some("thinking_tokens") => vec![AgentEvent::Activity(Activity::Thinking)],
         // 每次向 API 发请求前的状态（requesting），只说明还活着
         Some("status") => vec![AgentEvent::Activity(Activity::Streaming)],
+        // 跑得久的命令被 CLI 转到后台，开始和结束各报一次：命令还在跑，不是卡住了
+        Some("task_started" | "task_progress" | "task_updated" | "task_notification") => {
+            vec![AgentEvent::Activity(Activity::Streaming)]
+        }
+        // 斜杠命令清单有变；我们禁用了斜杠命令，用不上
+        Some("commands_changed") => Vec::new(),
         Some(other) => vec![AgentEvent::Warning(format!(
             "stream-json 出现未知 system 子类型 `{other}`，已忽略"
         ))],
@@ -556,6 +609,23 @@ mod tests {
     }
 
     #[test]
+    fn background_commands_count_as_progress_and_command_list_changes_are_silent() {
+        for subtype in ["task_started", "task_notification"] {
+            let events = decode(&format!(
+                r#"{{"type":"system","subtype":"{subtype}","task_id":"b1","description":"git clone"}}"#
+            ));
+            assert_eq!(
+                events,
+                vec![AgentEvent::Activity(Activity::Streaming)],
+                "{subtype}"
+            );
+        }
+        assert!(
+            decode(r#"{"type":"system","subtype":"commands_changed","commands":[]}"#).is_empty()
+        );
+    }
+
+    #[test]
     fn unknown_event_types_degrade_to_a_warning() {
         let events = decode(r#"{"type":"telemetry_v2","payload":{}}"#);
         assert!(matches!(events.as_slice(), [AgentEvent::Warning(_)]));
@@ -710,6 +780,56 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Draft(_)))
         );
+    }
+
+    /// 把一份结构化答案按片段喂给解码器，返回所有事件。
+    fn stream_answer(pieces: &[&str]) -> Vec<AgentEvent> {
+        let mut decoder = Decoder::new();
+        let mut events = decoder.line(r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","name":"StructuredOutput","input":{}}}}"#);
+        for piece in pieces {
+            let delta = serde_json::json!({
+                "type": "stream_event",
+                "event": {"type": "content_block_delta", "index": 1,
+                          "delta": {"type": "input_json_delta", "partial_json": piece}}
+            });
+            events.extend(decoder.line(&delta.to_string()));
+        }
+        events
+    }
+
+    #[test]
+    fn an_answer_written_with_escaped_chinese_is_reported_once() {
+        let warnings = |events: &[AgentEvent]| {
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Warning(w) if w.contains("转义")))
+                .count()
+        };
+        // 把汉字逐个写成 \uXXXX，模拟模型转义输出
+        let escape = |text: &str| -> String {
+            text.chars()
+                .map(|c| format!("\\u{:04x}", u32::from(c)))
+                .collect()
+        };
+        let escaped = format!(
+            r#"{{"title": "{}", "summary": "{}", "#,
+            escape("登录超时"),
+            escape("连接池耗尽导致登录超时")
+        );
+        let events = stream_answer(&[&escaped, r#""sections": []}"#]);
+        assert_eq!(warnings(&events), 1, "{events:?}");
+        // 解析出来的草稿照常是中文
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Draft(Draft { summary: Some(s), .. }) if s == "连接池耗尽导致登录超时"
+        )));
+
+        // 正文里出现字面的反斜杠加 u（JSON 里写作两个反斜杠）不算
+        let plain = format!(
+            r#"{{"title": "登录超时", "summary": "连接池耗尽导致登录超时，日志里的 {} 不算", "#,
+            escape("连接池耗尽导致登录超时").replace('\\', "\\\\")
+        );
+        assert_eq!(warnings(&stream_answer(&[&plain, "}"])), 0);
     }
 
     #[test]

@@ -271,15 +271,20 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         Arc::clone(&whitelist),
     )));
     let runner = Arc::new(runner);
-    tokio::spawn(maintenance::run(
-        maintenance::Maintenance {
-            store: store.clone(),
-            data_dir: data_dir.clone(),
-            // 和传给 claude 的环境一致：复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 ~/.claude
-            claude_config_dir,
-        },
-        cancel.clone(),
-    ));
+    // 定时清理和「清空上下文」共用：删会话数据的办法只有这一处
+    let maintenance = Arc::new(maintenance::Maintenance {
+        store: store.clone(),
+        data_dir: data_dir.clone(),
+        // 和传给 claude 的环境一致：复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 ~/.claude
+        agent_records: claude_config_dir.map(|dir| maintenance::AgentRecords {
+            root: dir.join("projects"),
+            dir_name: ai_boot_agent::claude::project_slug,
+            paths: Box::new(move |workdir: &Path| {
+                ai_boot_agent::claude::session_records(&dir, workdir)
+            }),
+        }),
+    });
+    tokio::spawn(maintenance::run(Arc::clone(&maintenance), cancel.clone()));
 
     // 上次退出时没结束的轮次记为中断，卡片上给重试按钮
     let interrupted = store.interrupt_open_turns(store::now_ms()).await?;
@@ -311,7 +316,8 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         Arc::clone(&bot_open_id),
         config.agent.backend.clone(),
         DEBOUNCE,
-    );
+    )
+    .with_eraser(maintenance);
     tokio::spawn(registry.run(jobs_rx));
     // 上次退出时还没分派的消息
     for message_id in store.unassigned_inputs().await? {

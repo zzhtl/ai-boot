@@ -91,6 +91,14 @@ pub(crate) struct Call {
     body: Option<Value>,
     /// multipart 上传的图片：表单字段 `image_type=message` 和 `image`。
     image: Option<Vec<u8>>,
+    /// multipart 上传的文件：表单字段 `file_type`、`file_name` 和 `file`。
+    file: Option<FileUpload>,
+}
+
+pub(crate) struct FileUpload {
+    file_type: &'static str,
+    file_name: String,
+    bytes: Vec<u8>,
 }
 
 impl Call {
@@ -101,6 +109,7 @@ impl Call {
             query: Vec::new(),
             body: None,
             image: None,
+            file: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl Call {
             query: Vec::new(),
             body: Some(body),
             image: None,
+            file: None,
         }
     }
 
@@ -121,6 +131,7 @@ impl Call {
             query: Vec::new(),
             body: Some(body),
             image: None,
+            file: None,
         }
     }
 
@@ -131,6 +142,27 @@ impl Call {
             query: Vec::new(),
             body: None,
             image: Some(image),
+            file: None,
+        }
+    }
+
+    pub(crate) fn upload_file(
+        path: impl Into<String>,
+        file_type: &'static str,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            method: Method::POST,
+            path: path.into(),
+            query: Vec::new(),
+            body: None,
+            image: None,
+            file: Some(FileUpload {
+                file_type,
+                file_name,
+                bytes,
+            }),
         }
     }
 
@@ -320,6 +352,17 @@ impl ApiClient {
                     .part(
                         "image",
                         reqwest::multipart::Part::bytes(image.clone()).file_name("image"),
+                    );
+                request = request.multipart(form);
+            }
+            if let Some(file) = &call.file {
+                let form = reqwest::multipart::Form::new()
+                    .text("file_type", file.file_type)
+                    .text("file_name", file.file_name.clone())
+                    .part(
+                        "file",
+                        reqwest::multipart::Part::bytes(file.bytes.clone())
+                            .file_name(file.file_name.clone()),
                     );
                 request = request.multipart(form);
             }

@@ -4,9 +4,12 @@
 //! `additionalProperties: false`、不用长度类关键字），Claude 和 Codex 共用一份。
 //! 长度上限在渲染时封顶。
 //!
-//! 例外是段落里的 images、charts、diagrams：大多数段落用不上，模型在长任务里常把它们
-//! 整个省掉，整份答案就会被 CLI 拒收、重写一遍（实测多花 20～30 秒），所以不放进
-//! required，解析时按空数组处理。接 Codex 的 strict 模式时要放回去。
+//! 例外是段落里的 images、charts、diagrams 和附带的 files：大多数答案用不上，模型在长
+//! 任务里常把它们整个省掉，整份答案就会被 CLI 拒收、重写一遍（实测多花 20～30 秒），
+//! 所以不放进 required，解析时按空数组处理。接 Codex 的 strict 模式时要放回去。
+//!
+//! 参考来源（references）不再让模型输出：卡片上只放根因和解决办法，依据写在正文里；
+//! 字段留着是为了读得懂以前存下的答案。
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -132,8 +135,12 @@ pub struct Answer {
     pub sections: Vec<Section>,
     #[serde(default)]
     pub open_questions: Vec<String>,
+    /// 以前的答案才有，现在不再输出。
     #[serde(default)]
     pub references: Vec<Reference>,
+    /// 随答案发出去的文件：工作目录里的相对路径。
+    #[serde(default)]
+    pub files: Vec<String>,
     #[serde(default)]
     pub jira_keys: Vec<String>,
     /// 截图和流程图上传到飞书后的 image_key（键见 `image_ref`、`diagram_ref`）。
@@ -160,7 +167,7 @@ impl Answer {
 /// 一轮成功执行得到的答复。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
-    Structured(Answer),
+    Structured(Box<Answer>),
     /// 没给结构化结果，或给的对不上契约：降级成纯文本展示，不丢内容。
     Text(String),
 }
@@ -182,7 +189,7 @@ pub fn reply_of(outcome: &Outcome) -> Option<Reply> {
     {
         // 只认我们自己上传得到的 key：模型输出里带了也不能拿来显示任意图片
         answer.image_keys.clear();
-        return Some(Reply::Structured(answer));
+        return Some(Reply::Structured(Box::new(answer)));
     }
     Some(Reply::Text(text.clone()))
 }
@@ -192,10 +199,11 @@ mod tests {
     use super::*;
 
     /// 有意不放进 required 的字段，原因见模块注释。
-    const OPTIONAL: [&str; 3] = [
+    const OPTIONAL: [&str; 4] = [
         "$.sections[].images",
         "$.sections[].charts",
         "$.sections[].diagrams",
+        "$.files",
     ];
 
     /// OpenAI strict 模式的约束：每个对象的属性都在 required 里（`OPTIONAL` 除外），

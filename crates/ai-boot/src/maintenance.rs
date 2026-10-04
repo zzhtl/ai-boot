@@ -12,7 +12,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use ai_boot_agent::claude::project_slug;
 use tokio_util::sync::CancellationToken;
 
 use crate::store::{Store, now_ms};
@@ -30,12 +29,24 @@ const LEFTOVER_AGE: Duration = Duration::from_secs(24 * 3600);
 pub struct Maintenance {
     pub store: Store,
     pub data_dir: PathBuf,
-    /// claude 用的配置目录（`CLAUDE_CONFIG_DIR`，复用本机登录时是 `~/.claude`）。
-    /// 只删机器人会话工作目录对应的 `projects/` 子目录，不碰别的。
-    pub claude_config_dir: Option<PathBuf>,
+    /// Agent CLI 自己存的会话记录。只删机器人会话工作目录对应的那些，不碰别的。
+    pub agent_records: Option<AgentRecords>,
 }
 
-pub async fn run(maintenance: Maintenance, cancel: CancellationToken) {
+/// 一个工作目录留下的全部 Agent 记录（目录）。
+pub type RecordPaths = Box<dyn Fn(&Path) -> Vec<PathBuf> + Send + Sync>;
+
+/// Agent CLI 按工作目录存会话记录的位置。编排层不认识具体后端，由装配代码给出。
+pub struct AgentRecords {
+    /// 各工作目录的记录所在的目录（Claude 是 `<配置目录>/projects`），清扫残留用。
+    pub root: PathBuf,
+    /// 工作目录在 `root` 下对应的目录名。
+    pub dir_name: fn(&Path) -> String,
+    /// 一个工作目录留下的全部记录（目录），删会话时一起删。
+    pub paths: RecordPaths,
+}
+
+pub async fn run(maintenance: std::sync::Arc<Maintenance>, cancel: CancellationToken) {
     let mut wait = FIRST_DELAY;
     loop {
         tokio::select! {
@@ -75,9 +86,7 @@ impl Maintenance {
         for id in expired {
             let workdir = sessions.join(&id);
             remove(&workdir).await;
-            if let Some(config) = &self.claude_config_dir {
-                remove(&config.join("projects").join(project_slug(&workdir))).await;
-            }
+            self.remove_agent_records(&workdir).await;
             match self.store.purge_conversation(&id).await {
                 Ok(()) => {
                     deleted += 1;
@@ -97,13 +106,13 @@ impl Maintenance {
         match self.store.conversation_ids().await {
             Ok(alive) => {
                 sweep_except(&sessions, "", RETENTION, &alive).await;
-                if let Some(config) = &self.claude_config_dir {
-                    let prefix = format!("{}-", project_slug(&sessions));
+                if let Some(records) = &self.agent_records {
+                    let prefix = format!("{}-", (records.dir_name)(&sessions));
                     let alive: HashSet<String> = alive
                         .iter()
-                        .map(|id| project_slug(&sessions.join(id)))
+                        .map(|id| (records.dir_name)(&sessions.join(id)))
                         .collect();
-                    sweep_except(&config.join("projects"), &prefix, RETENTION, &alive).await;
+                    sweep_except(&records.root, &prefix, RETENTION, &alive).await;
                 }
             }
             Err(err) => tracing::warn!("{err:#}，这次不清扫残留目录"),
@@ -113,6 +122,53 @@ impl Maintenance {
         {
             tracing::warn!("{err:#}");
         }
+    }
+
+    /// 清空上下文：库里的行由调用方先删，这里删这些会话的工作目录和 Agent 的会话记录，
+    /// 再整理数据库、换一份新备份——旧备份里还有刚删掉的数据。
+    pub async fn erase(&self, conversation_ids: &[String], now: i64) {
+        let sessions = self.data_dir.join("sessions");
+        for id in conversation_ids {
+            let workdir = sessions.join(id);
+            remove(&workdir).await;
+            self.remove_agent_records(&workdir).await;
+        }
+        if let Err(err) = self.store.compact().await {
+            tracing::warn!("{err:#}");
+        }
+        for old in self.backups() {
+            if let Err(err) = tokio::fs::remove_file(&old).await {
+                tracing::warn!(%err, file = %old.display(), "删除旧备份失败");
+            }
+        }
+        self.backup(now).await;
+    }
+
+    async fn remove_agent_records(&self, workdir: &Path) {
+        if let Some(records) = &self.agent_records {
+            for path in (records.paths)(workdir) {
+                remove(&path).await;
+            }
+        }
+    }
+
+    /// 备份目录里的全部备份，按时间从旧到新。
+    fn backups(&self) -> Vec<PathBuf> {
+        let mut backups: Vec<PathBuf> = match std::fs::read_dir(self.data_dir.join("backup")) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("ai-boot-") && n.ends_with(".db"))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        // 文件名里是日期，按名字排序就是按时间
+        backups.sort();
+        backups
     }
 
     async fn backup(&self, now: i64) {
@@ -130,20 +186,8 @@ impl Maintenance {
             tracing::warn!("{err:#}");
             return;
         }
-        // 只留最近几份：文件名里是日期，按名字排序就是按时间
-        let mut backups: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("ai-boot-") && n.ends_with(".db"))
-                })
-                .collect(),
-            Err(_) => return,
-        };
-        backups.sort();
+        // 只留最近几份
+        let backups = self.backups();
         let excess = backups.len().saturating_sub(BACKUPS_KEPT);
         for old in backups.into_iter().take(excess) {
             if let Err(err) = tokio::fs::remove_file(&old).await {
@@ -207,16 +251,12 @@ mod tests {
         Store::open(dir).await.expect("数据库")
     }
 
-    #[test]
-    fn project_dirs_follow_the_cli_naming() {
-        assert_eq!(
-            project_slug(Path::new("/var/lib/ai-boot/sessions/0199a-b")),
-            "-var-lib-ai-boot-sessions-0199a-b"
-        );
-        assert_eq!(
-            project_slug(Path::new("/home/u/.claude")),
-            "-home-u--claude"
-        );
+    /// 和 Claude 一样把路径里的非字母数字换成 `-`；清理逻辑不依赖具体怎么换。
+    fn project_slug(path: &Path) -> String {
+        path.to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
     }
 
     async fn conversation(store: &Store, id: &str, at: i64) {
@@ -322,7 +362,14 @@ mod tests {
         let maintenance = Maintenance {
             store: store.clone(),
             data_dir: data.clone(),
-            claude_config_dir: Some(claude.clone()),
+            agent_records: Some(AgentRecords {
+                root: claude.join("projects"),
+                dir_name: project_slug,
+                paths: {
+                    let root = claude.join("projects");
+                    Box::new(move |workdir: &Path| vec![root.join(project_slug(workdir))])
+                },
+            }),
         };
         maintenance.once(now).await;
 
@@ -386,13 +433,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn erasing_removes_the_files_and_replaces_the_backup() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let data = dir.path().join("data");
+        let store = open(&data).await;
+        let records = dir.path().join("claude");
+        let workdir = data.join("sessions").join("c1");
+        std::fs::create_dir_all(workdir.join("repos/x")).expect("工作目录");
+        let agent_dir = records.join(project_slug(&workdir));
+        std::fs::create_dir_all(&agent_dir).expect("会话记录");
+        let other = data.join("sessions").join("c2");
+        std::fs::create_dir_all(&other).expect("别的会话");
+        // 旧备份里还有要删掉的数据
+        std::fs::create_dir_all(data.join("backup")).expect("备份目录");
+        let old_backup = data.join("backup/ai-boot-20260901.db");
+        std::fs::write(&old_backup, b"old").expect("旧备份");
+
+        let maintenance = Maintenance {
+            store,
+            data_dir: data.clone(),
+            agent_records: Some(AgentRecords {
+                root: records.clone(),
+                dir_name: project_slug,
+                paths: {
+                    let root = records.clone();
+                    Box::new(move |workdir: &Path| vec![root.join(project_slug(workdir))])
+                },
+            }),
+        };
+        maintenance
+            .erase(&["c1".to_owned()], 1_790_000_000_000)
+            .await;
+
+        assert!(!workdir.exists() && !agent_dir.exists());
+        assert!(other.exists(), "别的会话不能动");
+        assert!(!old_backup.exists(), "旧备份要删掉");
+        assert_eq!(maintenance.backups().len(), 1, "换上一份新备份");
+    }
+
+    #[tokio::test]
     async fn only_the_last_backups_are_kept() {
         let dir = tempfile::tempdir().expect("临时目录");
         let store = open(dir.path()).await;
         let maintenance = Maintenance {
             store,
             data_dir: dir.path().to_path_buf(),
-            claude_config_dir: None,
+            agent_records: None,
         };
         let day = 24 * 3600 * 1000_i64;
         for i in 0..10 {

@@ -170,6 +170,23 @@ impl ApiClient {
         Ok(uploaded.image_key)
     }
 
+    /// 上传要作为文件消息发出去的文件，返回 `file_key`。不超过 30 MB，不能是空文件。
+    pub async fn upload_file(&self, file_name: &str, bytes: Vec<u8>) -> Result<String, ApiError> {
+        #[derive(serde::Deserialize)]
+        struct Uploaded {
+            file_key: String,
+        }
+        let uploaded: Uploaded = self
+            .call(Call::upload_file(
+                "open-apis/im/v1/files",
+                file_type(file_name),
+                file_name.to_owned(),
+                bytes,
+            ))
+            .await?;
+        Ok(uploaded.file_key)
+    }
+
     /// 按时间倒序或正序分页列出历史消息（每页最多 50 条）。话题容器不支持按
     /// 时间过滤，需要调用方自己按游标截断。
     pub async fn list_messages(
@@ -229,5 +246,23 @@ impl ApiClient {
             .call(Call::get(path).query("card_msg_content_type", RAW_CARD))
             .await?;
         Ok(page.items)
+    }
+}
+
+/// 上传文件时飞书要的类型：认得的几种文档用各自的类型，其余一律当普通文件。
+fn file_type(file_name: &str) -> &'static str {
+    let extension = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        "mp4" => "mp4",
+        "opus" => "opus",
+        _ => "stream",
     }
 }

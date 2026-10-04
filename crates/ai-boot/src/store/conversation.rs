@@ -128,6 +128,15 @@ pub struct TurnRecord {
 pub struct Input {
     pub payload: String,
     pub conversation_id: Option<String>,
+    pub received_at_ms: i64,
+}
+
+/// 清空一个聊天删掉了什么。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClearedChat {
+    /// 删掉的会话：它们的工作目录和 Agent 的会话记录还要另外删。
+    pub conversations: Vec<String>,
+    pub turns: u64,
 }
 
 /// 之前某一轮的问答，续接失败时给新会话补前情。
@@ -310,11 +319,13 @@ impl Store {
     }
 
     pub async fn input(&self, message_id: &str) -> anyhow::Result<Option<Input>> {
-        sqlx::query_as("SELECT payload, conversation_id FROM turn_inputs WHERE message_id = ?")
-            .bind(message_id)
-            .fetch_optional(&self.pool)
-            .await
-            .context("查询 turn_inputs 失败")
+        sqlx::query_as(
+            "SELECT payload, conversation_id, received_at_ms FROM turn_inputs WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("查询 turn_inputs 失败")
     }
 
     pub async fn assign_conversation(
@@ -694,6 +705,87 @@ impl Store {
         Ok(())
     }
 
+    /// 某个聊天里的全部会话（私聊每条新消息一个会话，群里一般只有一个）。
+    pub async fn chat_conversation_ids(&self, chat_id: &str) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM conversations WHERE chat_id = ?")
+            .bind(chat_id)
+            .fetch_all(&self.pool)
+            .await
+            .context("按聊天查询会话失败")?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// 清空上下文：一个事务里删掉这个聊天的全部会话数据（写回记录、原始消息、轮次、
+    /// 会话），以及 `received_up_to_ms` 及之前收到、还没分到会话的消息（含「清空」这条
+    /// 本身；之后才到的照常处理），再记下清空的时刻。调用方要先停掉这些会话的轮次。
+    pub async fn clear_chat(
+        &self,
+        chat_id: &str,
+        received_up_to_ms: i64,
+        reset_at_ms: i64,
+    ) -> anyhow::Result<ClearedChat> {
+        let mut tx = self.pool.begin().await.context("开启事务失败")?;
+        let conversations: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM conversations WHERE chat_id = ?")
+                .bind(chat_id)
+                .fetch_all(&mut *tx)
+                .await
+                .context("按聊天查询会话失败")?;
+        let (turns,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM turns
+             WHERE conversation_id IN (SELECT id FROM conversations WHERE chat_id = ?)",
+        )
+        .bind(chat_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("统计轮次失败")?;
+        for statement in [
+            "DELETE FROM writebacks WHERE turn_id IN (
+                 SELECT t.id FROM turns t JOIN conversations c ON c.id = t.conversation_id
+                 WHERE c.chat_id = ?1)",
+            "DELETE FROM turn_inputs
+             WHERE conversation_id IN (SELECT id FROM conversations WHERE chat_id = ?1)
+                OR turn_id IN (SELECT t.id FROM turns t JOIN conversations c
+                               ON c.id = t.conversation_id WHERE c.chat_id = ?1)
+                OR (chat_id = ?1 AND conversation_id IS NULL AND received_at_ms <= ?2)",
+            "DELETE FROM turns
+             WHERE conversation_id IN (SELECT id FROM conversations WHERE chat_id = ?1)",
+            "DELETE FROM conversations WHERE chat_id = ?1",
+        ] {
+            sqlx::query(statement)
+                .bind(chat_id)
+                .bind(received_up_to_ms)
+                .execute(&mut *tx)
+                .await
+                .context("清空聊天失败")?;
+        }
+        sqlx::query(
+            "INSERT INTO context_resets (chat_id, reset_at_ms) VALUES (?, ?)
+             ON CONFLICT (chat_id) DO UPDATE SET reset_at_ms = max(reset_at_ms, excluded.reset_at_ms)",
+        )
+        .bind(chat_id)
+        .bind(reset_at_ms)
+        .execute(&mut *tx)
+        .await
+        .context("记录清空时刻失败")?;
+        tx.commit().await.context("清空聊天失败")?;
+        Ok(ClearedChat {
+            conversations: conversations.into_iter().map(|(id,)| id).collect(),
+            turns: u64::try_from(turns).unwrap_or_default(),
+        })
+    }
+
+    /// 这个聊天最近一次清空上下文的时刻（飞书上的消息创建时间，毫秒）。
+    pub async fn context_reset(&self, chat_id: &str) -> anyhow::Result<Option<i64>> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT reset_at_ms FROM context_resets WHERE chat_id = ?")
+                .bind(chat_id)
+                .fetch_optional(&self.pool)
+                .await
+                .context("查询清空时刻失败")?;
+        Ok(row.map(|(at,)| at))
+    }
+
     /// 不属于任何会话的旧数据：没分到会话的原始消息（白名单外的私聊、解析不了的）、
     /// 过期的授权请求、太久没续期（早已失效）的用户授权。返回删掉的行数。
     pub async fn purge_orphans(&self, cutoff: i64, now_ms: i64) -> anyhow::Result<u64> {
@@ -793,6 +885,66 @@ mod tests {
             })
             .await
             .expect("创建会话");
+    }
+
+    #[tokio::test]
+    async fn clearing_a_chat_removes_only_its_data_and_keeps_later_messages() {
+        let (store, _dir) = store().await;
+        conversation(&store, "c1", "om_1", None).await;
+        input(&store, "om_1", 10).await;
+        store.assign_conversation("om_1", "c1").await.expect("分派");
+        store
+            .create_turn("c1", "t1", "om_1", 11)
+            .await
+            .expect("建轮次");
+        // 「清空」这条本身，和清空之后才到、还没分派的一条
+        input(&store, "om_clear", 20).await;
+        input(&store, "om_after", 30).await;
+        // 别的群的会话
+        store
+            .create_conversation(&NewConversation {
+                id: "c2",
+                chat_id: "oc_2",
+                chat_type: "group",
+                origin: Origin::NewThread,
+                thread_id: None,
+                root_message_id: "om_other",
+                owner_open_id: "ou_1",
+                backend: "claude",
+                now_ms: 1,
+            })
+            .await
+            .expect("创建会话");
+
+        let cleared = store.clear_chat("oc_1", 20, 1_000).await.expect("清空");
+        assert_eq!(
+            cleared,
+            ClearedChat {
+                conversations: vec!["c1".to_owned()],
+                turns: 1
+            }
+        );
+        assert!(store.conversation("c1").await.expect("查询").is_none());
+        assert!(store.conversation("c2").await.expect("查询").is_some());
+        assert!(store.turn("t1").await.expect("查询").is_none());
+        for (message_id, kept) in [("om_1", false), ("om_clear", false), ("om_after", true)] {
+            assert_eq!(
+                store.input(message_id).await.expect("查询").is_some(),
+                kept,
+                "{message_id}"
+            );
+        }
+        assert_eq!(
+            store.context_reset("oc_1").await.expect("查询"),
+            Some(1_000)
+        );
+        assert_eq!(store.context_reset("oc_2").await.expect("查询"), None);
+        // 重推的旧「清空」不会把时刻往回拨
+        store.clear_chat("oc_1", 20, 500).await.expect("再清空");
+        assert_eq!(
+            store.context_reset("oc_1").await.expect("查询"),
+            Some(1_000)
+        );
     }
 
     fn finished<'a>(turn_id: &'a str, status: TurnStatus) -> FinishedTurn<'a> {

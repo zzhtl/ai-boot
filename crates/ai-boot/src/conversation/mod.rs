@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::callback::{Action, Toast};
 use crate::context;
+use crate::maintenance::Maintenance;
 use crate::runner::{Runner, parse_event};
 use crate::store::{Conversation, NewConversation, Origin, Store, now_ms};
 use actor::{Actor, Idle, Msg};
@@ -57,6 +58,9 @@ pub enum Job {
 
 /// 只收到附件时，连发合并的窗口放宽到几倍。
 const ATTACHMENT_ONLY_FACTOR: u32 = 4;
+/// 清空上下文时，最多等这么久让这个聊天里在跑的轮次停下来、写完收尾。CLI 收到
+/// SIGINT 后有 10 秒宽限，这里留足余量。
+const CLEAR_WAIT: Duration = Duration::from_secs(60);
 
 /// 一个活着的 actor。`sent` 是发给它的消息数，回收时拿来确认没有在途消息。
 struct Slot {
@@ -84,6 +88,8 @@ pub struct Registry {
     recent: HashMap<(String, String), Recent>,
     idle_tx: mpsc::UnboundedSender<Idle>,
     idle_rx: mpsc::UnboundedReceiver<Idle>,
+    /// 清空上下文时删工作目录、Agent 会话记录，整理库和备份。没有就只删库里的行。
+    eraser: Option<Arc<Maintenance>>,
 }
 
 impl Registry {
@@ -105,7 +111,13 @@ impl Registry {
             recent: HashMap::new(),
             idle_tx,
             idle_rx,
+            eraser: None,
         }
+    }
+
+    pub fn with_eraser(mut self, eraser: Arc<Maintenance>) -> Self {
+        self.eraser = Some(eraser);
+        self
     }
 
     pub async fn run(mut self, mut jobs: mpsc::Receiver<Job>) {
@@ -131,6 +143,13 @@ impl Registry {
                 operator,
                 reply,
             } => {
+                // 在卡片输入框里说「清空上下文」也要真的清空，不能当成一句追问交给模型
+                if context::is_clear_command(&text) {
+                    let _ = reply.send(Toast::success("正在清空上下文"));
+                    let now = now_ms();
+                    self.clear(&chat_id, now, now, &card_message_id).await;
+                    return;
+                }
                 let toast = self
                     .follow_up(&turn_id, &card_message_id, &chat_id, &text, &operator)
                     .await;
@@ -188,6 +207,18 @@ impl Registry {
                 return;
             }
         };
+        let bot = self.bot_open_id.get().map(String::as_str);
+        if context::is_clear_command(&context::event_text(&received, bot)) {
+            let reset_at = received
+                .message
+                .create_time
+                .parse::<i64>()
+                .unwrap_or_else(|_| now_ms());
+            let chat_id = received.message.chat_id.clone();
+            self.clear(&chat_id, input.received_at_ms, reset_at, message_id)
+                .await;
+            return;
+        }
         let conversation_id = match input.conversation_id {
             Some(id) => id,
             None => match self.resolve(message_id, &received).await {
@@ -209,6 +240,66 @@ impl Registry {
         );
     }
 
+    /// 清空上下文：停掉这个聊天里在跑和排队的轮次，删掉它的全部会话数据——库里的行、
+    /// 工作目录（聊天记录、附件、clone 的仓库）、Agent 的会话记录——再整理库、换新备份，
+    /// 记下清空的时刻（`reset_at_ms`），之后的提问不再带上这之前的群聊。`received_at_ms`
+    /// 及之前收到的消息一起删，之后才到的照常处理；确认回复在 `reply_to` 下面。失败时
+    /// 「清空」那条消息留在收件箱，重启后再做一遍（清空本身可以重复做）。
+    async fn clear(
+        &mut self,
+        chat_id: &str,
+        received_at_ms: i64,
+        reset_at_ms: i64,
+        reply_to: &str,
+    ) {
+        let chat_id = chat_id.to_owned();
+        let ids = match self.store.chat_conversation_ids(&chat_id).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::error!(chat = %chat_id, "清空上下文失败：{err:#}");
+                return;
+            }
+        };
+        let mut closing = Vec::new();
+        for id in &ids {
+            if let Some(slot) = self.actors.remove(id) {
+                let (done, closed) = oneshot::channel();
+                if slot.tx.send(actor::Msg::Close { done }).is_ok() {
+                    closing.push(closed);
+                }
+            }
+        }
+        if tokio::time::timeout(CLEAR_WAIT, futures_util::future::join_all(closing))
+            .await
+            .is_err()
+        {
+            tracing::warn!(chat = %chat_id, "等在跑的轮次停下来超时，照样清空");
+        }
+        self.recent.retain(|(chat, _), _| *chat != chat_id);
+        let cleared = match self
+            .store
+            .clear_chat(&chat_id, received_at_ms, reset_at_ms)
+            .await
+        {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                tracing::error!(chat = %chat_id, "清空上下文失败：{err:#}");
+                return;
+            }
+        };
+        if let Some(eraser) = &self.eraser {
+            eraser.erase(&cleared.conversations, now_ms()).await;
+        }
+        tracing::info!(
+            conversations = cleared.conversations.len(),
+            turns = cleared.turns,
+            "已清空上下文"
+        );
+        let runner = Arc::clone(&self.runner);
+        let reply_to = reply_to.to_owned();
+        tokio::spawn(async move { runner.confirm_cleared(&reply_to, cleared.turns).await });
+    }
+
     /// 卡片输入框里的补充：没有对应的聊天消息，按一条文字消息落进收件箱（ID 以
     /// `context::CARD_INPUT_PREFIX` 开头，引用的是那张卡片），之后和普通消息走同一条路。
     async fn follow_up(
@@ -226,13 +317,21 @@ impl Registry {
         let conversation = match self.store.turn(turn_id).await {
             Ok(Some(turn)) => match self.store.conversation(&turn.conversation_id).await {
                 Ok(Some(conversation)) => conversation,
-                Ok(None) => return Toast::warning("这个会话已过保留期，直接 @ 我提问即可"),
+                Ok(None) => {
+                    return Toast::warning(
+                        "这个会话已经清理（过了保留期或清空了上下文），直接 @ 我提问即可",
+                    );
+                }
                 Err(err) => {
                     tracing::error!("{err:#}");
                     return Toast::error("操作失败，稍后再试");
                 }
             },
-            Ok(None) => return Toast::warning("这个会话已过保留期，直接 @ 我提问即可"),
+            Ok(None) => {
+                return Toast::warning(
+                    "这个会话已经清理（过了保留期或清空了上下文），直接 @ 我提问即可",
+                );
+            }
             Err(err) => {
                 tracing::error!("{err:#}");
                 return Toast::error("操作失败，稍后再试");

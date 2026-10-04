@@ -156,11 +156,18 @@ impl AgentBackend for ClaudeBackend {
             command = %invocation.command_line(&self.config.program.display().to_string()),
             "启动 claude"
         );
+        // 临时文件放进本轮的运行目录，这一轮结束随它一起删：CLI 自己的命令输出、模型
+        // 跑命令时 mktemp 出来的文件都不会留在服务的 /tmp 里
+        let tmp = request.run_dir.join("tmp");
+        create_private_dir(&tmp)?;
+        let mut env = self.config.env.clone();
+        env.retain(|(key, _)| key != "TMPDIR");
+        env.push(("TMPDIR".into(), tmp.into_os_string()));
         let spec = ProcessSpec {
             program: self.config.program.clone(),
             args: invocation.args().to_vec(),
             cwd: request.workdir,
-            env: self.config.env.clone(),
+            env,
             stdin: request.prompt.into_bytes(),
             timeout: request.timeout,
             stop_grace: self.config.stop_grace,
@@ -208,6 +215,26 @@ pub fn project_slug(workdir: &Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// CLI 为某个工作目录留下的全部记录：`projects/` 下的会话记录（含超大工具结果），以及
+/// 其中每个会话在 `session-env/` 下的目录。删会话时一起删，不留残留。
+pub fn session_records(config_dir: &Path, workdir: &Path) -> Vec<PathBuf> {
+    let project = config_dir.join("projects").join(project_slug(workdir));
+    let sessions: Vec<PathBuf> = std::fs::read_dir(&project)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let id = Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext == "jsonl")
+                .then(|| Path::new(&name).file_stem().map(ToOwned::to_owned))??;
+            Some(config_dir.join("session-env").join(id))
+        })
+        .collect();
+    std::iter::once(project).chain(sessions).collect()
 }
 
 /// 某个会话的超大工具结果存放的目录。
@@ -329,6 +356,42 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn session_records_cover_the_project_and_each_session_env() {
+        let config = tempfile::tempdir().expect("临时目录");
+        let workdir = Path::new("/var/lib/ai-boot/sessions/c1");
+        let project = config.path().join("projects").join(project_slug(workdir));
+        std::fs::create_dir_all(project.join("s-1/tool-results")).expect("目录");
+        std::fs::write(project.join("s-1.jsonl"), "{}").expect("会话记录");
+        std::fs::write(project.join("s-2.jsonl"), "{}").expect("会话记录");
+        let mut records = session_records(config.path(), workdir);
+        records.sort();
+        let mut expected = vec![
+            project,
+            config.path().join("session-env/s-1"),
+            config.path().join("session-env/s-2"),
+        ];
+        expected.sort();
+        assert_eq!(records, expected);
+        // 还没有会话记录时只有项目目录本身
+        assert_eq!(
+            session_records(config.path(), Path::new("/x")),
+            vec![config.path().join("projects/-x")]
+        );
+    }
+
+    #[test]
+    fn project_dirs_follow_the_cli_naming() {
+        assert_eq!(
+            project_slug(Path::new("/var/lib/ai-boot/sessions/0199a-b")),
+            "-var-lib-ai-boot-sessions-0199a-b"
+        );
+        assert_eq!(
+            project_slug(Path::new("/home/u/.claude")),
+            "-home-u--claude"
+        );
     }
 
     #[test]

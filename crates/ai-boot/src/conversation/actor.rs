@@ -36,6 +36,9 @@ pub(super) enum Msg {
         operator: String,
         reply: oneshot::Sender<Toast>,
     },
+    /// 清空上下文：取消在跑和排队的轮次，等这些轮次的任务都结束（收尾写完卡片和库）
+    /// 后应答，然后退出。
+    Close { done: oneshot::Sender<()> },
 }
 
 /// actor 空闲了。`epoch` 是它处理过的 registry 消息数。
@@ -71,6 +74,10 @@ pub(super) struct Actor {
     notified: Option<u64>,
     running: Option<Running>,
     pending: VecDeque<Pending>,
+    /// 已经起了、还没结束的轮次任务。
+    in_flight: usize,
+    /// 收到了 `Close`：轮次任务都结束后应答。
+    closing: Option<oneshot::Sender<()>>,
 }
 
 impl Actor {
@@ -95,6 +102,8 @@ impl Actor {
             notified: None,
             running: None,
             pending: VecDeque::new(),
+            in_flight: 0,
+            closing: None,
         };
         tokio::spawn(actor.run(rx));
         tx
@@ -118,6 +127,12 @@ impl Actor {
                 },
                 Some(turn_id) = self.done_rx.recv() => self.finished(&turn_id),
                 () = wait_until(start_at) => self.start_pending(),
+            }
+            if self.closing.is_some() && self.in_flight == 0 {
+                if let Some(done) = self.closing.take() {
+                    let _ = done.send(());
+                }
+                break;
             }
             if self.running.is_none() && self.pending.is_empty() {
                 if !open {
@@ -163,6 +178,16 @@ impl Actor {
                     Action::FollowUp => Toast::info("已收到"),
                 };
                 let _ = reply.send(toast);
+            }
+            Msg::Close { done } => {
+                if let Some(running) = &self.running {
+                    running.cancel.cancel();
+                }
+                // 丢掉开跑信号的发送端，排队的轮次就当被取消
+                for pending in self.pending.drain(..) {
+                    pending.cancel.cancel();
+                }
+                self.closing = Some(done);
             }
         }
     }
@@ -239,6 +264,7 @@ impl Actor {
     }
 
     fn finished(&mut self, turn_id: &str) {
+        self.in_flight = self.in_flight.saturating_sub(1);
         if self.running.as_ref().is_some_and(|r| r.turn_id == turn_id) {
             self.running = None;
         }
@@ -398,7 +424,8 @@ impl Actor {
         }
     }
 
-    fn launch(&self, spec: TurnSpec, go: oneshot::Receiver<()>, cancel: CancellationToken) {
+    fn launch(&mut self, spec: TurnSpec, go: oneshot::Receiver<()>, cancel: CancellationToken) {
+        self.in_flight += 1;
         let runner = Arc::clone(&self.runner);
         // 用 Drop 报告结束：执行任务 panic 时也要让 actor 知道，否则这个会话会卡住
         let done = DoneGuard {

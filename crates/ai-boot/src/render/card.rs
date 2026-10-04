@@ -20,7 +20,6 @@ const MAX_SECTIONS: usize = 8;
 const MAX_LIST_ITEMS: usize = 8;
 /// 露在外面的更正条数：多了就不「简洁」了，细节在正文里。
 const MAX_CORRECTIONS: usize = 3;
-const MAX_REFERENCES: usize = 20;
 const MIN_SECTION_CHARS: usize = 200;
 const TRUNCATED: &str = "\n\n…（内容过长，已截断）";
 /// 进度卡上露出的最近几步：卡片最后会换成答案，不必把过程全摆出来。
@@ -382,16 +381,13 @@ fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budge
         .take(MAX_SECTIONS)
         .map(|s| truncate(&s.body, SECTION_CHARS))
         .collect();
-    let mut keep = Keep {
-        charts: true,
-        references: true,
-    };
+    let mut keep = Keep { charts: true };
     loop {
         let built = build_answer(answer, &bodies, keep, footer, links);
         if serde_json::to_string(&built).map_or(0, |s| s.len()) <= budget {
             return built;
         }
-        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方），再去掉参考来源
+        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方）
         let longest = bodies
             .iter_mut()
             .max_by_key(|body| body.chars().count())
@@ -402,7 +398,6 @@ fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budge
                 *body = format!("{}{TRUNCATED}", body.chars().take(half).collect::<String>());
             }
             None if keep.charts => keep.charts = false,
-            None if keep.references => keep.references = false,
             None => return built,
         }
     }
@@ -412,7 +407,6 @@ fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budge
 #[derive(Debug, Clone, Copy)]
 struct Keep {
     charts: bool,
-    references: bool,
 }
 
 /// 这张卡片上还能放几张图、几个图表。
@@ -444,7 +438,7 @@ fn build_answer(
         elements.push(markdown(format!("**🔄 本轮更正**\n{}", items.join("\n"))));
     }
 
-    // 正文（根因、方案……）在前，其次是要对方补充的，再是冲突和来源
+    // 正文（根因、方案……）在前，其次是要对方补充的，再是冲突
     let mut room = Room {
         images: MAX_IMAGES,
         charts: if keep.charts { MAX_CHARTS } else { 0 },
@@ -486,30 +480,6 @@ fn build_answer(
             .collect();
         let title = format!("⚠️ 信息冲突（{}）", answer.conflicts.len());
         elements.push(panel(&title, false, vec![markdown(items.join("\n"))]));
-    }
-
-    if keep.references && !answer.references.is_empty() {
-        let items: Vec<String> = answer
-            .references
-            .iter()
-            .take(MAX_REFERENCES)
-            .map(|r| {
-                let title = inline(&r.title);
-                if links.allows(&r.url) {
-                    format!(
-                        "- [{title}]({})",
-                        r.url.replace(')', "%29").replace(' ', "%20")
-                    )
-                } else {
-                    format!("- {title}")
-                }
-            })
-            .collect();
-        elements.push(panel(
-            &format!("📎 参考来源（{}）", answer.references.len()),
-            false,
-            vec![markdown(items.join("\n"))],
-        ));
     }
 
     elements.push(markdown(footer.line()));
@@ -812,6 +782,7 @@ mod tests {
             sections,
             open_questions: vec![],
             references: vec![],
+            files: vec![],
             jira_keys: vec![],
             image_keys: Default::default(),
         }
@@ -874,8 +845,8 @@ mod tests {
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
             .collect();
-        // 信息冲突、待确认、两段正文、参考来源
-        assert_eq!(panels.len(), 5, "{card}");
+        // 两段正文、待确认、信息冲突；参考来源不上卡片
+        assert_eq!(panels.len(), 4, "{card}");
         assert!(panels.iter().all(|p| p["expanded"] == false), "{card}");
         let text = card.to_string();
         assert!(text.contains("信息冲突（1）"));
@@ -1064,24 +1035,18 @@ mod tests {
         assert!(!text.contains("hunter2"), "{text}");
     }
 
+    /// 注意力只放在根因和解决办法上：参考来源（以前的答案里才有）不再上卡片。
     #[test]
-    fn references_link_only_to_allowed_hosts() {
+    fn references_stay_off_the_card() {
         let mut a = answer_with(vec![]);
-        a.references = vec![
-            Reference {
-                kind: "jira".into(),
-                title: "ABC-1".into(),
-                url: "https://jira.example.com/browse/ABC-1".into(),
-            },
-            Reference {
-                kind: "other".into(),
-                title: "外链".into(),
-                url: "https://evil.example.net/x".into(),
-            },
-        ];
+        a.references = vec![Reference {
+            kind: "jira".into(),
+            title: "ABC-1 原单".into(),
+            url: "https://jira.example.com/browse/ABC-1".into(),
+        }];
         let text = render_answer(&a).to_string();
-        assert!(text.contains("(https://jira.example.com/browse/ABC-1)"));
-        assert!(!text.contains("evil.example.net"));
+        assert!(!text.contains("参考来源"), "{text}");
+        assert!(!text.contains("ABC-1 原单"), "{text}");
     }
 
     #[test]

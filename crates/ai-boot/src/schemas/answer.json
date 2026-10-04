@@ -11,7 +11,6 @@
     "conflicts",
     "sections",
     "open_questions",
-    "references",
     "jira_keys"
   ],
   "properties": {
@@ -49,7 +48,7 @@
     },
     "summary": {
       "type": "string",
-      "description": "一段简洁的全文概述：不展开详情也能看懂是什么问题、结论是什么，纯文字，不超过 200 字"
+      "description": "全文概述，打开卡片第一眼看到的就是它：排查类写成两行，「**根因**：……」和「**解决**：……」（根因还没确认时写「**可能原因**：……」和「**下一步**：……」）；其他问题两三句话说清结论。200 字左右，不写依据和来源"
     },
     "corrections": {
       "type": "array",
@@ -217,40 +216,16 @@
     },
     "open_questions": {
       "type": "array",
-      "description": "待确认事项与标为推测的结论",
+      "description": "需要提问人确认或补充、而且会影响结论的事项；不影响结论的推测不用列，没有就空数组",
       "items": {
         "type": "string"
       }
     },
-    "references": {
+    "files": {
       "type": "array",
-      "description": "实际查阅过的来源",
+      "description": "要随答案发给提问人的文件（脚本、报告、导出的数据）：当前工作目录里的相对路径，比如 out/check.sh。只在提问要求、或内容太长放不进正文时才给；短命令直接写在正文的代码块里。用不上就不写这个字段",
       "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "kind",
-          "title",
-          "url"
-        ],
-        "properties": {
-          "kind": {
-            "type": "string",
-            "enum": [
-              "jira",
-              "confluence",
-              "gitlab",
-              "feishu",
-              "other"
-            ]
-          },
-          "title": {
-            "type": "string"
-          },
-          "url": {
-            "type": "string"
-          }
-        }
+        "type": "string"
       }
     },
     "jira_keys": {

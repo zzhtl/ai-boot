@@ -61,6 +61,10 @@ const BUILTIN_TOOLS: [&str; 7] = [
     "WebSearch",
     "StructuredOutput",
 ];
+/// 一个答案最多附几个文件。
+const MAX_FILES: usize = 5;
+/// 附带的文件大小上限：飞书文件消息最大 30 MB。
+const MAX_FILE_BYTES: u64 = 30 * 1024 * 1024;
 /// 落库的提问文字上限：只用来给续接失败的会话补前情。
 const QUESTION_KEEP_CHARS: usize = 4000;
 /// 上一轮结束时上下文超过这么多（token），这一轮就把前几轮的结论收拢成摘要、换新
@@ -414,11 +418,70 @@ impl Runner {
                 self.update_final(&card_id, &plain).await;
             }
         }
+        if report.status == TurnStatus::Succeeded {
+            self.send_files(&card_id, &conversation, report.answer_json.as_deref())
+                .await;
+        }
         if spec.kind == TurnKind::Ask && report.status == TurnStatus::Succeeded {
             self.mark_superseded(&spec, &conversation, report.answer_json.as_deref())
                 .await;
         }
         self.alert(&report).await;
+    }
+
+    /// 答案附带的文件（脚本、报告、导出的数据）：上传后作为文件消息回复在答案卡下面。
+    /// 发不出去的回一句原因，免得提问人以为没有附件。
+    async fn send_files(
+        &self,
+        card_id: &str,
+        conversation: &Conversation,
+        answer_json: Option<&str>,
+    ) {
+        let Some(answer) =
+            answer_json.and_then(|json| serde_json::from_str::<answer::Answer>(json).ok())
+        else {
+            return;
+        };
+        let workdir = self
+            .settings
+            .data_dir
+            .join("sessions")
+            .join(&conversation.id);
+        for path in answer.files.iter().take(MAX_FILES) {
+            let uploaded = match workdir_file(&workdir, path, MAX_FILE_BYTES).await {
+                Ok((name, bytes)) => self
+                    .api
+                    .upload_file(&name, bytes)
+                    .await
+                    .map_err(|err| format!("上传失败：{err}")),
+                Err(reason) => Err(reason),
+            };
+            let reply = match &uploaded {
+                Ok(file_key) => Reply {
+                    message_id: card_id,
+                    msg_type: "file",
+                    content: serde_json::json!({ "file_key": file_key }).to_string(),
+                    reply_in_thread: false,
+                    uuid: idempotency_key("file", file_key),
+                },
+                Err(reason) => {
+                    tracing::warn!(%reason, conversation = %conversation.id, "答案附带的文件发不出去");
+                    Reply {
+                        message_id: card_id,
+                        msg_type: "text",
+                        content: serde_json::json!({
+                            "text": format!("附件 {path} 没有发出：{reason}")
+                        })
+                        .to_string(),
+                        reply_in_thread: false,
+                        uuid: idempotency_key("file-error", &format!("{card_id}/{path}")),
+                    }
+                }
+            };
+            if let Err(err) = self.api.reply(reply).await {
+                tracing::warn!(%err, "回复附件失败");
+            }
+        }
     }
 
     /// 这一轮更正了之前的结论：把上一张答案卡重画成「已更正，以最新回复为准」。
@@ -931,6 +994,17 @@ impl Runner {
         }
         let group_follow_up =
             !fresh && conversation.origin != Origin::P2p && conversation.thread_id.is_none();
+        // 这个聊天清空过上下文：清空之前的群聊、话题消息都不再带
+        let reset = match inputs.first().map(|r| r.message.chat_id.as_str()) {
+            Some(chat_id) => match self.store.context_reset(chat_id).await {
+                Ok(reset) => reset,
+                Err(err) => {
+                    tracing::warn!("{err:#}");
+                    None
+                }
+            },
+            None => None,
+        };
         let window = self
             .settings
             .window
@@ -946,13 +1020,21 @@ impl Runner {
                     // 游标那一秒的是上一轮已经交给 Agent 的
                     since = since.max(cursor / 1000 + 1);
                 }
+                // 清空上下文那一秒及之前的不再带
+                if let Some(reset) = reset {
+                    since = since.max(reset / 1000 + 1);
+                }
                 (count, since)
             });
+        let since_ms = if fresh {
+            None
+        } else {
+            conversation.history_cursor_ms
+        };
         let sources = context::Sources {
-            since_ms: if fresh {
-                None
-            } else {
-                conversation.history_cursor_ms
+            since_ms: match (since_ms, reset) {
+                (Some(cursor), Some(reset)) => Some(cursor.max(reset)),
+                (cursor, reset) => cursor.or(reset),
             },
             window,
             workspace: context::attach::Workspace {
@@ -1220,7 +1302,7 @@ impl Runner {
                             break;
                         }
                         AgentEvent::Warning(message) => {
-                            tracing::warn!(%message, "Agent 输出里有看不懂的内容");
+                            tracing::warn!(%message, "Agent 输出异常");
                         }
                         AgentEvent::Activity(_) => {}
                     }
@@ -1632,6 +1714,27 @@ impl Runner {
         }
     }
 
+    /// 清空上下文之后回一句确认。
+    pub async fn confirm_cleared(&self, message_id: &str, turns: u64) {
+        let text = if turns == 0 {
+            "已清空上下文，之后的提问从这里重新开始。".to_owned()
+        } else {
+            format!(
+                "已清空上下文：删掉了 {turns} 轮问答，以及它们的聊天记录副本、附件和模型会话记录。之后的提问从这里重新开始，不会带上之前的内容。"
+            )
+        };
+        let reply = Reply {
+            message_id,
+            msg_type: "text",
+            content: serde_json::json!({ "text": text }).to_string(),
+            reply_in_thread: false,
+            uuid: idempotency_key("clear", message_id),
+        };
+        if let Err(err) = self.api.reply(reply).await {
+            tracing::warn!(%err, message_id, "回复「已清空」失败");
+        }
+    }
+
     /// 启动时调用：把上次退出时没结束的轮次的卡片改成「已中断」，带重试按钮。
     pub async fn mark_interrupted(&self, turns: Vec<InterruptedTurn>) {
         for turn in turns {
@@ -1737,6 +1840,20 @@ fn failure_text(kind: FailKind) -> (&'static str, &'static str) {
 /// 答案里引用的截图：只认会话工作目录里的图片文件，路径来自模型，是不可信输入。
 async fn attachment_bytes(workdir: &Path, path: &str) -> Result<Vec<u8>, String> {
     const MAX_BYTES: u64 = 10 * 1024 * 1024;
+    let (_, bytes) = workdir_file(workdir, path, MAX_BYTES).await?;
+    if !context::extract::is_image(&bytes) {
+        return Err(format!("{path} 不是图片"));
+    }
+    Ok(bytes)
+}
+
+/// 工作目录里的一个普通文件：文件名和内容。路径来自模型，是不可信输入：只认相对路径，
+/// 解开符号链接之后也要在工作目录里，空文件和超过上限的不要。
+async fn workdir_file(
+    workdir: &Path,
+    path: &str,
+    max_bytes: u64,
+) -> Result<(String, Vec<u8>), String> {
     let relative = Path::new(path);
     if relative.is_absolute()
         || relative
@@ -1758,16 +1875,20 @@ async fn attachment_bytes(workdir: &Path, path: &str) -> Result<Vec<u8>, String>
     let metadata = tokio::fs::metadata(&file)
         .await
         .map_err(|err| format!("读取 {path} 失败：{err}"))?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(format!("{path} 不是 10 MB 以内的文件"));
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(format!(
+            "{path} 不是 {} MB 以内的非空文件",
+            max_bytes / 1024 / 1024
+        ));
     }
     let bytes = tokio::fs::read(&file)
         .await
         .map_err(|err| format!("读取 {path} 失败：{err}"))?;
-    if !context::extract::is_image(&bytes) {
-        return Err(format!("{path} 不是图片"));
-    }
-    Ok(bytes)
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned());
+    Ok((name, bytes))
 }
 
 /// 采集中的进度卡：读到多少写多少，没有的不写。

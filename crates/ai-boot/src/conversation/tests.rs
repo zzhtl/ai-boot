@@ -350,7 +350,12 @@ async fn world_full(
         bot,
         "claude".into(),
         debounce,
-    );
+    )
+    .with_eraser(Arc::new(crate::maintenance::Maintenance {
+        store: store.clone(),
+        data_dir: dir.path().to_path_buf(),
+        agent_records: None,
+    }));
     tokio::spawn(registry.run(jobs_rx));
     World {
         server,
@@ -618,13 +623,13 @@ async fn a_question_ends_as_a_folded_answer_card() {
         .expect("完整记录落盘");
     assert!(transcript.contains("登录偶发 500"));
 
-    // 最终卡片：折叠面板、链接、尾注，且没有标签注入
+    // 最终卡片：折叠面板、尾注，且没有标签注入；参考来源不上卡片
     let card = last_card(&w, "om_card_1").await;
     let text = card.to_string();
     assert_eq!(card["header"]["template"], "blue");
     assert!(!text.contains("<at"), "{text}");
     assert!(text.contains("collapsible_panel"));
-    assert!(text.contains("https://jira.example.com/browse/ABC-12"));
+    assert!(!text.contains("参考来源"), "{text}");
     assert!(
         text.contains("\"tag\":\"input\""),
         "卡片底部有补充用的输入框：{text}"
@@ -2231,4 +2236,218 @@ async fn a_resolved_question_becomes_a_closure_plan_that_is_written_back_once() 
     // 旧的答案卡上再点「已解决」：已经不是最新一轮
     let stale = press(&w, Action::Resolve, &first).await;
     assert!(stale.text.contains("最新"), "{stale:?}");
+}
+
+#[tokio::test]
+async fn clearing_the_context_stops_the_chat_erases_its_data_and_starts_over() {
+    let w = world_custom(
+        vec![
+            vec![started("s-1"), Beat::UntilCancelled],
+            vec![started("s-2"), answered("重新开始后的回答")],
+        ],
+        DEBOUNCE,
+        Some((500, Duration::ZERO)),
+    )
+    .await;
+    say(&w, "om_q1", "看下这个报错", json!({})).await;
+    let turns = until(&w, "第一轮开跑", |turns| {
+        turns.iter().any(|t| t.status == TurnStatus::Running)
+    })
+    .await;
+    let old_conversation = turns[0].conversation_id.clone();
+    let workdir = w._dir.path().join("sessions").join(&old_conversation);
+    assert!(workdir.is_dir(), "第一轮的工作目录应当已经建好");
+
+    // 在跑的那一轮被停下，这个群的全部数据删光，回一句确认
+    say(
+        &w,
+        "om_clear",
+        "清空上下文，重新开始",
+        json!({"create_time": "1790584900000"}),
+    )
+    .await;
+    for _ in 0..250 {
+        if replies(&w).await.iter().any(|r| {
+            r["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("已清空上下文"))
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let confirm = replies(&w)
+        .await
+        .into_iter()
+        .find(|r| {
+            r["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("已清空上下文"))
+        })
+        .expect("应当回复已清空");
+    assert!(
+        confirm["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("1 轮")),
+        "{confirm}"
+    );
+    assert!(w.store.all_turns().await.is_empty(), "轮次应当删光");
+    assert!(
+        w.store
+            .chat_conversation_ids("oc_1")
+            .await
+            .expect("查询")
+            .is_empty()
+    );
+    for message_id in ["om_q1", "om_clear"] {
+        assert!(
+            w.store.input(message_id).await.expect("查询").is_none(),
+            "{message_id} 应当从收件箱删掉"
+        );
+    }
+    assert!(!workdir.exists(), "工作目录应当删掉");
+    assert_eq!(
+        w.store.context_reset("oc_1").await.expect("查询"),
+        Some(1_790_584_900_000)
+    );
+
+    // 再问：新会话，群聊记录只取清空之后的
+    say(
+        &w,
+        "om_q2",
+        "新的问题",
+        json!({"create_time": "1790585000000"}),
+    )
+    .await;
+    let turns = until(&w, "清空后的那一轮结束", all_finished(1)).await;
+    assert_ne!(turns[0].conversation_id, old_conversation);
+    let requests = w.backend.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].session, SessionRef::New);
+    assert!(!requests[1].prompt.contains("看下这个报错"));
+    let window_since: Vec<String> = w
+        .server
+        .received_requests()
+        .await
+        .expect("请求记录")
+        .iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/open-apis/im/v1/messages")
+        .filter_map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "start_time")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect();
+    assert_eq!(
+        window_since.last().map(String::as_str),
+        Some("1790584901"),
+        "{window_since:?}"
+    );
+}
+
+#[tokio::test]
+async fn files_named_in_the_answer_are_sent_under_the_card_and_escapes_are_refused() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut answer = answer_json("给出检查脚本");
+    answer["files"] = json!(["out/check.sh", "../../etc/passwd"]);
+    let w = world(vec![vec![
+        started("s-1"),
+        Beat::Gate(Arc::clone(&gate)),
+        Beat::Event(AgentEvent::Finished(Outcome::Success {
+            structured: Some(answer),
+            text: String::new(),
+            turns: 2,
+        })),
+    ]])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/files"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"code": 0, "msg": "ok", "data": {"file_key": "file_v3_check"}}),
+            ),
+        )
+        .expect(1)
+        .mount(&w.server)
+        .await;
+    say(&w, "om_q1", "给我一个检查脚本", json!({})).await;
+    let turns = until(&w, "开跑", |turns| {
+        turns.iter().any(|t| t.status == TurnStatus::Running)
+    })
+    .await;
+    // Agent 在工作目录里写好脚本，再交答案
+    let out = w
+        ._dir
+        .path()
+        .join("sessions")
+        .join(&turns[0].conversation_id)
+        .join("out");
+    std::fs::create_dir_all(&out).expect("目录");
+    std::fs::write(out.join("check.sh"), "#!/bin/sh\nss -s\n").expect("脚本");
+    gate.notify_one();
+    until(&w, "结束", all_finished(1)).await;
+
+    let mut sent = Vec::new();
+    for _ in 0..100 {
+        sent = w
+            .server
+            .received_requests()
+            .await
+            .expect("请求记录")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST"
+                    && r.url.path() == "/open-apis/im/v1/messages/om_card_1/reply"
+            })
+            .map(|r| serde_json::from_slice::<Value>(&r.body).expect("JSON"))
+            .collect();
+        if sent.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        sent.iter().any(|r| r["msg_type"] == "file"
+            && r["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("file_v3_check"))),
+        "脚本应当作为文件回复在答案卡下面：{sent:?}"
+    );
+    assert!(
+        sent.iter().any(|r| r["msg_type"] == "text"
+            && r["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("../../etc/passwd") && c.contains("没有发出"))),
+        "越界的路径要拒绝并说明：{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn clear_typed_into_the_card_input_really_clears() {
+    let w = world(vec![vec![started("s-1"), answered("第一轮的结论")]]).await;
+    say(&w, "om_q1", "看下这个报错", json!({})).await;
+    let turns = until(&w, "第一轮结束", all_finished(1)).await;
+    let toast = supplement(&w, &turns[0].id, "om_card_1", "清空上下文").await;
+    assert!(toast.text.contains("正在清空"), "{}", toast.text);
+    let mut confirmed = false;
+    for _ in 0..250 {
+        confirmed = w
+            .server
+            .received_requests()
+            .await
+            .expect("请求记录")
+            .iter()
+            .any(|r| {
+                r.url.path() == "/open-apis/im/v1/messages/om_card_1/reply"
+                    && String::from_utf8_lossy(&r.body).contains("已清空上下文")
+            });
+        if confirmed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(confirmed, "确认要回复在那张卡片下面");
+    assert!(w.store.all_turns().await.is_empty());
+    assert_eq!(w.backend.requests().len(), 1, "清空不能交给模型当追问");
 }

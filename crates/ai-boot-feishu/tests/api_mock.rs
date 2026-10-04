@@ -567,3 +567,37 @@ async fn an_image_is_uploaded_as_multipart_and_its_key_returned() {
     assert!(body.contains("name=\"image\""), "{body}");
     assert!(body.contains("PNG fake"), "{body}");
 }
+
+/// 答案附带的文件：multipart 表单里带类型、文件名和内容，按扩展名选飞书的文件类型。
+#[tokio::test]
+async fn a_file_is_uploaded_as_multipart_with_its_type_and_name() {
+    let server = server_with_token(1).await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/files"))
+        .and(header("authorization", "Bearer t-token"))
+        .respond_with(ok(json!({"file_key": "file_v3_abc"})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let api = client(&server);
+    for (name, file_type) in [("check.sh", "stream"), ("报告.PDF", "pdf")] {
+        let key = api
+            .upload_file(name, b"#!/bin/sh\necho ok\n".to_vec())
+            .await
+            .expect("上传");
+        assert_eq!(key, "file_v3_abc");
+        let requests = server.received_requests().await.expect("请求记录");
+        let upload = requests
+            .iter()
+            .rev()
+            .find(|r| r.url.path() == "/open-apis/im/v1/files")
+            .expect("上传请求");
+        let body = String::from_utf8_lossy(&upload.body);
+        assert!(body.contains("name=\"file_type\""), "{body}");
+        assert!(body.contains(&format!("\r\n\r\n{file_type}\r\n")), "{body}");
+        assert!(body.contains("name=\"file_name\""), "{body}");
+        assert!(body.contains(name), "{body}");
+        assert!(body.contains("name=\"file\""), "{body}");
+        assert!(body.contains("echo ok"), "{body}");
+    }
+}

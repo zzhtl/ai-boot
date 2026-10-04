@@ -406,7 +406,7 @@ values = {
     ("access", "allowed_emails"): "[]",
     ("access", "allowed_open_ids"): array(env["SETUP_OPEN_IDS"].split()),
     ("storage", "data_dir"): string("/var/lib/ai-boot"),
-    ("agent", "effort"): string("high"),
+    ("agent", "effort"): string("xhigh"),
     ("agent", "budget_usd"): "20.0",
     ("agent", "max_concurrent"): "2",
     ("agent.claude", "program"): string(env["SETUP_CLAUDE"]),
@@ -538,6 +538,19 @@ write_dropin() {
     for rel in "${CREDENTIAL_PATHS[@]}"; do
         hidden+=("-$home/$rel")
     done
+    # 机器人的命令行用部署用户自己的工具链（node、cargo、go、java 等）：取本次运行时的
+    # PATH，只留存在的绝对路径目录并去重，再补上系统目录
+    local dir dirs=() seen=: path=()
+    IFS=: read -ra dirs <<<"$PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    for dir in "${dirs[@]}"; do
+        # systemd 的 Environment= 按空白分隔、把 % 当说明符，带这两样的目录不要
+        [[ $dir == /* && $dir != *[[:space:]%]* && -d $dir && $seen != *":$dir:"* ]] || continue
+        seen+="$dir:"
+        path+=("$dir")
+    done
+    local service_path
+    service_path=$(IFS=:; printf '%s' "${path[*]}")
+    info "命令行的 PATH：$service_path"
     cat >"$work/host-claude.conf" <<EOF
 # 由 deploy/setup.sh 生成，重跑会覆盖。服务以部署用户的身份运行，复用这台机器上
 # 已登录的 claude 和 qtmcp，不用 unit 里给独立服务用户准备的目录和 token。
@@ -545,6 +558,8 @@ write_dropin() {
 User=$user
 Group=$user
 Environment=HOME=$home
+# Agent 执行命令时用的 PATH：部署用户自己的工具链也能用
+Environment=PATH=$service_path
 # 只用 ~/.claude 里的登录：unit 设的 CLAUDE_CONFIG_DIR、ai-boot.env 里的 token 都去掉
 UnsetEnvironment=CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
 # claude 用同目录临时文件 + rename 更新 ~/.claude.json，只绑定这个文件的话 rename 会失败，
