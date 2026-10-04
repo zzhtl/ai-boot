@@ -94,16 +94,13 @@
     },
     "sections": {
       "type": "array",
-      "description": "详细内容，卡片上默认折叠。排查类：根因已确认写「根本原因」「解决方案」；根因未确认写「可能原因与验证方法」，不写解决方案。只问原因就只写原因。图片、图表、流程图只在比文字更清楚时才附，大多数段落三个数组都是空的",
+      "description": "详细内容，卡片上默认折叠。排查类：根因已确认写「根本原因」「解决方案」；根因未确认写「可能原因与验证方法」，不写解决方案。只问原因就只写原因。图片、图表、流程图只在比文字更清楚时才附，用不上就不写这三个字段",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "title",
-          "body",
-          "images",
-          "charts",
-          "diagrams"
+          "body"
         ],
         "properties": {
           "title": {

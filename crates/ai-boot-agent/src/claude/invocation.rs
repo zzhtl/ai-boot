@@ -5,8 +5,8 @@
 //! - `--strict-mcp-config` + `--mcp-config`：只挂我们给的 MCP server。
 //! - `--permission-mode auto`：没人值守，不能停下来等确认。`--permission-prompts none`
 //!   兜底：万一还有要问人的调用，直接拒绝而不是挂住。
-//! - `--allowedTools mcp__<server>`：qtmcp 的读写都要能用；不放行的话 auto 模式的
-//!   分类器可能拦下写操作（实测放行后写操作不再经过它）。
+//! - `--allowedTools mcp__<server>,Bash,WebFetch,WebSearch`：qtmcp 的读写、执行命令和上网
+//!   都要能用；不放行的话 auto 模式的分类器可能拦下一部分（实测放行后不再经过它）。
 //! - `--include-partial-messages`：增量事件里能看出模型在思考还是在写结论，进度卡据此
 //!   显示阶段；长时间一条输出都没有，才说明真的卡住了。
 //! - `--system-prompt-snapshot off`：默认 CLI 在会话第一次请求时把系统提示（含追加的
@@ -22,8 +22,11 @@ use std::path::Path;
 
 use crate::TurnRequest;
 
-/// 模型能用的内置工具：只有读，且被 `--restricted` 限定在工作目录内。
-const TOOLS: &str = "Read,Glob,Grep";
+/// 模型能用的内置工具：读文件（被 `--restricted` 限定在工作目录内）、执行命令、上网。
+/// 命令和网页按部署者的决定直接开放，不加沙箱。
+const TOOLS: &str = "Read,Glob,Grep,Bash,WebFetch,WebSearch";
+/// 和 qtmcp 一样预先批准的内置工具。
+const PRE_APPROVED: [&str; 3] = ["Bash", "WebFetch", "WebSearch"];
 /// 自动压缩的窗口（token）。
 const AUTOCOMPACT_TOKENS: &str = "200000";
 
@@ -73,14 +76,13 @@ impl Invocation {
         if let Some(dir) = results_dir {
             push("--add-dir", Some(dir.display().to_string()));
         }
-        if !request.mcp_servers.is_empty() {
-            let servers: Vec<String> = request
-                .mcp_servers
-                .iter()
-                .map(|server| format!("mcp__{}", server.name))
-                .collect();
-            push("--allowedTools", Some(servers.join(",")));
-        }
+        let approved: Vec<String> = request
+            .mcp_servers
+            .iter()
+            .map(|server| format!("mcp__{}", server.name))
+            .chain(PRE_APPROVED.iter().map(|tool| (*tool).to_owned()))
+            .collect();
+        push("--allowedTools", Some(approved.join(",")));
         push("--mcp-config", Some(mcp_config.display().to_string()));
         push("--settings", Some(settings.display().to_string()));
         push("--tools", Some(TOOLS.into()));
@@ -182,7 +184,10 @@ mod tests {
         }
         assert_eq!(value_of(&inv, "--permission-prompts"), Some("none"));
         assert_eq!(value_of(&inv, "--permission-mode"), Some("auto"));
-        assert_eq!(value_of(&inv, "--tools"), Some("Read,Glob,Grep"));
+        assert_eq!(
+            value_of(&inv, "--tools"),
+            Some("Read,Glob,Grep,Bash,WebFetch,WebSearch")
+        );
         assert_eq!(value_of(&inv, "--session-id"), Some("s-1"));
         assert_eq!(value_of(&inv, "--max-budget-usd"), Some("2.500000"));
         assert_eq!(value_of(&inv, "--effort"), Some("high"));
@@ -196,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn only_our_mcp_servers_are_pre_approved_and_the_prompt_stays_out_of_argv() {
+    fn our_mcp_servers_commands_and_the_web_are_pre_approved_and_the_prompt_stays_out_of_argv() {
         let mut req = request();
         let inv = Invocation::build(
             &req,
@@ -205,7 +210,10 @@ mod tests {
             Path::new("/r/settings.json"),
             None,
         );
-        assert!(!inv.args().iter().any(|a| a == "--allowedTools"));
+        assert_eq!(
+            value_of(&inv, "--allowedTools"),
+            Some("Bash,WebFetch,WebSearch")
+        );
         assert!(
             !inv.args()
                 .iter()
@@ -225,7 +233,10 @@ mod tests {
             Path::new("/r/settings.json"),
             None,
         );
-        assert_eq!(value_of(&inv, "--allowedTools"), Some("mcp__qtmcp"));
+        assert_eq!(
+            value_of(&inv, "--allowedTools"),
+            Some("mcp__qtmcp,Bash,WebFetch,WebSearch")
+        );
         assert!(!inv.args().iter().any(|a| a.contains("机密的群聊内容")));
         assert_eq!(value_of(&inv, "--resume"), Some("s-2"));
         assert!(!inv.args().iter().any(|a| a == "--session-id"));

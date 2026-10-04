@@ -1205,7 +1205,7 @@ async fn a_backend_prefix_binds_the_conversation_to_that_backend() {
 #[tokio::test]
 async fn an_unexpected_tool_surface_cancels_the_turn() {
     let w = world(vec![vec![
-        started_with("s-1", &["Read", "Bash"]),
+        started_with("s-1", &["Read", "Write"]),
         Beat::Event(AgentEvent::Step(Step::Text("本不该走到这里".into()))),
         Beat::UntilCancelled,
     ]])
@@ -1215,7 +1215,7 @@ async fn an_unexpected_tool_surface_cancels_the_turn() {
     let card = last_card(&w, "om_card_1").await;
     assert_eq!(card["header"]["template"], "red");
     let text = card.to_string();
-    assert!(text.contains("自检") && text.contains("Bash"), "{text}");
+    assert!(text.contains("自检") && text.contains("Write"), "{text}");
 }
 
 #[tokio::test]

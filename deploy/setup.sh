@@ -406,7 +406,7 @@ values = {
     ("access", "allowed_emails"): "[]",
     ("access", "allowed_open_ids"): array(env["SETUP_OPEN_IDS"].split()),
     ("storage", "data_dir"): string("/var/lib/ai-boot"),
-    ("agent", "effort"): string("xhigh"),
+    ("agent", "effort"): string("high"),
     ("agent", "budget_usd"): "20.0",
     ("agent", "max_concurrent"): "2",
     ("agent.claude", "program"): string(env["SETUP_CLAUDE"]),

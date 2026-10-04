@@ -97,6 +97,13 @@ fn main() -> ExitCode {
 
 fn serve(config: &Path) -> ExitCode {
     init_tracing();
+    // Agent 能执行命令，又和服务是同一个 Unix 用户：进程可转储的话，命令读得到
+    // /proc/<pid>/environ 里的 FEISHU_APP_SECRET，也能 ptrace 进来
+    if let Err(err) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        tracing::warn!(%err, "没能把进程设成不可转储，同一用户的进程可能读到它的环境变量");
+    }
     // 运行时手动构建而不是用 #[tokio::main]，这样 hook 子命令用不着它
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

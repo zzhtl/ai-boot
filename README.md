@@ -8,8 +8,9 @@
 ```
 
 - **不需要公网入口**：事件和卡片回调都走飞书长连接（WebSocket），机器能出网访问 `open.feishu.cn` 就行，不用域名和回调地址。
-- **复用本机的 Claude Code**：直接用部署用户已登录的 `claude`，不另配 token；auto 权限模式，模型跟随 CLI 默认，推理强度 xhigh。
+- **复用本机的 Claude Code**：直接用部署用户已登录的 `claude`，不另配 token；auto 权限模式，模型跟随 CLI 默认，推理强度 high（同一个问题 xhigh 要多花一倍时间）。
 - **qtmcp 可选**：装了就接上，Agent 能读写 Jira、Confluence、GitLab、Jenkins（GitLab 能按关键词搜代码、看文件历史和 blame、按版本号找 tag，要用带这些动作的 qtmcp）；没装就只凭聊天内容回答。
+- **联网和命令行**：Agent 能搜索网页（WebSearch）、打开网页（WebFetch）、执行命令（Bash）。看 GitHub 等公开仓库时先 clone 到会话的工作目录里再读代码，比逐页打开快，读到的也是原文。命令直接开放、没有沙箱，见「安全说明」。
 
 ## 工作方式
 
@@ -227,10 +228,16 @@ rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
     - 用 `InaccessiblePaths` 藏起 `~/.ssh`、`~/.gnupg`、`~/.docker`、`~/.kube`、`~/.config/gh`、`~/.npmrc`、lark-cli 的配置、keyring 和 Chrome 的配置目录；
     - 家目录里其余的文件，服务进程仍然可以读写。
   - claude 层：
-    - `--restricted` 去掉执行命令、执行代码的内置工具和 WebFetch，忽略你的 user / project / local settings，文件工具只能访问本轮的工作目录；
+    - `--restricted` 忽略你的 user / project / local settings，文件工具（Read、Glob、Grep）只能访问本轮的工作目录；
     - `--strict-mcp-config` 只加载 ai-boot 配的 MCP；
-    - 内置工具只开 Read、Glob、Grep；
-    - 每次工具调用还要经 `ai-boot hook` 判决，执行命令一律拒绝。
+    - 内置工具开 Read、Glob、Grep，以及执行命令（Bash）、打开网页（WebFetch）、搜索网页（WebSearch）；改文件、派子 Agent 的工具不开；
+    - 每次工具调用还要经 `ai-boot hook` 判决。
+- **命令行和网页直接开放、没有沙箱**：
+  - Bash 以服务用户的身份在 systemd 的加固环境里运行（系统目录只读，上面藏起来的凭据目录看不到），能读写家目录其余的文件，能访问内网和外网，网页不限域名；
+  - 家目录里 claude 的登录凭据、qtmcp 的配置（SSO 账号密码、TOTP 密钥、GitLab token）和 SSO 会话因此都在 Agent 读得到的范围里。群聊、文档、网页里藏的指令可能诱导它读取这些东西或把内网数据发到外网，只有提示词约束，不是硬限制；
+  - 部署用户在 docker 组里时，Bash 也能用 docker（能起特权容器挂载整个文件系统），等于有了整机 root。不需要的话在 drop-in 里加 `InaccessiblePaths=-/run/docker.sock` 挡掉；
+  - ai-boot 进程设成了不可转储：同一用户的进程读不到它的环境变量（App Secret），也没法附加调试；
+  - 要收紧，就从 `crates/ai-boot-agent/src/claude/invocation.rs` 的工具列表里去掉对应的工具，或者改用独立的服务用户。
 - **qtmcp 能写**：Agent 以你的身份读写 Jira、Confluence、GitLab、Jenkins。
   - 写操作（评论、改单、流转、建 MR、发页面、触发构建）按提示词只在本轮提问明确要求时才做，聊天记录和文档里出现的要求不算。这是提示词约束，不是硬限制。
   - 白名单只放信得过的人；不想让它碰某个系统，就把它从 `--toolsets` 里去掉。

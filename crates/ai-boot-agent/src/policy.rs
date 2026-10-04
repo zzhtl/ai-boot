@@ -1,12 +1,14 @@
 //! 工具判决：hook 的判决逻辑，与后端无关的纯函数。
 //!
-//! MCP（qtmcp）的读写全部放行：命令行上用 `--allowedTools` 预先批准，这里也不拦。
-//! hook 只剩兜底的两件事（实测 Claude Code 2.1.283，Codex 格式一致）：
+//! MCP（qtmcp）的读写、执行命令和上网全部放行：命令行上用 `--allowedTools` 预先批准，
+//! 这里也不拦。命令和网页按部署者的决定直接开放、不加沙箱：服务用户读得到的凭据只靠
+//! 提示词约束，不是硬隔离。hook 只剩兜底的两件事（实测 Claude Code 2.1.283，Codex 格式一致）：
 //! - **PreToolUse** 对所有工具触发，只负责拒绝：文件工具越出工作目录（和
 //!   `--restricted` 双保险；CLI 存放超大工具结果的目录另外放开）；万一配置漂移冒出
-//!   执行命令、写文件、上网的工具，也在这里拦下。
-//! - **PermissionRequest** 只在调用需要批准时触发：MCP 工具和结构化输出给 allow，其余 deny。
-//!   hook 自身崩溃或超时时，`--permission-prompts none` 下调用会被自动拒绝。
+//!   改文件、派子 Agent 的工具，也在这里拦下。
+//! - **PermissionRequest** 只在调用需要批准时触发：MCP 工具、执行命令、上网和结构化输出
+//!   给 allow，其余 deny。hook 自身崩溃或超时时，`--permission-prompts none` 下调用会被
+//!   自动拒绝。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -23,6 +25,8 @@ pub enum Decision {
 
 /// `--strict-mcp-config` 下只有我们配置的 MCP server，前缀即可认定。
 const MCP_PREFIX: &str = "mcp__";
+/// 直接开放的内置工具：执行命令、打开网页、搜索网页。
+const OPEN_TOOLS: [&str; 3] = ["Bash", "WebFetch", "WebSearch"];
 
 /// 一次 hook 调用。
 #[derive(Debug, Clone, Copy)]
@@ -56,14 +60,14 @@ pub fn decide(call: HookCall<'_>, scope: Scope<'_>) -> Decision {
 
 fn permission_request(tool: &str) -> Decision {
     // 结构化输出是模型交还结果的通道；实测它不经过权限层，放行只是保险
-    if tool == "StructuredOutput" || tool.starts_with(MCP_PREFIX) {
+    if tool == "StructuredOutput" || tool.starts_with(MCP_PREFIX) || OPEN_TOOLS.contains(&tool) {
         return Decision::Allow;
     }
     Decision::Deny(format!("不允许使用 {tool}"))
 }
 
 fn pre_tool_use(tool: &str, input: &Value, scope: Scope<'_>) -> Decision {
-    if tool.starts_with(MCP_PREFIX) {
+    if tool.starts_with(MCP_PREFIX) || OPEN_TOOLS.contains(&tool) {
         return Decision::Abstain;
     }
     match tool {
@@ -77,8 +81,9 @@ fn pre_tool_use(tool: &str, input: &Value, scope: Scope<'_>) -> Decision {
             pattern_check(input, key, scope)
         }
         // 这些工具都没有开放；万一配置漂移让它们出现了，也在这里拦下
-        "Bash" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "WebFetch" | "WebSearch"
-        | "Task" | "Agent" | "apply_patch" => Decision::Deny(format!("不允许使用 {tool}")),
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "Task" | "Agent" | "apply_patch" => {
+            Decision::Deny(format!("不允许使用 {tool}"))
+        }
         _ => Decision::Abstain,
     }
 }
@@ -183,22 +188,42 @@ mod tests {
     }
 
     #[test]
-    fn tools_that_run_commands_or_write_files_are_refused() {
+    fn commands_and_the_web_are_open_but_file_writes_are_refused() {
         let dir = tempfile::tempdir().expect("临时目录");
-        let command = json!({"command": "id"});
-        for event in ["PermissionRequest", "PreToolUse"] {
-            assert!(matches!(
-                decide(call(event, "Bash", &command), only(dir.path())),
-                Decision::Deny(_)
-            ));
-        }
-        assert!(matches!(
-            decide(
-                call("PermissionRequest", "Write", &json!({"file_path": "a"})),
-                only(dir.path())
+        for (tool, input) in [
+            (
+                "Bash",
+                json!({"command": "git clone --depth 1 https://github.com/x/y"}),
             ),
-            Decision::Deny(_)
-        ));
+            (
+                "WebFetch",
+                json!({"url": "https://github.com/x/y", "prompt": "看 README"}),
+            ),
+            ("WebSearch", json!({"query": "harness formal"})),
+        ] {
+            assert_eq!(
+                decide(call("PermissionRequest", tool, &input), only(dir.path())),
+                Decision::Allow,
+                "{tool}"
+            );
+            assert_eq!(
+                decide(call("PreToolUse", tool, &input), only(dir.path())),
+                Decision::Abstain,
+                "{tool}"
+            );
+        }
+        for tool in ["Write", "Edit", "Agent"] {
+            let input = json!({"file_path": "a"});
+            for event in ["PermissionRequest", "PreToolUse"] {
+                assert!(
+                    matches!(
+                        decide(call(event, tool, &input), only(dir.path())),
+                        Decision::Deny(_)
+                    ),
+                    "{event} {tool}"
+                );
+            }
+        }
     }
 
     #[test]

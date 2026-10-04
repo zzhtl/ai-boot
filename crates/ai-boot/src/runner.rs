@@ -52,7 +52,15 @@ const PHASE_TOOL: &str = "🔧 调用工具中";
 const PHASE_CONCLUDING: &str = "📝 正在整理结论";
 const DENY_TEXT: &str = "你没有使用这个机器人的权限。";
 /// 模型能用的内置工具。
-const BUILTIN_TOOLS: [&str; 4] = ["Read", "Glob", "Grep", "StructuredOutput"];
+const BUILTIN_TOOLS: [&str; 7] = [
+    "Read",
+    "Glob",
+    "Grep",
+    "Bash",
+    "WebFetch",
+    "WebSearch",
+    "StructuredOutput",
+];
 /// 落库的提问文字上限：只用来给续接失败的会话补前情。
 const QUESTION_KEEP_CHARS: usize = 4000;
 /// 上一轮结束时上下文超过这么多（token），这一轮就把前几轮的结论收拢成摘要、换新
@@ -1936,8 +1944,8 @@ mod tests {
     #[test]
     fn any_drift_fails_the_self_check() {
         let mut s = started();
-        s.tools.as_mut().expect("tools").push("Bash".into());
-        assert!(self_check(&s, &["qtmcp"]).is_err_and(|e| e.contains("Bash")));
+        s.tools.as_mut().expect("tools").push("Write".into());
+        assert!(self_check(&s, &["qtmcp"]).is_err_and(|e| e.contains("Write")));
 
         let mut s = started();
         s.mcp_servers = Some(vec![McpStatus {

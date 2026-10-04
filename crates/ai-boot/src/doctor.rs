@@ -335,7 +335,7 @@ async fn login_status(program: &Path, env: &[(OsString, OsString)]) -> Result<()
     }
 }
 
-/// hook 必须失败即拒绝：喂一个执行命令的调用，应当拿到拒绝。
+/// hook 必须失败即拒绝：喂一个改文件的调用（没有开放），应当拿到拒绝。
 async fn hook(config: &Config) -> Check {
     let name = "hook";
     let program = &config.agent.hook.program;
@@ -343,8 +343,8 @@ async fn hook(config: &Config) -> Check {
     let input = json!({
         "session_id": "doctor", "transcript_path": "/dev/null", "cwd": workdir,
         "permission_mode": "auto", "hook_event_name": "PermissionRequest",
-        "tool_name": "Bash",
-        "tool_input": { "command": "id" },
+        "tool_name": "Write",
+        "tool_input": { "file_path": "doctor.txt", "content": "x" },
     });
     let mut child = match tokio::process::Command::new(program)
         .args(["hook", "--backend", "claude", "--workdir"])
@@ -375,11 +375,11 @@ async fn hook(config: &Config) -> Check {
     };
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
     if reply.pointer("/hookSpecificOutput/decision/behavior") == Some(&json!("deny")) {
-        Check::ok(name, "执行命令会被拒绝")
+        Check::ok(name, "改文件的工具会被拒绝")
     } else {
         Check::fail(
             name,
-            "执行命令没有被拒绝",
+            "改文件的工具没有被拒绝",
             "agent.hook.program 指向的程序版本不对，重新安装 ai-boot",
         )
     }

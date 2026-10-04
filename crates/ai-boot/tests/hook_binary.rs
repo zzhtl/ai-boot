@@ -75,12 +75,16 @@ fn permission_requests_for_mcp_reads_and_writes_are_approved() {
 }
 
 #[test]
-fn permission_requests_for_command_tools_are_denied_with_a_reason() {
+fn permission_requests_for_file_writes_are_denied_with_a_reason() {
     let dir = tempfile::tempdir().expect("临时目录");
     let reply = hook(
         "claude",
         dir.path(),
-        &claude_input("PermissionRequest", "Bash", json!({"command": "id"})),
+        &claude_input(
+            "PermissionRequest",
+            "Write",
+            json!({"file_path": "a.txt", "content": "x"}),
+        ),
     );
     assert_eq!(reply.code, Some(0));
     let out = parsed(&reply);
@@ -88,21 +92,56 @@ fn permission_requests_for_command_tools_are_denied_with_a_reason() {
     assert!(
         out["hookSpecificOutput"]["decision"]["message"]
             .as_str()
-            .is_some_and(|m| m.contains("Bash"))
+            .is_some_and(|m| m.contains("Write"))
     );
 }
 
+/// 执行命令和上网按部署者的决定直接开放：批准时放行，PreToolUse 不表态。
 #[test]
-fn pre_tool_use_denies_command_tools_and_stays_silent_for_the_rest() {
+fn commands_and_the_web_are_approved_and_never_blocked() {
     let dir = tempfile::tempdir().expect("临时目录");
-    let command = hook(
+    for (tool, input) in [
+        (
+            "Bash",
+            json!({"command": "git clone --depth 1 https://github.com/x/y"}),
+        ),
+        (
+            "WebFetch",
+            json!({"url": "https://github.com/x/y", "prompt": "README"}),
+        ),
+        ("WebSearch", json!({"query": "x"})),
+    ] {
+        let approval = hook(
+            "claude",
+            dir.path(),
+            &claude_input("PermissionRequest", tool, input.clone()),
+        );
+        assert_eq!(
+            parsed(&approval)["hookSpecificOutput"]["decision"]["behavior"],
+            "allow",
+            "{tool}"
+        );
+        let pre = hook(
+            "claude",
+            dir.path(),
+            &claude_input("PreToolUse", tool, input),
+        );
+        assert_eq!(pre.code, Some(0), "{tool}");
+        assert!(pre.stdout.is_empty(), "{tool} 应当不表态：{}", pre.stdout);
+    }
+}
+
+#[test]
+fn pre_tool_use_denies_file_writes_and_stays_silent_for_the_rest() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let write = hook(
         "claude",
         dir.path(),
-        &claude_input("PreToolUse", "Bash", json!({"command": "id"})),
+        &claude_input("PreToolUse", "Edit", json!({"file_path": "a.txt"})),
     );
-    assert_eq!(command.code, Some(0));
+    assert_eq!(write.code, Some(0));
     assert_eq!(
-        parsed(&command)["hookSpecificOutput"]["permissionDecision"],
+        parsed(&write)["hookSpecificOutput"]["permissionDecision"],
         "deny"
     );
 

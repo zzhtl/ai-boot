@@ -6,6 +6,7 @@ use ai_boot_agent::Step;
 use serde_json::Value;
 
 use super::markdown::escape;
+use super::redact::redact;
 
 const ARG_CHARS: usize = 60;
 
@@ -89,6 +90,25 @@ fn tool_label(tool: &str, input: &Value) -> String {
                 .unwrap_or_default()
         ),
         "Grep" => format!("🔍 检索 {}", arg("pattern").unwrap_or_default()),
+        // 命令里可能带着 token，先脱敏再上卡片
+        "Bash" => format!(
+            "⌨️ 执行 {}",
+            input
+                .get("command")
+                .and_then(Value::as_str)
+                .map(|c| short(&redact(c)))
+                .unwrap_or_default()
+        ),
+        // 网址的查询串里也可能带 token
+        "WebFetch" => format!(
+            "🌐 打开 {}",
+            input
+                .get("url")
+                .and_then(Value::as_str)
+                .map(|u| short(&redact(u)))
+                .unwrap_or_default()
+        ),
+        "WebSearch" => format!("🔎 搜索网页：{}", arg("query").unwrap_or_default()),
         "Glob" => "📁 列出文件".to_owned(),
         "StructuredOutput" => "📝 整理结论".to_owned(),
         other => format!("🔧 {}", escape(other)),
@@ -165,6 +185,35 @@ mod tests {
             .as_deref(),
             Some("💻 GitLab g/p：提交 abc1234")
         );
+        assert_eq!(
+            call(
+                "Bash",
+                json!({"command": "git clone --depth 1 https://github.com/x/y repos/y"})
+            )
+            .as_deref(),
+            Some("⌨️ 执行 git clone --depth 1 https://github.com/x/y repos/y")
+        );
+        assert_eq!(
+            call(
+                "WebFetch",
+                json!({"url": "https://github.com/x/y", "prompt": "README"})
+            )
+            .as_deref(),
+            Some("🌐 打开 https://github.com/x/y")
+        );
+        // 命令里的 token 不能上卡片
+        let leaked = call(
+            "Bash",
+            json!({"command": "curl -H 'PRIVATE-TOKEN: glpat-abcdefghijklmnopqrstuv' https://x"}),
+        )
+        .expect("要显示");
+        assert!(!leaked.contains("abcdefghijklmnopqrstuv"), "{leaked}");
+        let leaked = call(
+            "WebFetch",
+            json!({"url": "https://x.io/a?token=abcdefghijklmnop", "prompt": "看看"}),
+        )
+        .expect("要显示");
+        assert!(!leaked.contains("abcdefghijklmnop"), "{leaked}");
         assert_eq!(
             call("Read", json!({"file_path": "/w/context/transcript.md"})).as_deref(),
             Some("📄 阅读 transcript.md")

@@ -3,6 +3,10 @@
 //! schema 写成 OpenAI strict 兼容的子集（所有字段都在 required 里、每层对象
 //! `additionalProperties: false`、不用长度类关键字），Claude 和 Codex 共用一份。
 //! 长度上限在渲染时封顶。
+//!
+//! 例外是段落里的 images、charts、diagrams：大多数段落用不上，模型在长任务里常把它们
+//! 整个省掉，整份答案就会被 CLI 拒收、重写一遍（实测多花 20～30 秒），所以不放进
+//! required，解析时按空数组处理。接 Codex 的 strict 模式时要放回去。
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -187,7 +191,15 @@ pub fn reply_of(outcome: &Outcome) -> Option<Reply> {
 mod tests {
     use super::*;
 
-    /// OpenAI strict 模式的约束：每个对象的属性都在 required 里，且不允许额外属性。
+    /// 有意不放进 required 的字段，原因见模块注释。
+    const OPTIONAL: [&str; 3] = [
+        "$.sections[].images",
+        "$.sections[].charts",
+        "$.sections[].diagrams",
+    ];
+
+    /// OpenAI strict 模式的约束：每个对象的属性都在 required 里（`OPTIONAL` 除外），
+    /// 且不允许额外属性。
     fn assert_strict(node: &Value, path: &str) {
         if node.get("type") == Some(&Value::String("object".into())) {
             let props = node["properties"].as_object().expect("对象要有 properties");
@@ -198,9 +210,11 @@ mod tests {
                 .filter_map(Value::as_str)
                 .collect();
             for key in props.keys() {
-                assert!(
+                let field = format!("{path}.{key}");
+                assert_eq!(
                     required.contains(&key.as_str()),
-                    "{path}.{key} 不在 required 里"
+                    !OPTIONAL.contains(&field.as_str()),
+                    "{field} 是否在 required 里不对"
                 );
             }
             assert_eq!(
