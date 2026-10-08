@@ -719,13 +719,14 @@ async fn a_follow_up_resumes_the_session_and_counts_only_its_own_tokens() {
     assert_eq!(w.store.turn_usage(&turns[1].id).await.0, 800);
 }
 
-/// 私聊不开话题：引用机器人的卡片回复就是追问，续接同一个 Agent 会话；
-/// 直接新发一条则是新会话。
+/// 私聊不开话题：引用机器人的卡片回复就是追问，续接同一个 Agent 会话；上一轮结束两小时内
+/// 直接新发的也续接（同一件事一问再问，不用从零查起），隔了两小时以上才新开会话。
 #[tokio::test]
-async fn in_private_chat_quoting_the_card_follows_up_and_a_new_message_starts_over() {
+async fn in_private_chat_a_new_message_follows_up_within_two_hours_and_starts_over_after() {
     let w = world(vec![
         vec![started("s-1"), answered("第一轮")],
         vec![started("s-1"), answered("追问")],
+        vec![started("s-1"), answered("接着问")],
         vec![started("s-2"), answered("新问题")],
     ])
     .await;
@@ -734,15 +735,34 @@ async fn in_private_chat_quoting_the_card_follows_up_and_a_new_message_starts_ov
     let quote = json!({"chat_type": "p2p", "parent_id": "om_card_1", "root_id": "om_1"});
     say(&w, "om_2", "那 3.3 有没有这个问题", quote).await;
     until(&w, "追问结束", all_finished(2)).await;
-    say(&w, "om_3", "导出为什么慢", json!({"chat_type": "p2p"})).await;
-    let turns = until(&w, "新问题结束", all_finished(3)).await;
+    say(&w, "om_3", "改完要重启吗", json!({"chat_type": "p2p"})).await;
+    let turns = until(&w, "接着问结束", all_finished(3)).await;
+    w.store
+        .age_conversation(&turns[0].conversation_id, 2 * 60 * 60 * 1000 + 1000)
+        .await;
+    say(&w, "om_4", "导出为什么慢", json!({"chat_type": "p2p"})).await;
+    let turns = until(&w, "新问题结束", all_finished(4)).await;
 
     assert_eq!(turns[0].conversation_id, turns[1].conversation_id);
     assert_eq!(turns[1].seq, 2);
-    assert_ne!(turns[0].conversation_id, turns[2].conversation_id);
+    assert_eq!(
+        turns[0].conversation_id, turns[2].conversation_id,
+        "两小时内续接"
+    );
+    assert_eq!(turns[2].seq, 3);
+    assert_ne!(
+        turns[0].conversation_id, turns[3].conversation_id,
+        "隔久了新开"
+    );
     let requests = w.backend.requests();
     assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
-    assert_eq!(requests[2].session, SessionRef::New);
+    assert_eq!(requests[2].session, SessionRef::Resume("s-1".into()));
+    assert!(
+        requests[2].prompt.contains("改完要重启吗") && !requests[2].prompt.contains("登录报 500"),
+        "续接只带本轮提问：{}",
+        requests[2].prompt
+    );
+    assert_eq!(requests[3].session, SessionRef::New);
     assert!(
         replies(&w)
             .await

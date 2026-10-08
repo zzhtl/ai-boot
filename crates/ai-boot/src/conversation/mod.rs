@@ -1,7 +1,8 @@
 //! 会话调度：把收件箱里的消息分到会话，同一会话里的轮次串行执行。
 //!
 //! 一个群一个会话：同一个群里的提问都续接同一个 Agent 会话，聊天记录和附件只发
-//! 新增的部分，不重复发。私聊每条新消息一个会话，引用卡片或在卡片上补充才算追问。
+//! 新增的部分，不重复发。私聊上一轮结束两小时内的新消息续接原来的会话，隔久了新开；
+//! 引用卡片或在卡片上补充，不论隔多久都接着那张卡片的会话。
 //!
 //! - registry（单个任务）：给消息找会话或建会话、把按钮回调转给对应会话、
 //!   回收空闲的 actor。它是唯一建会话的地方，所以不会为同一个话题建出两个会话。
@@ -58,6 +59,8 @@ pub enum Job {
 
 /// 只收到附件时，连发合并的窗口放宽到几倍。
 const ATTACHMENT_ONLY_FACTOR: u32 = 4;
+/// 私聊的新消息，上一轮结束这么久以内的接着原来的会话问。
+const P2P_CONTINUE: Duration = Duration::from_secs(2 * 60 * 60);
 /// 清空上下文时，最多等这么久让这个聊天里在跑的轮次停下来、写完收尾。CLI 收到
 /// SIGINT 后有 10 秒宽限，这里留足余量。
 const CLEAR_WAIT: Duration = Duration::from_secs(60);
@@ -423,6 +426,15 @@ impl Registry {
         if found.is_none() && thread.is_none() {
             found = self
                 .recent_conversation(&key, attachment_only(received))
+                .await?;
+        }
+        // 私聊隔一阵再问多半还是前面那件事（同一个故障一问再问）：两小时内续接，不用每条
+        // 都从零查起；隔久了再新开，免得背着不相关的上下文、每一步都变慢
+        if found.is_none() && thread.is_none() && message.is_p2p() {
+            let since = now_ms() - i64::try_from(P2P_CONTINUE.as_millis()).unwrap_or(i64::MAX);
+            found = self
+                .store
+                .recent_p2p_conversation(&message.chat_id, since)
                 .await?;
         }
         if let Some(conversation) = found {

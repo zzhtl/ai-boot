@@ -218,6 +218,28 @@ impl Store {
         .context("按群查询会话失败")
     }
 
+    /// 私聊里最近还在用的会话：上一轮在 `since_ms` 之后落库（`updated_at_ms` 每轮结束都
+    /// 刷新），或者刚建、第一轮还没跑完。
+    pub async fn recent_p2p_conversation(
+        &self,
+        chat_id: &str,
+        since_ms: i64,
+    ) -> anyhow::Result<Option<Conversation>> {
+        sqlx::query_as(concat!(
+            "SELECT ",
+            conversation_columns!(""),
+            " FROM conversations
+             WHERE chat_id = ? AND origin = 'p2p' AND status = 'active' AND updated_at_ms >= ?
+             ORDER BY updated_at_ms DESC
+             LIMIT 1"
+        ))
+        .bind(chat_id)
+        .bind(since_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .context("查询私聊会话失败")
+    }
+
     /// 某张机器人卡片属于哪一轮。
     pub async fn turn_by_card(&self, card_message_id: &str) -> anyhow::Result<Option<Turn>> {
         sqlx::query_as(
@@ -842,6 +864,16 @@ impl Store {
             .fetch_one(&self.pool)
             .await
             .expect("查询用量")
+    }
+
+    /// 把会话的最后活动时间往前拨，模拟隔了一阵才再问。
+    pub async fn age_conversation(&self, conversation_id: &str, by_ms: i64) {
+        sqlx::query("UPDATE conversations SET updated_at_ms = updated_at_ms - ? WHERE id = ?")
+            .bind(by_ms)
+            .bind(conversation_id)
+            .execute(&self.pool)
+            .await
+            .expect("改会话时间");
     }
 }
 
