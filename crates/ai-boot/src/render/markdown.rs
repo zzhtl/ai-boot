@@ -91,6 +91,12 @@ struct Table {
     head_rows: usize,
 }
 
+/// 正在读的代码块：内容读完才知道能不能原样放进围栏。
+struct Code {
+    lang: String,
+    text: String,
+}
+
 struct Writer<'a> {
     links: &'a dyn LinkPolicy,
     blocks: Vec<String>,
@@ -99,7 +105,7 @@ struct Writer<'a> {
     /// 每层列表的下一个序号（无序列表为 None）。
     lists: Vec<Option<u64>>,
     quote_depth: usize,
-    code: Option<String>,
+    code: Option<Code>,
     /// 每层链接是否被放行（放行时记下地址，收尾时补上）。
     link_stack: Vec<Option<String>>,
     table: Option<Table>,
@@ -193,17 +199,21 @@ impl<'a> Writer<'a> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
-                if self.code.is_some() {
-                    // 代码块内容原样保留（飞书按代码显示）；逐行补引用前缀
-                    for piece in text.split_inclusive('\n') {
-                        self.write(piece);
-                    }
+                if let Some(code) = self.code.as_mut() {
+                    code.text.push_str(&text);
                 } else {
                     let escaped = escape(&text);
                     self.write(&escaped);
                 }
             }
             Event::Code(code) => {
+                // 内容里有连续的反引号，外面用几个反引号包都可能被提前闭合，后面的内容
+                // 就按 markdown 生效了（比如 <at id=all>）：退回转义后的文字
+                if code.contains("``") {
+                    let escaped = escape(&code);
+                    self.write(&escaped);
+                    return;
+                }
                 let fence = if code.contains('`') { "``" } else { "`" };
                 let pad = if code.starts_with('`') || code.ends_with('`') {
                     " "
@@ -256,8 +266,10 @@ impl<'a> Writer<'a> {
                     CodeBlockKind::Fenced(info) => sanitize_lang(&info),
                     CodeBlockKind::Indented => String::new(),
                 };
-                self.write(&format!("```{lang}\n"));
-                self.code = Some(lang);
+                self.code = Some(Code {
+                    lang,
+                    text: String::new(),
+                });
             }
             Tag::List(start) => {
                 if self.lists.is_empty() {
@@ -336,10 +348,9 @@ impl<'a> Writer<'a> {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             TagEnd::CodeBlock => {
-                self.ensure_line_start();
-                self.write("```");
-                self.newline();
-                self.code = None;
+                if let Some(code) = self.code.take() {
+                    self.emit_code(code);
+                }
             }
             TagEnd::List(_) => {
                 self.lists.pop();
@@ -382,6 +393,31 @@ impl<'a> Writer<'a> {
             }
             _ => {}
         }
+    }
+
+    /// 代码块内容原样放进 ``` 围栏（飞书按代码显示），逐行补引用前缀。内容里有以 ```
+    /// 开头的行（原文用 ~~~、四个反引号或缩进写的代码块里可以有），飞书会在那一行
+    /// 提前结束代码块，后面的内容就按 markdown 生效了：这种整块退回转义后的文字。
+    fn emit_code(&mut self, code: Code) {
+        if code
+            .text
+            .lines()
+            .any(|line| line.trim_start().starts_with("```"))
+        {
+            for line in code.text.lines() {
+                let escaped = escape(line);
+                self.write(&escaped);
+                self.newline();
+            }
+            return;
+        }
+        self.write(&format!("```{}\n", code.lang));
+        for piece in code.text.split_inclusive('\n') {
+            self.write(piece);
+        }
+        self.ensure_line_start();
+        self.write("```");
+        self.newline();
     }
 
     fn emit_table(&mut self, table: Table) {
@@ -513,10 +549,36 @@ mod tests {
         assert!(md("```rust<at>\nx\n```").starts_with("```rustat\n"));
     }
 
+    /// 原文里的代码块可以夹着一行 ```：原样放进围栏的话，飞书会在那一行提前结束代码块，
+    /// 后面的标签就生效了。
+    #[test]
+    fn a_fence_inside_a_code_block_cannot_end_it_early() {
+        for attack in [
+            "~~~\n```\n<at id=all></at>\n~~~",
+            "````\n```\n<at id=all></at>\n````",
+            "    ```\n    <at id=all></at>",
+        ] {
+            let out = md(attack);
+            assert!(!out.contains('<'), "{attack:?} → {out}");
+            assert!(out.contains("&#60;at id=all&#62;"), "{out}");
+            assert!(!out.contains("```"), "退回文字后不再有围栏：{out}");
+        }
+        // 正常的代码块不受影响
+        assert_eq!(md("~~~sh\nls -l\n~~~"), "```sh\nls -l\n```");
+    }
+
     #[test]
     fn inline_code_is_kept() {
         assert_eq!(md("调用 `a && b` 即可"), "调用 `a && b` 即可");
         assert_eq!(md("``a`b``"), "``a`b``");
+    }
+
+    /// 行内代码里有连续的反引号，再用 `` 包就会被提前闭合。
+    #[test]
+    fn inline_code_with_a_backtick_run_falls_back_to_text() {
+        let out = md("看 ```a``<at id=all></at>``b``` 这里");
+        assert!(!out.contains('<'), "{out}");
+        assert!(out.contains("&#96;&#96;&#60;at id=all&#62;"), "{out}");
     }
 
     #[test]
