@@ -3,7 +3,6 @@
 //! 卡片里所有来自模型或用户的文字都先脱敏、再经 markdown 规范化；标题一律用
 //! plain_text。尺寸按序列化后的字节数控制在 28 KB 以内（飞书上限 30 KB）。
 
-use std::fmt::Write as _;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -27,7 +26,7 @@ const MAX_COMMANDS: usize = 6;
 /// 命令本身不悄悄截断（截了可能照样能执行、意思却变了），太长才截并标红。
 const COMMAND_CHARS: usize = 1500;
 const COMMAND_TITLE_CHARS: usize = 40;
-/// 规则要求 30 字、80 字以内；这里是兜底，留出余量免得把半句话截掉。
+/// 规则要求 20 字、80 字以内；这里是兜底，留出余量免得把半句话截掉。
 const COMMAND_PLACE_CHARS: usize = 80;
 const COMMAND_LOOK_CHARS: usize = 160;
 /// 概述行首的标签和颜色：排查类的「根因 / 解决」，根因没确认时的「可能原因 / 下一步」。
@@ -219,31 +218,26 @@ fn summary_blocks(summary: &str, links: &dyn LinkPolicy, muted: bool) -> Vec<Val
         .collect()
 }
 
-/// 关键命令：前几条露在概述下面，其余折叠；`keep_extra` 为 false 时（卡片放不下）
-/// 折叠的那些只留一句说明。
+/// 关键命令：前几条放进露在概述下面的命令框，其余折叠；`keep_extra` 为 false 时（卡片
+/// 放不下）折叠的那些只留一句说明。
 fn command_elements(commands: &[Command], keep_extra: bool) -> Vec<Value> {
     let commands: Vec<&Command> = commands
         .iter()
         .filter(|c| !c.command.trim().is_empty())
         .take(MAX_COMMANDS)
         .collect();
+    if commands.is_empty() {
+        return Vec::new();
+    }
     let numbered = commands.len() > 1;
-    let mut out: Vec<Value> = commands
-        .iter()
-        .take(SHOWN_COMMANDS)
-        .enumerate()
-        .map(|(i, command)| command_element(i, command, numbered))
-        .collect();
+    let shown = &commands[..commands.len().min(SHOWN_COMMANDS)];
+    let mut out = vec![command_box(shown, 0, numbered)];
     let extra = commands.get(SHOWN_COMMANDS..).unwrap_or_default();
     if extra.is_empty() {
         return out;
     }
     if keep_extra {
-        let inner = extra
-            .iter()
-            .enumerate()
-            .map(|(i, command)| command_element(SHOWN_COMMANDS + i, command, true))
-            .collect();
+        let inner = vec![command_box(extra, SHOWN_COMMANDS, true)];
         out.push(panel(&format!("更多命令（{}）", extra.len()), false, inner));
     } else {
         out.push(markdown(format!(
@@ -254,54 +248,72 @@ fn command_elements(commands: &[Command], keep_extra: bool) -> Vec<Value> {
     out
 }
 
-/// 一条命令：做什么和在哪执行一行，命令单独放代码块，执行后看什么用灰字跟在后面。
-fn command_element(index: usize, command: &Command, numbered: bool) -> Value {
-    let mut head = String::new();
-    if numbered {
-        let _ = write!(head, "{} ", circled(index + 1));
+/// 命令框：几条命令按顺序放进同一个代码块，每条前面一行注释写序号、做什么、在哪执行，
+/// 下面一行就是完整命令，照着框里一步步敲就行；执行后看什么用灰字按序号列在框下面。
+/// 命令里有 ``` 会提前结束代码块，后面的内容就按 markdown 生效了：这种不进框，转义后
+/// 单独列出。
+fn command_box(commands: &[&Command], first: usize, numbered: bool) -> Value {
+    let mut code = Vec::new();
+    let mut below = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        let number = if numbered {
+            format!("{}. ", first + i + 1)
+        } else {
+            String::new()
+        };
+        let label = command_label(command);
+        let text = redact(command.command.trim());
+        let cut = text.chars().count() > COMMAND_CHARS;
+        let text = truncate(&text, COMMAND_CHARS);
+        if text.contains("```") {
+            below.push(format!("{number}{}：{}", escape(&label), escape(&text)));
+        } else {
+            code.push(format!("# {number}{label}"));
+            code.push(text);
+        }
+        if cut {
+            below.push(format!(
+                "<font color='red'>{number}命令过长已截断，勿直接执行</font>"
+            ));
+        }
+        let look = inline_within(&command.look, COMMAND_LOOK_CHARS);
+        if !look.is_empty() {
+            below.push(format!("<font color='grey'>{number}{look}</font>"));
+        }
     }
-    let title = inline_within(&command.title, COMMAND_TITLE_CHARS);
-    let _ = write!(
-        head,
-        "**{}**",
-        if title.is_empty() { "执行" } else { &title }
-    );
-    let place = inline_within(&command.place, COMMAND_PLACE_CHARS);
-    if !place.is_empty() {
-        let _ = write!(head, "　<font color='grey'>{place}</font>");
+    let mut parts = Vec::new();
+    if !code.is_empty() {
+        parts.push(format!("```bash\n{}\n```", code.join("\n")));
     }
-    let mut parts = vec![head, code_block(&command.command)];
-    let look = inline_within(&command.look, COMMAND_LOOK_CHARS);
-    if !look.is_empty() {
-        parts.push(format!("<font color='grey'>{look}</font>"));
+    if !below.is_empty() {
+        parts.push(below.join("\n"));
     }
     markdown(parts.join("\n\n"))
 }
 
-/// 命令原样放进代码块。命令里有 ``` 会提前结束代码块，后面的内容就按 markdown 生效了：
-/// 这种退回转义后的文字。
-fn code_block(command: &str) -> String {
-    let command = redact(command.trim());
-    let cut = command.chars().count() > COMMAND_CHARS;
-    let command = truncate(&command, COMMAND_CHARS);
-    let mut out = if command.contains("```") {
-        escape(&command)
-    } else {
-        format!("```\n{command}\n```")
+/// 命令框里注释行的文字：做什么（在哪执行）。代码块里按原样显示，所以不转义，只压成
+/// 一行、去掉反引号，免得提前结束代码块。
+fn command_label(command: &Command) -> String {
+    let flat = |text: &str, limit: usize| {
+        let text = redact(text)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('`', "'");
+        truncate(&text, limit)
     };
-    if cut {
-        out.push_str("\n\n<font color='red'>命令过长已截断，勿直接执行</font>");
+    let title = flat(&command.title, COMMAND_TITLE_CHARS);
+    let title = if title.is_empty() {
+        "执行".to_owned()
+    } else {
+        title
+    };
+    let place = flat(&command.place, COMMAND_PLACE_CHARS);
+    if place.is_empty() {
+        title
+    } else {
+        format!("{title}（{place}）")
     }
-    out
-}
-
-/// 1～20 的带圈数字，再往后用普通数字。
-fn circled(n: usize) -> String {
-    u32::try_from(n)
-        .ok()
-        .filter(|n| (1..=20).contains(n))
-        .and_then(|n| char::from_u32(0x2460 + n - 1))
-        .map_or_else(|| format!("{n}."), String::from)
 }
 
 fn panel(title: &str, expanded: bool, elements: Vec<Value>) -> Value {
@@ -1293,46 +1305,65 @@ mod tests {
         assert!(!text.contains("text_tag color"), "{text}");
     }
 
-    /// 关键命令紧跟概述露在外面：一条时不编号，多出 3 条的折叠起来，命令原样进代码块。
+    /// 关键命令紧跟概述露在外面：几条命令按顺序放进同一个命令框，每条前面一行注释写序号、
+    /// 做什么、在哪执行；一条时不编号，超过 3 条的折叠起来，序号接着排。
     #[test]
-    fn key_commands_show_under_the_summary_and_the_rest_fold() {
+    fn key_commands_show_under_the_summary_in_one_numbered_box() {
         let mut a = answer_with(vec![section("根本原因", "连接池只有 10")]);
         a.commands = vec![command(
             "查看消费堆积",
-            "bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups",
+            "/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups",
         )];
         let card = render_answer(&a);
         let elements = card["body"]["elements"].as_array().expect("elements");
-        let shown = elements[1]["content"].as_str().expect("命令");
         assert_eq!(
-            shown,
-            "**查看消费堆积**　<font color='grey'>kafka 所在主机</font>\n\n```\nbin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups\n```\n\n<font color='grey'>看 LAG 列</font>"
+            elements[1]["content"],
+            "```bash\n# 查看消费堆积（kafka 所在主机）\n/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups\n```\n\n<font color='grey'>看 LAG 列</font>"
         );
 
         a.commands = (1..=5)
             .map(|i| command(&format!("第 {i} 步"), &format!("echo {i}")))
             .collect();
         a.commands.push(command("空命令不显示", "  "));
+        a.commands[1].place = String::new();
+        a.commands[1].look = String::new();
         let card = render_answer(&a);
         let elements = card["body"]["elements"].as_array().expect("elements");
-        assert!(
-            elements[1]["content"]
-                .as_str()
-                .is_some_and(|c| c.starts_with("① **第 1 步**"))
+        assert_eq!(
+            elements[1]["content"],
+            "```bash\n# 1. 第 1 步（kafka 所在主机）\necho 1\n# 2. 第 2 步\necho 2\n# 3. 第 3 步（kafka 所在主机）\necho 3\n```\n\n<font color='grey'>1. 看 LAG 列</font>\n<font color='grey'>3. 看 LAG 列</font>"
         );
-        assert!(
-            elements[3]["content"]
-                .as_str()
-                .is_some_and(|c| c.starts_with("③ **第 3 步**"))
-        );
-        let more = &elements[4];
+        let more = &elements[2];
         assert_eq!(more["tag"], "collapsible_panel");
-        assert!(more.to_string().contains("更多命令（2）"), "{more}");
-        assert!(more.to_string().contains("⑤ **第 5 步**"), "{more}");
+        let more = more.to_string();
+        assert!(more.contains("更多命令（2）"), "{more}");
+        assert!(more.contains("# 4. 第 4 步（kafka 所在主机）"), "{more}");
+        assert!(more.contains("# 5. 第 5 步"), "{more}");
         assert!(!card.to_string().contains("空命令不显示"));
     }
 
-    /// 命令里有 ``` 会提前结束代码块：退回转义后的文字，标签不会生效。
+    /// 命令框里的注释行按原样显示：标题里的换行和反引号不能打断代码块。
+    #[test]
+    fn labels_in_the_command_box_cannot_end_it() {
+        let mut a = answer_with(vec![]);
+        a.commands = vec![command("看```\n结束", "echo ok")];
+        let card = render_answer(&a);
+        let shown = card["body"]["elements"][1]["content"]
+            .as_str()
+            .expect("命令框")
+            .to_owned();
+        assert!(
+            shown.starts_with("```bash\n# 看''' 结束（kafka 所在主机）\necho ok\n```"),
+            "{shown}"
+        );
+        assert_eq!(
+            shown.matches("```").count(),
+            2,
+            "只有命令框自己的一对围栏：{shown}"
+        );
+    }
+
+    /// 命令里有 ``` 会提前结束代码块：不进命令框，转义后单独列出，标签不会生效。
     #[test]
     fn a_command_that_could_end_its_code_block_is_shown_as_text() {
         let mut a = answer_with(vec![]);
@@ -1340,6 +1371,7 @@ mod tests {
         let text = render_answer(&a).to_string();
         assert!(!text.contains("<at"), "{text}");
         assert!(!text.contains("```"), "{text}");
+        assert!(text.contains("坏命令（kafka 所在主机）：echo"), "{text}");
         // 太长的才截，并且标红
         a.commands = vec![command("长命令", &"x".repeat(COMMAND_CHARS + 10))];
         let text = render_answer(&a).to_string();
@@ -1363,12 +1395,12 @@ mod tests {
         assert!(text.contains("连接池耗尽导致"), "概述不动");
         for i in 1..=3 {
             assert!(
-                text.contains(&format!("**第 {i} 步**")),
+                text.contains(&format!("# {i}. 第 {i} 步")),
                 "第 {i} 条命令不动"
             );
         }
         assert!(text.contains("另有 3 条命令没有显示"), "{text}");
-        assert!(!text.contains("**第 4 步**"));
+        assert!(!text.contains("第 4 步"));
     }
 
     #[test]
