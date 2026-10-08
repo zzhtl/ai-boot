@@ -214,6 +214,7 @@ rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
 | `render.link_hosts` | 卡片里允许出现链接的域名（含子域），比如 `jira.example.com` |
 | `context.window_messages` / `context.window_minutes` | 群聊记录最多带几条（上限 500）、往前看多少分钟（0 不限） |
 | `context.office_legacy` | doc、ppt 等旧格式先用 soffice 转换 |
+| `context.knowledge_file` | 可选：环境速查（团队整理的部署方式、命名空间、常用路径、代码在哪个仓库），接在规则后面给模型参考；每轮读一次，改了不用重启 |
 | `[oauth]`、`[writeback]` | 可选：以你的身份读群里贴的云文档；把闭环方案写回 Jira、Confluence。部署脚本不配，需要时对照示例补上 |
 
 ## 安全说明

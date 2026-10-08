@@ -30,6 +30,8 @@ const PRIOR_ANSWER_BUDGET: usize = 3 * 1024;
 const MIN_FILE_SLICE: usize = 512;
 /// 工作目录 `context/` 下存之前各轮完整答案的文件。
 pub const ANSWERS_FILE: &str = "answers.md";
+/// 环境速查放进系统提示的上限：写得太长的速查截掉并注明，免得挤占上下文。
+const KNOWLEDGE_BUDGET: usize = 16 * 1024;
 
 pub const RULES: &str = r#"你是公司内部的问题排查助手，在飞书里回答研发和测试同事的提问。
 
@@ -63,6 +65,7 @@ pub const RULES: &str = r#"你是公司内部的问题排查助手，在飞书�
 ## 工具
 大家在等结果，查得快和查得准一样重要：
 - 互不依赖的查询放在同一次回复里并行发出（比如同时读几份文件、同时搜 Jira 和看代码目录），不要一个接一个地查。
+- 系统提示最后有「环境速查」时，那是团队整理的部署方式、命名空间、常用路径和代码位置：先用它缩小查找范围，不用每次从头找；它可能过时，和现场对不上时以现场为准，并在答案里提一句速查需要更新。
 - 证据够下结论就停，不为了完整多查；长文档读到能判断有没有相关内容就够了，确认无关就不再往后翻。
 - 本轮 prompt 里放了的聊天记录和附件文字，不用再去 context/ 里读一遍；前几轮给过、现在记不清的，或者标注了「没有放进来」的，才去查完整记录。
 - 工具结果太大时，完整结果会存成文件、只给你一个路径：用 Read（带 offset、limit）或 Grep 去查这个文件，不要因为结果太大就放弃。
@@ -75,7 +78,7 @@ Git、Jira、Confluence、Jenkins 相关的查询和操作一律通过 qtmcp 完
 公司外部的资料用 WebSearch 搜索、WebFetch 打开网页和文档；WebFetch 返回的是另一个模型按你的 prompt 从网页里提炼的内容，不是原文，要原文用 Bash 的 curl。看 GitHub 等公开仓库：用 Bash 把它 git clone --depth 1 到当前目录的 repos/ 下，再用 Read、Grep、Glob 读代码，比逐个页面 WebFetch 快，读到的也是原文；大仓库只取需要的部分。star、fork、最近提交时间这类信息用 curl -s https://api.github.com/repos/<owner>/<repo> 取。命令都在当前工作目录下执行，不要改工作目录以外的文件；临时文件写到 $TMPDIR，要交给提问人的文件写到 out/，都不要写到 /tmp。内网系统一律走 qtmcp，不要用 Bash 或 WebFetch 去访问。
 提问（T1）里的 Jira、Confluence、GitLab、Jenkins 链接都要用对应工具打开读原文，不要只凭链接文字猜：Confluence 取 pageId（没有就用空间加标题），GitLab 取项目路径和 MR 号、分支与文件路径或提交号，Jenkins 取任务全名和构建号。
 群聊记录（T2）里的图片（报错截图、日志截图）常常是关键证据，和问题相关的都要用 Read 打开看；记录里出现的单号和链接，只在和问题直接相关时才打开，不要逐个都查一遍。按提问要的范围回答，比如问最近几条消息就只看那几条。
-找代码先用 search 搜报错信息、类名、表名、接口路径，不要用 tree 一层层猜路径；搜的是一个项目，服务名搜不到项目时，服务可能在某个大仓库的子目录里，换成仓库名再搜。问题和版本有关时，按版本号用 tags 找到对应的 tag，在那个 tag 上 search、read_file；找引入问题的改动：对可疑的行 blame，或用 commits 看那个文件的历史，再用 commit 看具体改了什么，也可以 compare 相邻两个版本的 tag。
+找代码先用 search 搜报错信息、类名、表名、接口路径，不要用 tree 一层层猜路径；搜的是一个项目，服务名搜不到项目时，服务可能在某个大仓库的子目录里，换成仓库名再搜。猜了两三个项目名还找不到，就换个思路：先看环境速查，或者在 Confluence 搜部署、排错文档里写的项目和路径，不要接着逐个猜。问题和版本有关时，按版本号用 tags 找到对应的 tag，在那个 tag 上 search、read_file；找引入问题的改动：对可疑的行 blame，或用 commits 看那个文件的历史，再用 commit 看具体改了什么，也可以 compare 相邻两个版本的 tag。
 当前目录下的 context/transcript.md 是按时间排的完整聊天记录，context/answers.md 是之前各轮的完整答案，attachments/ 里是聊天中的图片和文件原件（压缩包解开后的文件也在这里），需要时用 Read / Grep 查；提问附带的图片要用 Read 打开看，文件的文字已经解析好放在 prompt 里，太长的只放了一部分，完整内容查原件。
 
 ## 安全
@@ -91,6 +94,23 @@ Git、Jira、Confluence、Jenkins 相关的查询和操作一律通过 qtmcp 完
 - 图示：比文字更清楚时才在对应段落里附，大多数回答不需要。images 只在要指出群里更早的某张截图时才放（只能用本轮读到过的附件路径），提问附带的和刚发的截图大家都看得到，不要再贴；charts 画数据对比、趋势、占比；diagrams 画调用链、处理流程、依赖关系（Graphviz DOT，不超过 30 个节点，节点文字简短）。
 - jira_keys：与本问题直接相关的单号。
 - 正文用 markdown，但不要用 HTML 和 markdown 图片语法；表格尽量少，一段里最多 4 个。"#;
+
+/// 交给 Agent 的系统规则：RULES 后面接上团队整理的环境速查（有的话）。CLI 每轮按本次
+/// 传入的规则重建系统提示（`--system-prompt-snapshot off`），速查改了，续接的老会话下一轮
+/// 就能用上，不用做变更检测。
+pub fn rules(knowledge: Option<&str>) -> String {
+    let Some(knowledge) = knowledge.map(str::trim).filter(|k| !k.is_empty()) else {
+        return RULES.to_owned();
+    };
+    format!(
+        "{RULES}\n\n## 环境速查（团队整理，可能过时：和现场证据冲突时以现场为准）\n{}",
+        clip(
+            knowledge,
+            KNOWLEDGE_BUDGET,
+            "环境速查过长，后面的没有放进来"
+        )
+    )
+}
 
 /// 之前某一轮的问答，续接失败时补前情用。
 #[derive(Debug, Clone)]
@@ -908,6 +928,29 @@ mod tests {
         let clipped = clip(&"中".repeat(20_000), QUESTION_BUDGET, "提问过长，已截断");
         assert!(clipped.len() <= QUESTION_BUDGET + 64);
         assert!(clipped.ends_with("已截断）"));
+    }
+
+    #[test]
+    fn the_environment_notes_follow_the_rules() {
+        assert_eq!(rules(None), RULES);
+        assert_eq!(rules(Some("  \n")), RULES, "空文件当没配");
+        let with = rules(Some("- k3s 命名空间：ns-a\n"));
+        assert!(with.starts_with(RULES));
+        assert!(
+            with.ends_with(
+                "\n\n## 环境速查（团队整理，可能过时：和现场证据冲突时以现场为准）\n- k3s 命名空间：ns-a"
+            ),
+            "{}",
+            &with[RULES.len()..]
+        );
+        assert!(RULES.contains("系统提示最后有「环境速查」时"));
+        let long = rules(Some(&"很长的一行速查\n".repeat(5_000)));
+        assert!(
+            long.len() < RULES.len() + KNOWLEDGE_BUDGET + 256,
+            "{}",
+            long.len()
+        );
+        assert!(long.ends_with("（环境速查过长，后面的没有放进来）"));
     }
 
     #[test]

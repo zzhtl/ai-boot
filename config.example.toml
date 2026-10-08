@@ -58,6 +58,10 @@ window_messages = 500
 window_minutes = 0
 # 旧版 Office（doc、ppt）和 OpenDocument 先用 soffice 转换再读取
 office_legacy = true
+# 环境速查（markdown）：团队整理的部署方式、命名空间、常用路径和代码在哪个仓库，接在规则
+# 后面给模型参考，省得每次从头找。每轮读一次，改了不用重启；内容可能过时，模型以现场为准。
+# 不配就不带
+# knowledge_file = "/etc/ai-boot/knowledge.md"
 
 # 以你的身份读云文档（OAuth 授权一次，之后后台自动续期）。不配这一节就不读文档。
 [oauth]

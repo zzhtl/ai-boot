@@ -83,6 +83,8 @@ pub struct Settings {
     pub budget_usd_micros: Option<u64>,
     pub mcp_servers: Vec<McpServer>,
     pub link_hosts: Vec<String>,
+    /// 环境速查文件，接在规则后面；没配就不带。
+    pub knowledge_file: Option<PathBuf>,
 }
 
 pub struct Runner {
@@ -1162,7 +1164,7 @@ impl Runner {
             workdir: workdir.to_path_buf(),
             run_dir: run_dir.clone(),
             images,
-            rules: prompt::RULES.to_owned(),
+            rules: prompt::rules(self.knowledge().await.as_deref()),
             schema: answer::schema().clone(),
             mcp_servers: self.settings.mcp_servers.clone(),
             model: self.settings.model.clone(),
@@ -1200,6 +1202,18 @@ impl Runner {
             tracing::debug!(%err, dir = %run_dir.display(), "清理运行目录失败");
         }
         attempt
+    }
+
+    /// 环境速查的内容：每轮读一次，改了文件不用重启。读不到就不带，照常分析。
+    async fn knowledge(&self) -> Option<String> {
+        let path = self.settings.knowledge_file.as_ref()?;
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "读不到环境速查，这一轮不带");
+                None
+            }
+        }
     }
 
     /// 消费事件，节流更新进度卡，直到终态。

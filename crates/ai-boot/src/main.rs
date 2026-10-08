@@ -211,6 +211,7 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
             })
             .collect(),
         link_hosts: config.render.link_hosts.clone(),
+        knowledge_file: config.context.knowledge_file.clone(),
     };
     let mut runner = runner::Runner::new(
         Arc::clone(&api),

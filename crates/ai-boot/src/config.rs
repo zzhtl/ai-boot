@@ -181,6 +181,10 @@ pub struct ContextConfig {
     /// 旧版 Office（doc、ppt）和 OpenDocument 用 soffice 转换后读取。
     #[serde(default = "default_office_legacy")]
     pub office_legacy: bool,
+    /// 环境速查：团队整理的部署方式、命名空间、常用路径和代码位置，接在规则后面给模型
+    /// 参考，省得每次从头找。每轮读一次，改了不用重启；不配就不带。
+    #[serde(default)]
+    pub knowledge_file: Option<PathBuf>,
 }
 
 impl Default for ContextConfig {
@@ -189,6 +193,7 @@ impl Default for ContextConfig {
             window_messages: default_window_messages(),
             window_minutes: default_window_minutes(),
             office_legacy: default_office_legacy(),
+            knowledge_file: None,
         }
     }
 }

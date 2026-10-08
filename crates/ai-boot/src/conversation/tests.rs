@@ -309,6 +309,7 @@ async fn world_full(
                 env: Default::default(),
             }],
             link_hosts: vec!["jira.example.com".into()],
+            knowledge_file: None,
         },
         1,
         Arc::clone(&bot),
