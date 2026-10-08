@@ -15,10 +15,11 @@
 //! - `--autocompact`：一轮里上下文涨过这个数就先压缩再继续。每次请求都要带上整段会话，
 //!   窗口越大每一步越慢；轮与轮之间由编排层按上下文大小换新会话。
 //! - `--add-dir`：超大的工具结果 CLI 存成文件、只回一个路径，文件在工作目录外；
-//!   不放开，模型就读不到这份结果（线上出现过）。
+//!   不放开，模型就读不到这份结果（线上出现过）。本轮的临时目录（`$TMPDIR`）同理：
+//!   模型把附件、源码下载到那里再读，不放开就要绕道拷进工作目录（线上出现过）。
 //! - prompt 不在这里：它走 stdin。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::TurnRequest;
 
@@ -41,13 +42,14 @@ pub(crate) enum SessionArg<'a> {
 }
 
 impl Invocation {
-    /// `results_dir` 是 CLI 存放超大工具结果的目录，给了就放开给文件工具读。
+    /// `readable` 是工作目录外要放开给文件工具读的目录：CLI 存放超大工具结果的目录、
+    /// 本轮的临时目录。
     pub(crate) fn build(
         request: &TurnRequest,
         session: SessionArg<'_>,
         mcp_config: &Path,
         settings: &Path,
-        results_dir: Option<&Path>,
+        readable: &[PathBuf],
     ) -> Self {
         let mut args: Vec<String> = Vec::with_capacity(32);
         let mut push = |flag: &str, value: Option<String>| {
@@ -73,9 +75,6 @@ impl Invocation {
         push("--permission-prompts", Some("none".into()));
         push("--system-prompt-snapshot", Some("off".into()));
         push("--autocompact", Some(AUTOCOMPACT_TOKENS.into()));
-        if let Some(dir) = results_dir {
-            push("--add-dir", Some(dir.display().to_string()));
-        }
         let approved: Vec<String> = request
             .mcp_servers
             .iter()
@@ -98,6 +97,12 @@ impl Invocation {
         }
         if let Some(micros) = request.budget_usd_micros {
             push("--max-budget-usd", Some(usd_decimal(micros)));
+        }
+        // 参数是 `<directories...>`，会吞掉后面所有不以 - 开头的参数：放在最后，
+        // 一个 --add-dir 跟全部目录
+        if !readable.is_empty() {
+            args.push("--add-dir".to_owned());
+            args.extend(readable.iter().map(|dir| dir.display().to_string()));
         }
         Self { args }
     }
@@ -170,7 +175,10 @@ mod tests {
             SessionArg::New("s-1"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
-            Some(Path::new("/c/projects/-w/s-1/tool-results")),
+            &[
+                PathBuf::from("/c/projects/-w/s-1/tool-results"),
+                PathBuf::from("/r/tmp"),
+            ],
         );
         for flag in [
             "-p",
@@ -191,12 +199,18 @@ mod tests {
         assert_eq!(value_of(&inv, "--session-id"), Some("s-1"));
         assert_eq!(value_of(&inv, "--max-budget-usd"), Some("2.500000"));
         assert_eq!(value_of(&inv, "--effort"), Some("high"));
-        // 规则改了老会话也要按新的来；超大工具结果所在的目录要能读
+        // 规则改了老会话也要按新的来；超大工具结果所在的目录、本轮的临时目录要能读
         assert_eq!(value_of(&inv, "--system-prompt-snapshot"), Some("off"));
         assert_eq!(value_of(&inv, "--autocompact"), Some(AUTOCOMPACT_TOKENS));
+        let add_dir = inv
+            .args()
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("--add-dir");
         assert_eq!(
-            value_of(&inv, "--add-dir"),
-            Some("/c/projects/-w/s-1/tool-results")
+            &inv.args()[add_dir..],
+            ["--add-dir", "/c/projects/-w/s-1/tool-results", "/r/tmp"],
+            "可变参数放在最后，后面不能再有别的参数"
         );
     }
 
@@ -208,7 +222,7 @@ mod tests {
             SessionArg::Resume("s-2"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
-            None,
+            &[],
         );
         assert_eq!(
             value_of(&inv, "--allowedTools"),
@@ -231,7 +245,7 @@ mod tests {
             SessionArg::Resume("s-2"),
             Path::new("/r/mcp.json"),
             Path::new("/r/settings.json"),
-            None,
+            &[],
         );
         assert_eq!(
             value_of(&inv, "--allowedTools"),

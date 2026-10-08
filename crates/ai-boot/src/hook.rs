@@ -27,7 +27,7 @@ pub struct HookArgs {
     /// 本轮的工作目录：文件工具只能读这里面的东西
     #[arg(long)]
     workdir: PathBuf,
-    /// 工作目录外另外放开读的目录：CLI 把超大的工具结果存成文件放在这里
+    /// 工作目录外另外放开读的目录：CLI 把超大的工具结果存成文件放的地方、本轮的临时目录
     #[arg(long)]
     read_dir: Vec<PathBuf>,
 }

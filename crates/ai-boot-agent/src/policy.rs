@@ -4,7 +4,7 @@
 //! 这里也不拦。命令和网页按部署者的决定直接开放、不加沙箱：服务用户读得到的凭据只靠
 //! 提示词约束，不是硬隔离。hook 只剩兜底的两件事（实测 Claude Code 2.1.283，Codex 格式一致）：
 //! - **PreToolUse** 对所有工具触发，只负责拒绝：文件工具越出工作目录（和
-//!   `--restricted` 双保险；CLI 存放超大工具结果的目录另外放开）；万一配置漂移冒出
+//!   `--restricted` 双保险；CLI 存放超大工具结果的目录、本轮的临时目录另外放开）；万一配置漂移冒出
 //!   改文件、派子 Agent 的工具，也在这里拦下。
 //! - **PermissionRequest** 只在调用需要批准时触发：MCP 工具、执行命令、上网和结构化输出
 //!   给 allow，其余 deny。hook 自身崩溃或超时时，`--permission-prompts none` 下调用会被
@@ -40,7 +40,7 @@ pub struct HookCall<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Scope<'a> {
     pub workdir: &'a Path,
-    /// CLI 存放超大工具结果的目录：结果只以文件的形式交给模型。
+    /// CLI 存放超大工具结果的目录（结果只以文件的形式交给模型）、本轮的临时目录。
     pub readable: &'a [PathBuf],
 }
 

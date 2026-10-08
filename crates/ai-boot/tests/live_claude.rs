@@ -213,3 +213,52 @@ async fn commands_and_the_web_work_end_to_end() {
         }))
     ));
 }
+
+/// 本轮的临时目录（`$TMPDIR`）在工作目录外：模型把附件、源码下载到那里之后要能直接
+/// Read，不用再拷进工作目录（线上出现过被 hook 拦下、绕道拷贝）。
+#[tokio::test]
+async fn files_in_the_turn_tmpdir_are_readable() {
+    if !enabled() {
+        eprintln!("跳过：设置 AI_BOOT_LIVE_CLAUDE=1 才运行");
+        return;
+    }
+    let root = tempfile::tempdir().expect("临时目录");
+    let workdir = root.path().join("work");
+    std::fs::create_dir(&workdir).expect("工作目录");
+    let request = TurnRequest {
+        session: SessionRef::New,
+        prompt: "按顺序真实调用工具，每一步单独调用，不要跳过：\
+                 1. 用 Bash 执行 echo tmp-check > \"$TMPDIR/a.txt\" && echo \"$TMPDIR/a.txt\"；\
+                 2. 用 Read 读取上一步输出的那个绝对路径。\
+                 最后按 JSON 输出：summary 一句话，steps 逐条写每一步的结果。"
+            .into(),
+        workdir,
+        run_dir: root.path().join("run"),
+        images: Vec::new(),
+        rules: "你是全链路检查探针，按用户要求逐步调用工具。".into(),
+        schema: probe_schema(),
+        mcp_servers: Vec::new(),
+        model: Some("haiku".into()),
+        effort: None,
+        timeout: Duration::from_secs(240),
+        budget_usd_micros: Some(500_000),
+    };
+
+    let (events, _) = run(request).await;
+
+    assert!(succeeded(&events, "Bash"), "Bash 没有成功执行");
+    assert!(succeeded(&events, "Read"), "Read 没有读到 $TMPDIR 里的文件");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Step(Step::Denied { .. }))),
+        "有调用被拦下"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Finished(Outcome::Success {
+            structured: Some(_),
+            ..
+        }))
+    ));
+}

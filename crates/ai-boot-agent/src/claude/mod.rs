@@ -6,7 +6,8 @@
 //!
 //! 超大的工具结果（整页 Confluence、长日志）CLI 不放进上下文，而是存到
 //! `<配置目录>/projects/<工作目录>/<会话>/tool-results/` 下、只回一个路径。这个目录
-//! 在工作目录外，得同时交给 `--add-dir` 和 hook，模型才读得到。
+//! 在工作目录外，得同时交给 `--add-dir` 和 hook，模型才读得到。本轮的临时目录
+//! `run_dir/tmp`（`$TMPDIR`）也一样；`run_dir` 本身不放开，里面是 MCP 和 hook 的配置。
 
 pub mod decode;
 mod invocation;
@@ -68,10 +69,11 @@ impl ClaudeBackend {
         var("CLAUDE_CONFIG_DIR").or_else(|| var("HOME").map(|home| home.join(".claude")))
     }
 
+    /// `readable` 是工作目录外要放开给文件工具读的目录，每个交给 hook 一个 `--read-dir`。
     fn write_run_files(
         &self,
         request: &TurnRequest,
-        results_dir: Option<&Path>,
+        readable: &[PathBuf],
     ) -> Result<(PathBuf, PathBuf), AgentError> {
         create_private_dir(&request.run_dir)?;
 
@@ -97,7 +99,7 @@ impl ClaudeBackend {
             shell_quote(&self.config.hook_program.display().to_string()),
             shell_quote(&request.workdir.display().to_string()),
         );
-        if let Some(dir) = results_dir {
+        for dir in readable {
             command.push_str(" --read-dir ");
             command.push_str(&shell_quote(&dir.display().to_string()));
         }
@@ -132,6 +134,9 @@ impl AgentBackend for ClaudeBackend {
             SessionRef::New => uuid::Uuid::now_v7().to_string(),
             SessionRef::Resume(id) => id.clone(),
         };
+        // 临时文件放进本轮的运行目录，这一轮结束随它一起删：CLI 自己的命令输出、模型
+        // 跑命令时 mktemp 出来的文件都不会留在服务的 /tmp 里
+        let tmp = request.run_dir.join("tmp");
         // 先建好：hook 按真实路径判断，不存在的目录没法比
         let results_dir = self
             .config_dir()
@@ -139,27 +144,19 @@ impl AgentBackend for ClaudeBackend {
         if let Some(dir) = &results_dir {
             create_private_dir(dir)?;
         }
-        let (mcp_path, settings_path) = self.write_run_files(&request, results_dir.as_deref())?;
+        create_private_dir(&tmp)?;
+        let readable: Vec<PathBuf> = results_dir.into_iter().chain([tmp.clone()]).collect();
+        let (mcp_path, settings_path) = self.write_run_files(&request, &readable)?;
         let session = match &request.session {
             SessionRef::New => SessionArg::New(&session_id),
             SessionRef::Resume(_) => SessionArg::Resume(&session_id),
         };
-        let invocation = Invocation::build(
-            &request,
-            session,
-            &mcp_path,
-            &settings_path,
-            results_dir.as_deref(),
-        );
+        let invocation = Invocation::build(&request, session, &mcp_path, &settings_path, &readable);
         tracing::debug!(
             target: "claude::invocation",
             command = %invocation.command_line(&self.config.program.display().to_string()),
             "启动 claude"
         );
-        // 临时文件放进本轮的运行目录，这一轮结束随它一起删：CLI 自己的命令输出、模型
-        // 跑命令时 mktemp 出来的文件都不会留在服务的 /tmp 里
-        let tmp = request.run_dir.join("tmp");
-        create_private_dir(&tmp)?;
         let mut env = self.config.env.clone();
         env.retain(|(key, _)| key != "TMPDIR");
         env.push(("TMPDIR".into(), tmp.into_os_string()));
@@ -321,8 +318,9 @@ mod tests {
         let work = root.path().join("work dir");
         std::fs::create_dir(&work).expect("工作目录");
         let results = root.path().join("claude/projects/x/s/tool-results");
+        let tmp = run.join("tmp");
         let (mcp, settings) = backend()
-            .write_run_files(&request(run.clone(), work), Some(&results))
+            .write_run_files(&request(run.clone(), work), &[results.clone(), tmp.clone()])
             .expect("写配置");
 
         let mcp: serde_json::Value =
@@ -343,9 +341,13 @@ mod tests {
             assert!(
                 command.starts_with("'/opt/ai boot/bin/ai-boot' hook --backend claude --workdir '")
             );
-            // 超大工具结果的目录也交给 hook，否则模型读它时会被拦下
+            // 超大工具结果的目录、本轮的临时目录也交给 hook，否则模型读它们时会被拦下
             assert!(
-                command.ends_with(&format!("--read-dir {}", results.display())),
+                command.ends_with(&format!(
+                    "--read-dir {} --read-dir {}",
+                    results.display(),
+                    tmp.display()
+                )),
                 "{command}"
             );
         }
