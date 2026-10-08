@@ -3,13 +3,14 @@
 //! 卡片里所有来自模型或用户的文字都先脱敏、再经 markdown 规范化；标题一律用
 //! plain_text。尺寸按序列化后的字节数控制在 28 KB 以内（飞书上限 30 KB）。
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use super::markdown::{LinkPolicy, escape, render};
 use super::redact::redact;
-use crate::answer::{Answer, Chart, ChartKind, Confidence, Kind, Section, Status};
+use crate::answer::{Answer, Chart, ChartKind, Command, Confidence, Kind, Section, Status};
 use crate::callback::Action;
 
 const MAX_CARD_BYTES: usize = 28 * 1024;
@@ -20,6 +21,25 @@ const MAX_SECTIONS: usize = 8;
 const MAX_LIST_ITEMS: usize = 8;
 /// 露在外面的更正条数：多了就不「简洁」了，细节在正文里。
 const MAX_CORRECTIONS: usize = 3;
+/// 露在外面的关键命令条数，多出来的折叠；一张卡片最多放的命令。
+const SHOWN_COMMANDS: usize = 3;
+const MAX_COMMANDS: usize = 6;
+/// 命令本身不悄悄截断（截了可能照样能执行、意思却变了），太长才截并标红。
+const COMMAND_CHARS: usize = 1500;
+const COMMAND_TITLE_CHARS: usize = 40;
+/// 规则要求 30 字、80 字以内；这里是兜底，留出余量免得把半句话截掉。
+const COMMAND_PLACE_CHARS: usize = 80;
+const COMMAND_LOOK_CHARS: usize = 160;
+/// 概述行首的标签和颜色：排查类的「根因 / 解决」，根因没确认时的「可能原因 / 下一步」。
+const LABELS: [(&str, &str); 4] = [
+    ("根因", "red"),
+    ("可能原因", "orange"),
+    ("解决", "green"),
+    ("下一步", "blue"),
+];
+/// 标签在渲染前换成这一段私用区字符，渲染后再换成 `text_tag`：正文照常转义，
+/// 卡片标签只能由我们生成。
+const SENTINEL_BASE: u32 = 0xE000;
 const MIN_SECTION_CHARS: usize = 200;
 const TRUNCATED: &str = "\n\n…（内容过长，已截断）";
 /// 进度卡上露出的最近几步：卡片最后会换成答案，不必把过程全摆出来。
@@ -96,8 +116,7 @@ fn plain(text: &str, limit: usize) -> String {
 
 fn card(title: &str, subtitle: &str, template: &str, elements: Vec<Value>) -> Value {
     let title = plain(title, TITLE_CHARS);
-    let subtitle = plain(subtitle, 60);
-    json!({
+    let mut card = json!({
         "schema": "2.0",
         "config": {
             "update_multi": true,
@@ -107,10 +126,22 @@ fn card(title: &str, subtitle: &str, template: &str, elements: Vec<Value>) -> Va
         },
         "header": {
             "title": { "tag": "plain_text", "content": &title },
-            "subtitle": { "tag": "plain_text", "content": &subtitle },
             "template": template,
         },
         "body": { "elements": elements },
+    });
+    if !subtitle.trim().is_empty() {
+        card["header"]["subtitle"] = json!({ "tag": "plain_text", "content": plain(subtitle, 60) });
+    }
+    card
+}
+
+/// 标题右侧的彩色标签（飞书最多显示 3 个）。
+fn header_tag(text: &str, color: &str) -> Value {
+    json!({
+        "tag": "text_tag",
+        "text": { "tag": "plain_text", "content": plain(text, 20) },
+        "color": color,
     })
 }
 
@@ -124,6 +155,153 @@ fn markdown_blocks(text: &str, links: &dyn LinkPolicy) -> Vec<Value> {
         .into_iter()
         .map(markdown)
         .collect()
+}
+
+fn sentinel(index: usize) -> char {
+    u32::try_from(index)
+        .ok()
+        .and_then(|i| char::from_u32(SENTINEL_BASE + i))
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+}
+
+fn is_sentinel(c: char) -> bool {
+    (SENTINEL_BASE..SENTINEL_BASE + 0x100).contains(&u32::from(c))
+}
+
+/// 行首的标签。三种写法都认：`**根因**：`、`**根因：**`、`根因：`，冒号全角半角都行
+/// （冒号写在加粗里时按 CommonMark 不算加粗，不在这里剥掉就会显示出星号）。
+/// 返回标签在 [`LABELS`] 里的序号和标签后面的正文。
+fn line_label(line: &str) -> Option<(usize, &str)> {
+    let line = line.trim_start();
+    LABELS.iter().enumerate().find_map(|(i, (label, _))| {
+        [
+            format!("**{label}**："),
+            format!("**{label}**:"),
+            format!("**{label}：**"),
+            format!("**{label}:**"),
+            format!("{label}："),
+            format!("{label}:"),
+        ]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix.as_str()))
+        .map(|rest| (i, rest.trim_start()))
+    })
+}
+
+/// 概述：行首的「根因」「解决」这类标签换成彩色胶囊，一眼分得清原因和办法；正文照常
+/// 转义。`muted` 是被更正过的旧卡片，标签一律灰色。
+fn summary_blocks(summary: &str, links: &dyn LinkPolicy, muted: bool) -> Vec<Value> {
+    // 模型文本里本来就有的私用区字符先去掉，免得冒充占位符
+    let clean: String = redact(summary)
+        .chars()
+        .filter(|c| !is_sentinel(*c))
+        .collect();
+    let marked: Vec<String> = clean
+        .lines()
+        .map(|line| match line_label(line) {
+            Some((i, rest)) => format!("{}{rest}", sentinel(i)),
+            None => line.to_owned(),
+        })
+        .collect();
+    render(&marked.join("\n"), links)
+        .blocks
+        .into_iter()
+        .map(|mut block| {
+            for (i, (label, color)) in LABELS.iter().enumerate() {
+                let color = if muted { "neutral" } else { color };
+                block = block.replace(
+                    sentinel(i),
+                    &format!("<text_tag color=\"{color}\">{label}</text_tag> "),
+                );
+            }
+            markdown(block)
+        })
+        .collect()
+}
+
+/// 关键命令：前几条露在概述下面，其余折叠；`keep_extra` 为 false 时（卡片放不下）
+/// 折叠的那些只留一句说明。
+fn command_elements(commands: &[Command], keep_extra: bool) -> Vec<Value> {
+    let commands: Vec<&Command> = commands
+        .iter()
+        .filter(|c| !c.command.trim().is_empty())
+        .take(MAX_COMMANDS)
+        .collect();
+    let numbered = commands.len() > 1;
+    let mut out: Vec<Value> = commands
+        .iter()
+        .take(SHOWN_COMMANDS)
+        .enumerate()
+        .map(|(i, command)| command_element(i, command, numbered))
+        .collect();
+    let extra = commands.get(SHOWN_COMMANDS..).unwrap_or_default();
+    if extra.is_empty() {
+        return out;
+    }
+    if keep_extra {
+        let inner = extra
+            .iter()
+            .enumerate()
+            .map(|(i, command)| command_element(SHOWN_COMMANDS + i, command, true))
+            .collect();
+        out.push(panel(&format!("更多命令（{}）", extra.len()), false, inner));
+    } else {
+        out.push(markdown(format!(
+            "<font color='grey'>卡片放不下，另有 {} 条命令没有显示</font>",
+            extra.len()
+        )));
+    }
+    out
+}
+
+/// 一条命令：做什么和在哪执行一行，命令单独放代码块，执行后看什么用灰字跟在后面。
+fn command_element(index: usize, command: &Command, numbered: bool) -> Value {
+    let mut head = String::new();
+    if numbered {
+        let _ = write!(head, "{} ", circled(index + 1));
+    }
+    let title = inline_within(&command.title, COMMAND_TITLE_CHARS);
+    let _ = write!(
+        head,
+        "**{}**",
+        if title.is_empty() { "执行" } else { &title }
+    );
+    let place = inline_within(&command.place, COMMAND_PLACE_CHARS);
+    if !place.is_empty() {
+        let _ = write!(head, "　<font color='grey'>{place}</font>");
+    }
+    let mut parts = vec![head, code_block(&command.command)];
+    let look = inline_within(&command.look, COMMAND_LOOK_CHARS);
+    if !look.is_empty() {
+        parts.push(format!("<font color='grey'>{look}</font>"));
+    }
+    markdown(parts.join("\n\n"))
+}
+
+/// 命令原样放进代码块。命令里有 ``` 会提前结束代码块，后面的内容就按 markdown 生效了：
+/// 这种退回转义后的文字。
+fn code_block(command: &str) -> String {
+    let command = redact(command.trim());
+    let cut = command.chars().count() > COMMAND_CHARS;
+    let command = truncate(&command, COMMAND_CHARS);
+    let mut out = if command.contains("```") {
+        escape(&command)
+    } else {
+        format!("```\n{command}\n```")
+    };
+    if cut {
+        out.push_str("\n\n<font color='red'>命令过长已截断，勿直接执行</font>");
+    }
+    out
+}
+
+/// 1～20 的带圈数字，再往后用普通数字。
+fn circled(n: usize) -> String {
+    u32::try_from(n)
+        .ok()
+        .filter(|n| (1..=20).contains(n))
+        .and_then(|n| char::from_u32(0x2460 + n - 1))
+        .map_or_else(|| format!("{n}."), String::from)
 }
 
 fn panel(title: &str, expanded: bool, elements: Vec<Value>) -> Value {
@@ -180,6 +358,8 @@ pub struct Progress<'a> {
     pub thought: Option<&'a str>,
     /// 正在写的结论里已经写完的概述。
     pub draft: Option<&'a str>,
+    /// 已经写完的关键命令（紧跟概述写出来）：详情还在写，人可以先动手。
+    pub commands: &'a [Command],
     pub elapsed: Duration,
     pub notes: &'a [String],
     /// 这一轮的 ID，给了就带「停止」按钮。
@@ -203,6 +383,7 @@ pub fn progress(view: &Progress<'_>) -> Value {
         steps,
         thought,
         draft,
+        commands,
         elapsed,
         notes,
         stop,
@@ -219,7 +400,12 @@ pub fn progress(view: &Progress<'_>) -> Value {
     // 结论开始写了就只露结论：过程已经不重要了
     if let Some(draft) = draft.filter(|d| !d.trim().is_empty()) {
         elements.push(markdown("**结论（还在写详情）**".to_owned()));
-        elements.extend(markdown_blocks(&truncate(draft, SUMMARY_CHARS), &NoLinks));
+        elements.extend(summary_blocks(
+            &truncate(draft, SUMMARY_CHARS),
+            &NoLinks,
+            false,
+        ));
+        elements.extend(command_elements(commands, true));
     } else {
         if let Some(thought) = thought.filter(|t| !t.trim().is_empty()) {
             elements.push(markdown(format!(
@@ -263,9 +449,9 @@ fn progress_steps(elements: &mut Vec<Value>, steps: &[String]) {
     elements.push(markdown(recent.join("\n")));
 }
 
-/// 结构化答案：顶上一段概述，详细内容全部折叠。
+/// 结构化答案：顶上是概述和关键命令，详细内容全部折叠。
 pub fn answer(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy) -> Value {
-    answer_within(answer, footer, links, MAX_CARD_BYTES)
+    answer_within(answer, footer, links, MAX_CARD_BYTES, false)
 }
 
 /// 结论已被后面某一轮更正的旧答案卡：内容保留，顶上注明以最新回复为准，头部置灰，
@@ -276,7 +462,7 @@ pub fn superseded(
     links: &dyn LinkPolicy,
     corrected_in: u32,
 ) -> Value {
-    let mut card = answer_within(answer, footer, links, MAX_CARD_BYTES - 1024);
+    let mut card = answer_within(answer, footer, links, MAX_CARD_BYTES - 1024, true);
     card["header"]["template"] = json!("grey");
     if let Some(elements) = card["body"]["elements"].as_array_mut() {
         elements.insert(
@@ -317,7 +503,7 @@ pub fn closure(
     writebacks: &[WritebackView],
 ) -> Value {
     // 写回区大约占几 KB，给它留出位置
-    let mut card = answer_within(answer, footer, links, MAX_CARD_BYTES - 4 * 1024);
+    let mut card = answer_within(answer, footer, links, MAX_CARD_BYTES - 4 * 1024, false);
     let title = plain(&format!("✅ 闭环方案：{}", answer.title), TITLE_CHARS);
     card["header"]["title"]["content"] = json!(title);
     card["header"]["template"] = json!("green");
@@ -374,20 +560,31 @@ pub fn closure(
     card
 }
 
-fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budget: usize) -> Value {
+/// `muted`：结论已被更正的旧卡片，状态和概述的标签都用灰色。
+fn answer_within(
+    answer: &Answer,
+    footer: &Footer,
+    links: &dyn LinkPolicy,
+    budget: usize,
+    muted: bool,
+) -> Value {
     let mut bodies: Vec<String> = answer
         .sections
         .iter()
         .take(MAX_SECTIONS)
         .map(|s| truncate(&s.body, SECTION_CHARS))
         .collect();
-    let mut keep = Keep { charts: true };
+    let mut keep = Keep {
+        charts: true,
+        extra_commands: true,
+    };
     loop {
-        let built = build_answer(answer, &bodies, keep, footer, links);
+        let built = build_answer(answer, &bodies, keep, footer, links, muted);
         if serde_json::to_string(&built).map_or(0, |s| s.len()) <= budget {
             return built;
         }
-        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方）
+        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方），再去掉折叠着的
+        // 多余命令。概述、露在外面的命令和底部不动
         let longest = bodies
             .iter_mut()
             .max_by_key(|body| body.chars().count())
@@ -398,6 +595,7 @@ fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budge
                 *body = format!("{}{TRUNCATED}", body.chars().take(half).collect::<String>());
             }
             None if keep.charts => keep.charts = false,
+            None if keep.extra_commands => keep.extra_commands = false,
             None => return built,
         }
     }
@@ -407,6 +605,7 @@ fn answer_within(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy, budge
 #[derive(Debug, Clone, Copy)]
 struct Keep {
     charts: bool,
+    extra_commands: bool,
 }
 
 /// 这张卡片上还能放几张图、几个图表。
@@ -421,13 +620,17 @@ fn build_answer(
     keep: Keep,
     footer: &Footer,
     links: &dyn LinkPolicy,
+    muted: bool,
 ) -> Value {
-    // 露在外面的只有概述（和本轮的更正）；其余全部折叠且默认收起，群里也不会刷屏
+    // 露在外面的只有概述、关键命令（和本轮的更正）：一眼看到什么问题、怎么解决、
+    // 先执行什么；其余全部折叠且默认收起，群里也不会刷屏
     let mut elements: Vec<Value> = footer.asked_line().into_iter().collect();
-    elements.extend(markdown_blocks(
+    elements.extend(summary_blocks(
         &truncate(&answer.summary, SUMMARY_CHARS),
         links,
+        muted,
     ));
+    elements.extend(command_elements(&answer.commands, keep.extra_commands));
     if !answer.corrections.is_empty() {
         let items: Vec<String> = answer
             .corrections
@@ -484,20 +687,31 @@ fn build_answer(
 
     elements.push(markdown(footer.line()));
     elements.extend(footer.input());
-    // 副标题只说结论到了哪一步；把握度只在不高的时候提
+    // 标题旁的标签只说结论到了哪一步，把握度只在不高的时候提。头部统一蓝色，状态的颜色
+    // 只放在标签上：橙色头部、橙色标签、橙色行首标签叠在一起太刺眼
     let diagnosis = answer.kind == Kind::Diagnosis;
-    let (template, badge) = match answer.status {
-        Status::Answered if diagnosis => ("blue", "根因已确认"),
-        Status::Answered => ("blue", kind_label(answer.kind)),
-        Status::NeedMoreInfo => ("orange", "需要补充信息"),
-        Status::Partial if diagnosis => ("orange", "根因待确认"),
-        Status::Partial => ("orange", "部分结论"),
+    let (badge, color) = match answer.status {
+        Status::Answered if diagnosis => ("根因已确认", "green"),
+        Status::Answered => (kind_label(answer.kind), "blue"),
+        Status::NeedMoreInfo => ("需要补充信息", "orange"),
+        Status::Partial if diagnosis => ("根因待确认", "orange"),
+        Status::Partial => ("部分结论", "orange"),
     };
-    let subtitle = match answer.confidence {
-        Confidence::High => badge.to_owned(),
-        other => format!("{badge} · 把握：{}", confidence_label(other)),
+    let tags = if muted {
+        vec![header_tag("已更正", "neutral")]
+    } else {
+        let mut tags = vec![header_tag(badge, color)];
+        if answer.confidence != Confidence::High {
+            tags.push(header_tag(
+                &format!("把握：{}", confidence_label(answer.confidence)),
+                "neutral",
+            ));
+        }
+        tags
     };
-    card(&answer.title, &subtitle, template, elements)
+    let mut card = card(&answer.title, "", "blue", elements);
+    card["header"]["text_tag_list"] = json!(tags);
+    card
 }
 
 /// 段落里的截图、图表、流程图。截图和流程图要先上传拿到 image_key，没拿到的不画。
@@ -758,7 +972,7 @@ pub fn human_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::answer::{Conflict, Reference, Section};
+    use crate::answer::{Command, Conflict, Reference, Section};
     use crate::render::markdown::HostAllowlist;
 
     fn footer() -> Footer {
@@ -777,6 +991,7 @@ mod tests {
             status: Status::Answered,
             confidence: Confidence::Medium,
             summary: "连接池耗尽导致".into(),
+            commands: vec![],
             corrections: vec![],
             conflicts: vec![],
             sections,
@@ -803,6 +1018,36 @@ mod tests {
         super::answer(answer, &footer(), &HostAllowlist(&hosts))
     }
 
+    /// 标题旁的标签：(文字, 颜色)。
+    fn header_tags(card: &Value) -> Vec<(String, String)> {
+        card["header"]["text_tag_list"]
+            .as_array()
+            .map(|tags| {
+                tags.iter()
+                    .map(|t| {
+                        (
+                            t["text"]["content"].as_str().unwrap_or_default().to_owned(),
+                            t["color"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn tag(text: &str, color: &str) -> (String, String) {
+        (text.to_owned(), color.to_owned())
+    }
+
+    fn command(title: &str, command: &str) -> Command {
+        Command {
+            title: title.into(),
+            place: "kafka 所在主机".into(),
+            command: command.into(),
+            look: "看 LAG 列".into(),
+        }
+    }
+
     fn tags(card: &Value) -> Vec<String> {
         card["body"]["elements"]
             .as_array()
@@ -812,7 +1057,7 @@ mod tests {
             .collect()
     }
 
-    /// 露在外面的只有概述和底部信息，其余全部折叠且默认收起；卡片撑满宽度。
+    /// 没有命令时，露在外面的只有概述和底部信息，其余全部折叠且默认收起；卡片撑满宽度。
     #[test]
     fn only_the_summary_shows_and_everything_else_is_folded() {
         let mut a = answer_with(vec![
@@ -862,19 +1107,11 @@ mod tests {
         let mut a = answer_with(vec![section("可能原因与验证方法", "1. DNS 2. 连接池")]);
         a.status = Status::Partial;
         let card = render_answer(&a);
-        assert!(
-            card["header"]["subtitle"]["content"]
-                .as_str()
-                .is_some_and(|t| t.contains("根因待确认"))
-        );
+        assert_eq!(header_tags(&card)[0], tag("根因待确认", "orange"));
         a.status = Status::Answered;
         a.corrections = vec!["原来说是连接池耗尽 → 实际是 DNS 超时".into()];
         let card = render_answer(&a);
-        assert!(
-            card["header"]["subtitle"]["content"]
-                .as_str()
-                .is_some_and(|t| t.contains("根因已确认"))
-        );
+        assert_eq!(header_tags(&card)[0], tag("根因已确认", "green"));
         let elements = card["body"]["elements"].as_array().expect("elements");
         assert_eq!(elements[1]["tag"], "markdown", "更正紧跟在概述后面，不折叠");
         assert!(elements[1].to_string().contains("本轮更正"));
@@ -970,18 +1207,24 @@ mod tests {
         assert!(plain.to_string().contains("见截图"), "文字留着");
     }
 
+    /// 标题旁的标签只说结论到了哪一步，把握度只在不高时提；头部统一蓝色、没有副标题；
+    /// 底部没有模型和 token。
     #[test]
     fn the_chrome_carries_only_what_readers_need() {
         let mut a = answer_with(vec![section("根本原因", "连接池只有 10")]);
         a.confidence = Confidence::High;
         let card = render_answer(&a);
-        assert_eq!(card["header"]["subtitle"]["content"], "根因已确认");
+        assert_eq!(header_tags(&card), [tag("根因已确认", "green")]);
+        assert!(card["header"].get("subtitle").is_none(), "{card}");
+        assert_eq!(card["header"]["template"], "blue");
         a.confidence = Confidence::Low;
+        a.status = Status::Partial;
         let card = render_answer(&a);
         assert_eq!(
-            card["header"]["subtitle"]["content"],
-            "根因已确认 · 把握：低"
+            header_tags(&card),
+            [tag("根因待确认", "orange"), tag("把握：低", "neutral")]
         );
+        assert_eq!(card["header"]["template"], "blue", "状态的颜色只在标签上");
         let elements = card["body"]["elements"].as_array().expect("elements");
         assert_eq!(
             elements.last().map(|e| &e["tag"]),
@@ -998,19 +1241,134 @@ mod tests {
     #[test]
     fn a_superseded_answer_is_greyed_and_points_to_the_latest_reply() {
         let hosts = vec!["jira.example.com".to_owned()];
-        let card = superseded(
-            &answer_with(vec![section("根本原因", "连接池只有 10")]),
-            &footer(),
-            &HostAllowlist(&hosts),
-            3,
-        );
+        let mut a = answer_with(vec![section("根本原因", "连接池只有 10")]);
+        a.summary = "**根因**：连接池耗尽\n**解决**：调大连接池".into();
+        let card = superseded(&a, &footer(), &HostAllowlist(&hosts), 3);
         assert_eq!(card["header"]["template"], "grey");
+        assert_eq!(header_tags(&card), [tag("已更正", "neutral")]);
+        let text = card.to_string();
+        assert!(
+            text.contains(r#"<text_tag color=\"neutral\">根因</text_tag>"#),
+            "旧结论的标签也是灰的：{text}"
+        );
+        assert!(!text.contains("color=\\\"red\\\""), "{text}");
         assert!(
             card["body"]["elements"][0]
                 .to_string()
                 .contains("这条结论已在第 3 轮更正")
         );
         assert!(card.to_string().contains("连接池只有 10"), "原来的内容还在");
+    }
+
+    /// 概述行首的「根因」「解决」换成彩色胶囊，三种写法都认；模型自己写的标签照样转义。
+    #[test]
+    fn summary_labels_become_coloured_tags_and_model_tags_stay_escaped() {
+        let mut a = answer_with(vec![]);
+        a.summary = "**根因**：连接池只有 10\n**解决：**调到 50\n下一步: 观察一天 <text_tag color='red'>假</text_tag>".into();
+        let card = render_answer(&a);
+        let summary = card["body"]["elements"][0]["content"]
+            .as_str()
+            .expect("概述")
+            .to_owned();
+        assert!(
+            summary.starts_with(r#"<text_tag color="red">根因</text_tag> 连接池只有 10"#),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(r#"<text_tag color="green">解决</text_tag> 调到 50"#),
+            "冒号写在加粗里也认，不留星号：{summary}"
+        );
+        assert!(
+            summary.contains(r#"<text_tag color="blue">下一步</text_tag> 观察一天"#),
+            "{summary}"
+        );
+        assert_eq!(summary.matches("<text_tag").count(), 3, "{summary}");
+        assert!(
+            summary.contains("&#60;text&#95;tag"),
+            "模型写的标签被转义：{summary}"
+        );
+        // 没有标签的概述照原样，模型写的私用区字符冒充不了占位符
+        a.summary = format!("连接池耗尽{}", '\u{E000}');
+        let text = render_answer(&a).to_string();
+        assert!(!text.contains("text_tag color"), "{text}");
+    }
+
+    /// 关键命令紧跟概述露在外面：一条时不编号，多出 3 条的折叠起来，命令原样进代码块。
+    #[test]
+    fn key_commands_show_under_the_summary_and_the_rest_fold() {
+        let mut a = answer_with(vec![section("根本原因", "连接池只有 10")]);
+        a.commands = vec![command(
+            "查看消费堆积",
+            "bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups",
+        )];
+        let card = render_answer(&a);
+        let elements = card["body"]["elements"].as_array().expect("elements");
+        let shown = elements[1]["content"].as_str().expect("命令");
+        assert_eq!(
+            shown,
+            "**查看消费堆积**　<font color='grey'>kafka 所在主机</font>\n\n```\nbin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups\n```\n\n<font color='grey'>看 LAG 列</font>"
+        );
+
+        a.commands = (1..=5)
+            .map(|i| command(&format!("第 {i} 步"), &format!("echo {i}")))
+            .collect();
+        a.commands.push(command("空命令不显示", "  "));
+        let card = render_answer(&a);
+        let elements = card["body"]["elements"].as_array().expect("elements");
+        assert!(
+            elements[1]["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("① **第 1 步**"))
+        );
+        assert!(
+            elements[3]["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("③ **第 3 步**"))
+        );
+        let more = &elements[4];
+        assert_eq!(more["tag"], "collapsible_panel");
+        assert!(more.to_string().contains("更多命令（2）"), "{more}");
+        assert!(more.to_string().contains("⑤ **第 5 步**"), "{more}");
+        assert!(!card.to_string().contains("空命令不显示"));
+    }
+
+    /// 命令里有 ``` 会提前结束代码块：退回转义后的文字，标签不会生效。
+    #[test]
+    fn a_command_that_could_end_its_code_block_is_shown_as_text() {
+        let mut a = answer_with(vec![]);
+        a.commands = vec![command("坏命令", "echo ```\n<at id=all></at>")];
+        let text = render_answer(&a).to_string();
+        assert!(!text.contains("<at"), "{text}");
+        assert!(!text.contains("```"), "{text}");
+        // 太长的才截，并且标红
+        a.commands = vec![command("长命令", &"x".repeat(COMMAND_CHARS + 10))];
+        let text = render_answer(&a).to_string();
+        assert!(
+            text.contains("命令过长已截断，勿直接执行"),
+            "{}",
+            text.len()
+        );
+    }
+
+    /// 卡片放不下时依次舍掉：段落减半、图表、折叠着的多余命令；概述和前 3 条命令不动。
+    #[test]
+    fn the_first_commands_survive_when_the_card_is_too_big() {
+        let mut a = answer_with(vec![section("根本原因", &"很长的一段分析。".repeat(500))]);
+        a.commands = (1..=6)
+            .map(|i| command(&format!("第 {i} 步"), &format!("echo {}", "y".repeat(1400))))
+            .collect();
+        let hosts: Vec<String> = Vec::new();
+        let card = answer_within(&a, &footer(), &HostAllowlist(&hosts), 9 * 1024, false);
+        let text = card.to_string();
+        assert!(text.contains("连接池耗尽导致"), "概述不动");
+        for i in 1..=3 {
+            assert!(
+                text.contains(&format!("**第 {i} 步**")),
+                "第 {i} 条命令不动"
+            );
+        }
+        assert!(text.contains("另有 3 条命令没有显示"), "{text}");
+        assert!(!text.contains("**第 4 步**"));
     }
 
     #[test]

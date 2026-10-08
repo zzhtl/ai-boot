@@ -26,6 +26,9 @@ const PRE_TOOL_USE_PREFIX: &str = "PreToolUse:";
 const HOOK_ERROR_MARK: &str = " hook error: ";
 /// 标题和概述里被写成 `\uXXXX` 的汉字达到这么多个，就认为这次答案在转义输出中文。
 const ESCAPED_CJK_WARN: usize = 10;
+/// 草稿只从答案开头这么多字节里找：模型万一没按顺序写，不至于每个片段都从头扫一遍
+/// 整份答案。
+const DRAFT_SCAN_BYTES: usize = 16 * 1024;
 
 /// 逐行解码。每行都是自包含的一条事件，只有两件事要跨行记：结构化答案的增量片段
 /// （拼起来才看得出哪些字段写完了），和最近一次请求带上的上下文（终态时一起报）。
@@ -43,7 +46,9 @@ pub struct Decoder {
 struct PartialAnswer {
     index: u64,
     json: String,
-    /// 标题和概述都拿到了：后面的片段不用再拼。
+    /// 标题和概述都拿到了。
+    head: bool,
+    /// 命令也拿到了（或者已经超出扫描范围）：后面的片段不用再拼。
     done: bool,
     /// 已经检查过中文有没有被转义。
     checked: bool,
@@ -101,7 +106,7 @@ impl crate::process::Decode for Decoder {
 
 impl Decoder {
     /// `--include-partial-messages` 的增量事件：完整内容随后还会以 assistant 事件出现，
-    /// 这里只取「模型在做什么」，以及结构化答案里已经写完的标题和概述。结构化答案是
+    /// 这里只取「模型在做什么」，以及结构化答案里已经写完的标题、概述和命令。结构化答案是
     /// 模型调用 `StructuredOutput` 工具写出来的，参数按 JSON 片段一段段流过来。
     fn stream_event(&mut self, value: &Value) -> Vec<AgentEvent> {
         let index = value.pointer("/event/index").and_then(Value::as_u64);
@@ -119,6 +124,7 @@ impl Decoder {
                         self.answer = index.map(|index| PartialAnswer {
                             index,
                             json: String::new(),
+                            head: false,
                             done: false,
                             checked: false,
                         });
@@ -147,7 +153,7 @@ impl Decoder {
         events
     }
 
-    /// 结构化答案的一段参数片段。标题或概述刚写完时返回新的草稿。
+    /// 结构化答案的一段参数片段。标题、概述或命令刚写完时返回新的草稿。
     fn answer_delta(&mut self, index: Option<u64>, value: &Value) -> Option<Draft> {
         let answer = self.answer.as_mut().filter(|a| Some(a.index) == index)?;
         if answer.done {
@@ -158,11 +164,16 @@ impl Decoder {
             .push_str(value.pointer("/event/delta/partial_json")?.as_str()?);
         let title = completed_string(&answer.json, "title");
         let summary = completed_string(&answer.json, "summary");
-        answer.done = title.is_some() && summary.is_some();
+        let commands = completed_raw(&answer.json, "commands")
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .filter(Value::is_array);
+        answer.head = title.is_some() && summary.is_some();
+        answer.done = (answer.head && commands.is_some()) || answer.json.len() > DRAFT_SCAN_BYTES;
         // 答案被 schema 校验打回、重写时，先保留上一次的
         let draft = Draft {
             title: title.or_else(|| self.draft.title.clone()),
             summary: summary.or_else(|| self.draft.summary.clone()),
+            commands: commands.or_else(|| self.draft.commands.clone()),
         };
         if draft == self.draft {
             return None;
@@ -174,7 +185,7 @@ impl Decoder {
     /// 标题和概述写完时看一眼：模型偶尔把整份答案的中文写成 `\uXXXX`，解析出来一样，
     /// 生成的 token 却多两三倍，写结论要多等一两分钟。只报一次，留在日志里看有多常见。
     fn escape_warning(&mut self) -> Option<String> {
-        let answer = self.answer.as_mut().filter(|a| a.done && !a.checked)?;
+        let answer = self.answer.as_mut().filter(|a| a.head && !a.checked)?;
         answer.checked = true;
         let escaped = escaped_cjk(&answer.json);
         (escaped >= ESCAPED_CJK_WARN).then(|| {
@@ -212,8 +223,14 @@ fn escaped_cjk(json: &str) -> usize {
 }
 
 /// 写到一半的 JSON 对象里，顶层字段 `key` 的字符串值；值的结束引号还没出现（或者
-/// 这个字段还没写到）就返回 `None`。
+/// 这个字段还没写到、不是字符串）就返回 `None`。
 fn completed_string(partial: &str, key: &str) -> Option<String> {
+    serde_json::from_str(completed_raw(partial, key)?).ok()
+}
+
+/// 写到一半的 JSON 对象里，顶层字段 `key` 已经写完的值（字符串、数组或对象）的原文；
+/// 还没写完或者还没写到就返回 `None`。
+fn completed_raw<'a>(partial: &'a str, key: &str) -> Option<&'a str> {
     let bytes = partial.as_bytes();
     let mut depth = 0_usize;
     // 顶层下一个字符串是字段名
@@ -249,11 +266,12 @@ fn completed_string(partial: &str, key: &str) -> Option<String> {
                 }
                 let start = skip_space(bytes, colon + 1)?;
                 if name == key {
-                    if bytes[start] != b'"' {
-                        return None;
-                    }
-                    let value_end = string_end(bytes, start)?;
-                    return serde_json::from_str(&partial[start..=value_end]).ok();
+                    let end = match bytes[start] {
+                        b'"' => string_end(bytes, start)?,
+                        b'[' | b'{' => container_end(bytes, start)?,
+                        _ => return None,
+                    };
+                    return Some(&partial[start..=end]);
                 }
                 i = start;
             }
@@ -272,6 +290,31 @@ fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
             b'"' => return Some(i),
             _ => i += 1,
         }
+    }
+    None
+}
+
+/// 从 `start` 处的 `[` 或 `{` 开始的数组、对象在哪里结束（配对的括号的下标），还没
+/// 结束返回 `None`。字符串里的括号不算。
+fn container_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = string_end(bytes, i)? + 1;
+                continue;
+            }
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
     None
 }
@@ -764,11 +807,13 @@ mod tests {
             [
                 Draft {
                     title: Some("登录超时".into()),
-                    summary: None
+                    summary: None,
+                    commands: None,
                 },
                 Draft {
                     title: Some("登录超时".into()),
-                    summary: Some("锁等待超时".into())
+                    summary: Some("锁等待超时".into()),
+                    commands: None,
                 },
             ]
         );
@@ -780,6 +825,43 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Draft(_)))
         );
+    }
+
+    /// 命令数组紧跟概述写出来：整个数组写完才算，字符串里的 `]` 和引号不能让它提前收尾。
+    #[test]
+    fn the_commands_count_as_written_only_once_the_whole_array_arrives() {
+        let full = r#"{"title": "看堆积", "summary": "看 LAG 列", "commands": [{"title": "查看[堆积]", "where": "kafka \"主机\"", "command": "grep ']' a.log", "look": ""}], "sections": []}"#;
+        let expected: Value = serde_json::from_str(full).expect("JSON");
+        let raw = completed_raw(full, "commands").expect("写完了");
+        assert_eq!(
+            serde_json::from_str::<Value>(raw).expect("数组"),
+            expected["commands"]
+        );
+        for end in 0..full.len() {
+            if !full.is_char_boundary(end) {
+                continue;
+            }
+            let partial = &full[..end];
+            if let Some(raw) = completed_raw(partial, "commands") {
+                assert_eq!(
+                    serde_json::from_str::<Value>(raw).ok().as_ref(),
+                    Some(&expected["commands"]),
+                    "{partial}"
+                );
+            }
+        }
+        // 草稿里带着命令，写完命令之后的片段不再拼
+        let events = stream_answer(&[&full[..60], &full[60..]]);
+        let last = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Draft(draft) => Some(draft),
+                _ => None,
+            })
+            .next_back()
+            .expect("草稿");
+        assert_eq!(last.commands.as_ref(), Some(&expected["commands"]));
+        assert_eq!(last.summary.as_deref(), Some("看 LAG 列"));
     }
 
     /// 把一份结构化答案按片段喂给解码器，返回所有事件。

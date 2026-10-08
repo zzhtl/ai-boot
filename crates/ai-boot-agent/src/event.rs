@@ -24,6 +24,8 @@ pub enum AgentEvent {
 pub struct Draft {
     pub title: Option<String>,
     pub summary: Option<String>,
+    /// 紧跟概述写出来的关键命令，原样的 JSON 数组：这一层不认识答案的格式，由编排层解析。
+    pub commands: Option<Value>,
 }
 
 /// 模型此刻在做什么。

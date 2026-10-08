@@ -112,6 +112,21 @@ pub struct Diagram {
     pub dot: String,
 }
 
+/// 要执行的关键命令：卡片上紧跟在概述下面，不折叠。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    #[serde(default)]
+    pub title: String,
+    /// 在哪执行。JSON 里叫 `where`，是 Rust 的关键字。
+    #[serde(rename = "where", default)]
+    pub place: String,
+    #[serde(default)]
+    pub command: String,
+    /// 执行后看什么、怎么判断。
+    #[serde(default)]
+    pub look: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reference {
     pub kind: String,
@@ -126,6 +141,9 @@ pub struct Answer {
     pub status: Status,
     pub confidence: Confidence,
     pub summary: String,
+    /// 旧答案里没有。
+    #[serde(default)]
+    pub commands: Vec<Command>,
     /// 本轮对上一轮结论的更正；旧答案里没有。
     #[serde(default)]
     pub corrections: Vec<String>,
@@ -293,6 +311,20 @@ mod tests {
         };
         assert_eq!(answer.status, Status::Answered);
         assert_eq!(answer.sections.len(), 1);
+        assert!(answer.commands.is_empty(), "库里的旧答案没有 commands");
+    }
+
+    #[test]
+    fn commands_keep_their_where_key_on_a_round_trip() {
+        let mut value = sample();
+        value["commands"] = serde_json::json!([{
+            "title": "查看消费堆积", "where": "kafka 所在主机",
+            "command": "bin/kafka-consumer-groups.sh --describe --all-groups", "look": "看 LAG 列"
+        }]);
+        let answer: Answer = serde_json::from_value(value).expect("解析");
+        assert_eq!(answer.commands[0].place, "kafka 所在主机");
+        let back = serde_json::to_value(&answer).expect("序列化");
+        assert_eq!(back["commands"][0]["where"], "kafka 所在主机");
     }
 
     #[test]

@@ -1808,7 +1808,7 @@ async fn progress_with(w: &World, text: &str) -> String {
     panic!("进度卡上一直没有出现「{text}」");
 }
 
-/// 分析中：模型说的进展和写到一半的结论先露在进度卡上，不用干等整份答案。
+/// 分析中：模型说的进展和写到一半的结论（概述和命令）先露在进度卡上，不用干等整份答案。
 #[tokio::test]
 async fn the_progress_card_shows_what_the_model_found_and_the_conclusion_as_it_is_written() {
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -1820,7 +1820,10 @@ async fn the_progress_card_shows_what_the_model_found_and_the_conclusion_as_it_i
         Beat::Gate(Arc::clone(&gate)),
         Beat::Event(AgentEvent::Draft(ai_boot_agent::Draft {
             title: Some("登录锁等待超时".into()),
-            summary: Some("用户表那一行的锁被别的事务占住".into()),
+            summary: Some("**根因**：用户表那一行的锁被别的事务占住".into()),
+            commands: Some(json!([{
+                "title": "查占锁的事务", "where": "数据库", "command": "SHOW ENGINE INNODB STATUS", "look": ""
+            }])),
         })),
         Beat::Gate(Arc::clone(&gate)),
         answered("登录锁等待超时"),
@@ -1835,6 +1838,9 @@ async fn the_progress_card_shows_what_the_model_found_and_the_conclusion_as_it_i
     gate.notify_one();
     let draft = progress_with(&w, "用户表那一行的锁被别的事务占住").await;
     assert!(draft.contains("结论（还在写详情）"), "{draft}");
+    // 命令紧跟概述写完，详情还在写时就露出来，人可以先动手
+    assert!(draft.contains("SHOW ENGINE INNODB STATUS"), "{draft}");
+    assert!(draft.contains("text_tag"), "概述的标签着色：{draft}");
     gate.notify_one();
     until(&w, "结束", all_finished(1)).await;
 }

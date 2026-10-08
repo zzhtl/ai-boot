@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::answer::Answer;
+use crate::answer::{Answer, Command};
 use crate::context::attach::{Attachment, Layer};
 use crate::context::{Line, TurnContext, beijing_time};
 
@@ -50,6 +50,9 @@ pub const RULES: &str = r#"你是公司内部的问题排查助手，在飞书�
 - 正确最重要，时间可以多花，但要花在查证上：下结论前自查一遍——根因能不能解释全部现象，有没有对不上的证据或反例，引用的代码、版本是不是问题发生的那个。对不上就接着查，不要凑结论。
 - 确实缺少关键信息、没法往下分析时才用 need_more_info，并说清缺什么；不要编造。
 - 公司外部的知识（开源软件的行为和版本差异、接口与配置、报错含义）以官方文档、源码、issue 为准：拿不准或可能已经过时的，先用 WebSearch、WebFetch 或 clone 源码核实，不要只凭记忆。
+- 现场状态以当前生效的值为准：运行中进程的实际参数（ps、/proc/<pid>/cmdline、jcmd 看到的）、kubectl get 或 describe 看到的 spec 和 status、正在用的配置文件。注解（比如 last-applied-configuration）、模板和 chart 的默认值、文档示例只说明以前或应该是什么，不能当现状；对不上时以现状为准，并写明各自出处。
+- 建议改配置、调参数、重启之前，先核对会碰到的约束：资源上限（比如堆内存加上堆外开销不能超过容器的内存 limit）、同一配置在别的容器、文件或环境变量里的副本、改完要重启什么、怎么回退。核对不了的写进 open_questions，不要默认没问题。
+- 给出的命令要确认在对方的版本和环境里能原样执行（子命令、参数存在，对象名有现场依据）；拿不准的先查文档或源码。
 
 ## 先查明根因，再给方案
 - 排查类问题的目标是查明根本原因。根因有证据确认了，才写解决方案（status 用 answered）。
@@ -86,10 +89,17 @@ Git、Jira、Confluence、Jenkins 相关的查询和操作一律通过 qtmcp 完
 命令行和网页都能用，更要小心：不要读取、输出或外发任何凭据和配置（家目录下的 .config、.claude、.local、.ssh 等目录，/etc 下的配置，环境变量里的 token，本机进程的信息）；不要把内网系统（Jira、Confluence、GitLab、Jenkins）的内容拼进外部网址或发到外网；工作目录以外的东西不要修改、删除或安装，除非本轮提问明确要求。
 
 ## 输出
-按给定的 JSON Schema 输出（结构化输出），用中文。看的人要一眼知道问题的原因和怎么解决：只写必要的内容，不输出参考链接、来源列表和查阅过程，附带的东西只会分散注意力。证据查够了就直接写进结构化输出，不要先在思考里把整份答案起草一遍再誊写；字段里的中文直接写汉字，不要写成 \uXXXX 转义（同样的内容要多花两三倍时间）；字数要求是大概的，不用逐字计数。
-- summary：打开卡片第一眼看到的就是它。排查类写成两行：「**根因**：……」和「**解决**：……」；根因还没确认时写「**可能原因**：……」和「**下一步**：……」；其他问题两三句话说清结论。200 字左右，不写依据和来源。
-- sections：给想看细节的人，默认折叠。只回答问到的，不要加提问没要的内容；所有段落合计一般在 1500 字以内，提问要求详细时可以更长。排查类：根因已确认写「根本原因」（含引入的版本或提交，依据写在括号里）和「解决方案」（操作步骤和要执行的命令，命令放代码块），只问原因就只写「根本原因」；根因未确认写「可能原因与验证方法」，每条原因给最关键的一两个验证命令或查询。影响范围、复现、验证等只在提问要求或确有必要时才写。总结类写「要点」「结论」，用法类写「步骤」「注意事项」。最多 8 段。
-- files：要交付脚本、报告、导出的数据时，把文件写到当前工作目录的 out/ 下，在 files 里列出相对路径，会作为文件发给提问人；短命令直接写在正文的代码块里，不用另给文件。
+按给定的 JSON Schema 输出（结构化输出），用中文。看的人要一眼看到「什么问题、怎么解决」，多半还要照着命令在现场手敲：只写解决问题必需的内容，不加提问没要的命令和信息，不输出参考链接、来源列表和查阅过程。证据查够了就直接写进结构化输出，不要先在思考里把整份答案起草一遍再誊写；字段里的中文直接写汉字，不要写成 \uXXXX 转义（同样的内容要多花两三倍时间）；字数要求是大概的，不用逐字计数。
+- summary：打开卡片第一眼看到的就是它。排查类写两行：「**根因**：……」和「**解决**：……」；根因还没确认时写「**可能原因**：……」和「**下一步**：……」。每行一句话，60 字左右，不写命令和依据。其他问题一两句话说清结论。环境是推断的，要点明按什么环境回答。
+- commands：解决问题必须执行的关键命令，卡片上紧跟在概述下面、按顺序编号。目标机器上一般没法复制粘贴，要照着手敲，所以要少而准：
+  - 通常 1 条，最多 3 条，按执行顺序。只是查看状态的（比如看消费堆积、看当前配置），给最直接的那 1 条。根因未确认时放验证最可能原因的命令；需要对方补充信息时放取回这些信息的命令；用不着执行命令时为空数组。
+  - 只给一种做法：不列多种写法，不按多个环境、多个版本各给一套。环境不明确时按最可能的环境给，在 where 里写明；其他环境的差别最多在 sections 里提一句。会修改东西的命令，环境或对象拿不准时先不给，改为给查明它的只读命令。
+  - 按手敲来写：一行一条，越短越好；不用变量、循环、$(...)、jsonpath、长管道和多层引号；要先进某个目录或容器的，在 where 里写清，命令里用相对路径。
+  - 命名空间、资源名、容器名、路径、端口必须来自现场证据或文档，不要凭印象拼；拿不准的写成 <占位符>，在 look 里说怎么查到；口令和 token 一律写成占位符。
+  - where 写在哪执行（哪台机器、哪个容器或 pod、什么用户），30 字以内；look 写执行后看什么、怎么判断，80 字以内，不放命令。where 和 look 都用纯文字，怎么找到占位符的值这类补充也要写得短。
+  - 改配置、调参数、重启：按名字精确指定改哪里（容器名、配置键、文件路径），比如 kubectl set resources 用 -c 指定容器，不要说「紧跟在某一行后面的那个」；确认改对了的检查命令作为下一条给出。
+- sections：给想看细节的人，默认折叠。只回答问到的；最多 4 段，合计 800 字左右，提问要求详细时可以更长。commands 里的命令不再重复，也不补其他环境、其他写法的命令，不列「常用变体」「相关命令」这类提问没要的命令；注意事项只写和这次要执行的命令直接相关的（会失败的情况、风险、怎么回退），不写顺带的知识。依据只写最关键的一两处，用短写法（单号、文件名加行号、提交号前 8 位）。排查类：根因已确认写「根本原因」（含引入的版本或提交）和「解决方案」（步骤要点、影响、怎么回退），只问原因就只写「根本原因」；根因未确认写「可能原因与验证方法」，按可能性排序，每条一两句。总结类写「要点」「结论」，用法类写「步骤」「注意事项」。
+- files：要交付脚本、报告、导出的数据时，把文件写到当前工作目录的 out/ 下，在 files 里列出相对路径，会作为文件发给提问人；单条命令放 commands，不用另给文件。
 - open_questions：只写需要提问人确认或补充、而且会影响结论的事项。
 - 图示：比文字更清楚时才在对应段落里附，大多数回答不需要。images 只在要指出群里更早的某张截图时才放（只能用本轮读到过的附件路径），提问附带的和刚发的截图大家都看得到，不要再贴；charts 画数据对比、趋势、占比；diagrams 画调用链、处理流程、依赖关系（Graphviz DOT，不超过 30 个节点，节点文字简短）。
 - jira_keys：与本问题直接相关的单号。
@@ -129,6 +139,7 @@ const RESOLVE: &str = "# 问题已确认解决，请生成闭环方案
 - sections 只写「根本原因」（含引入的版本或提交）和「解决方案」（含修复的版本、提交或配置）两段；做过的验证可以附在解决方案里，不要编造没有做过的验证。
 - 只写有证据的结论，依据（Jira 单号、代码位置、提交号）写在结论后面的括号里；推测的写进 open_questions。
 - jira_keys 只列与本问题直接相关的单。
+- commands 写空数组：闭环方案要写进 Jira 和 Confluence，要执行的命令写进「解决方案」段的代码块。
 按输出契约给出结构化结果。";
 
 /// 闭环方案：续接原来的会话，只给要求。
@@ -514,9 +525,13 @@ fn forwards_in_full(out: &mut String, context: &TurnContext) {
     }
 }
 
-/// 一轮答案的结论摘要：换新会话、续接失败时给前情用，全文在 answers.md。
+/// 一轮答案的结论摘要：换新会话、续接失败时给前情用，全文在 answers.md。命令要带上：
+/// 正文里不再重复命令，对方说「第 2 条命令报错」时，新会话得知道是哪一条。
 pub fn conclusion_of(answer: &Answer) -> String {
     let mut out = format!("{}：{}", answer.title, answer.summary);
+    for (i, command) in answer.commands.iter().enumerate() {
+        let _ = write!(out, "\n命令 {}：{}", i + 1, command_line(command));
+    }
     if !answer.corrections.is_empty() {
         let _ = write!(out, "\n更正：{}", answer.corrections.join("；"));
     }
@@ -535,6 +550,15 @@ pub fn answer_record(seq: i64, question: &str, answer: &Answer) -> String {
     for correction in &answer.corrections {
         let _ = writeln!(out, "- 更正：{correction}");
     }
+    if !answer.commands.is_empty() {
+        let _ = writeln!(out, "\n### 关键命令");
+        for (i, command) in answer.commands.iter().enumerate() {
+            let _ = writeln!(out, "{}. {}", i + 1, command_line(command));
+            if !command.look.trim().is_empty() {
+                let _ = writeln!(out, "   看：{}", command.look.trim());
+            }
+        }
+    }
     for section in &answer.sections {
         let _ = writeln!(out, "\n### {}\n{}", section.title, section.body);
     }
@@ -551,6 +575,21 @@ pub fn answer_record(seq: i64, question: &str, answer: &Answer) -> String {
         }
     }
     out
+}
+
+/// 一条命令写成一行：做什么（在哪执行）：`命令`。
+fn command_line(command: &Command) -> String {
+    let place = command.place.trim();
+    let place = if place.is_empty() {
+        String::new()
+    } else {
+        format!("（{place}）")
+    };
+    format!(
+        "{}{place}：`{}`",
+        command.title.trim(),
+        command.command.trim()
+    )
 }
 
 /// 写进工作目录的完整记录。
@@ -928,6 +967,34 @@ mod tests {
         let clipped = clip(&"中".repeat(20_000), QUESTION_BUDGET, "提问过长，已截断");
         assert!(clipped.len() <= QUESTION_BUDGET + 64);
         assert!(clipped.ends_with("已截断）"));
+    }
+
+    /// 正文里不再重复命令：续接的会话和 answers.md 里都要有这一轮让人执行了什么。
+    #[test]
+    fn the_commands_of_an_answer_are_kept_for_later_turns() {
+        let answer: Answer = serde_json::from_value(serde_json::json!({
+            "kind": "howto", "title": "查看消费堆积", "status": "answered", "confidence": "high",
+            "summary": "用 kafka-consumer-groups.sh 看 LAG 列",
+            "commands": [{
+                "title": "查看堆积", "where": "kafka 所在主机",
+                "command": "bin/kafka-consumer-groups.sh --describe --all-groups", "look": "LAG 列是未消费的条数"
+            }],
+            "sections": []
+        }))
+        .expect("答案");
+        let conclusion = conclusion_of(&answer);
+        assert!(
+            conclusion.contains(
+                "命令 1：查看堆积（kafka 所在主机）：`bin/kafka-consumer-groups.sh --describe --all-groups`"
+            ),
+            "{conclusion}"
+        );
+        let record = answer_record(3, "给个看堆积的命令", &answer);
+        assert!(
+            record.contains("### 关键命令\n1. 查看堆积（kafka 所在主机）"),
+            "{record}"
+        );
+        assert!(record.contains("   看：LAG 列是未消费的条数"), "{record}");
     }
 
     #[test]

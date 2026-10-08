@@ -207,6 +207,8 @@ struct Live<'a> {
     thought: Option<&'a str>,
     /// 正在写的结论里已经写完的概述。
     draft: Option<&'a str>,
+    /// 已经写完的关键命令。
+    commands: &'a [answer::Command],
     notes: &'a [String],
 }
 
@@ -218,6 +220,7 @@ impl Screen<'_> {
             steps: live.steps,
             thought: live.thought,
             draft: live.draft,
+            commands: live.commands,
             elapsed: self.started_at.elapsed(),
             notes: live.notes,
             stop: stoppable.then_some(self.spec.turn_id.as_str()),
@@ -1240,6 +1243,7 @@ impl Runner {
         let mut notes: Vec<String> = Vec::new();
         let mut thought: Option<String> = None;
         let mut draft: Option<String> = None;
+        let mut draft_commands: Vec<answer::Command> = Vec::new();
         let mut dirty = false;
         let mut phase = PHASE_STARTING;
         let mut last_output = Instant::now();
@@ -1304,11 +1308,19 @@ impl Runner {
                                 dirty = true;
                             }
                         }
-                        AgentEvent::Draft(ai_boot_agent::Draft { summary: Some(summary), .. }) => {
-                            draft = Some(summary);
-                            dirty = true;
+                        AgentEvent::Draft(ai_boot_agent::Draft { summary, commands, .. }) => {
+                            if summary.is_some() {
+                                draft = summary;
+                                dirty = true;
+                            }
+                            // 对不上契约的命令不显示，等最终答案
+                            if let Some(commands) = commands
+                                .and_then(|raw| serde_json::from_value::<Vec<answer::Command>>(raw).ok())
+                            {
+                                draft_commands = commands;
+                                dirty = true;
+                            }
                         }
-                        AgentEvent::Draft(_) => {}
                         AgentEvent::Usage(usage) => result.usage = Some(usage),
                         AgentEvent::Finished(outcome) => {
                             result.outcome = outcome;
@@ -1349,6 +1361,7 @@ impl Runner {
                             steps: &steps,
                             thought: thought.as_deref(),
                             draft: draft.as_deref(),
+                            commands: &draft_commands,
                             notes: &shown,
                         };
                         let progress = screen.progress(&live, !result.stopped);

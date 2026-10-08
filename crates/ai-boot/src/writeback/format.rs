@@ -15,6 +15,28 @@ use crate::answer::Answer;
 pub fn document(answer: &Answer, footer: &str) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "**结论**：{}\n", answer.summary.trim());
+    // 规则要求闭环方案的命令写进正文；模型没照做时也不能让卡片上有、写出去的没有。
+    // 没有命令时文档和以前逐字节一样，已发出的闭环卡片上的摘要照样对得上
+    if !answer.commands.is_empty() {
+        let _ = writeln!(out, "## 关键命令\n");
+        for (i, command) in answer.commands.iter().enumerate() {
+            let place = command.place.trim();
+            let _ = write!(out, "{}. {}", i + 1, command.title.trim());
+            if !place.is_empty() {
+                let _ = write!(out, "（{place}）");
+            }
+            let text = command.command.trim();
+            // 命令里有 ``` 会提前结束代码块，按文字写，转换时照样转义
+            if text.contains("```") {
+                let _ = writeln!(out, "：{text}\n");
+            } else {
+                let _ = writeln!(out, "\n\n```\n{text}\n```\n");
+            }
+            if !command.look.trim().is_empty() {
+                let _ = writeln!(out, "看：{}\n", command.look.trim());
+            }
+        }
+    }
     if !answer.conflicts.is_empty() {
         let _ = writeln!(out, "## 信息冲突\n");
         for c in &answer.conflicts {
@@ -371,6 +393,7 @@ mod tests {
             status: Status::Answered,
             confidence: Confidence::High,
             summary: "连接池耗尽，3.2.2 已修复".into(),
+            commands: vec![],
             corrections: vec![],
             conflicts: vec![Conflict {
                 topic: "引入版本".into(),
@@ -424,6 +447,28 @@ mod tests {
             content_hash(&document(&answer(), "别的尾注"))
         );
         assert_eq!(content_hash(&doc).len(), 16);
+    }
+
+    /// 卡片上露出的关键命令也写进闭环文档；没有命令时文档不变。
+    #[test]
+    fn key_commands_are_written_after_the_conclusion() {
+        let without = document(&answer(), FOOTER);
+        assert!(!without.contains("关键命令"));
+        let mut a = answer();
+        a.commands = vec![crate::answer::Command {
+            title: "调大连接池".into(),
+            place: "应用服务器".into(),
+            command: "sed -i 's/maxPoolSize=10/maxPoolSize=50/' app.conf".into(),
+            look: "重启后看日志不再报 timeout".into(),
+        }];
+        let doc = document(&a, FOOTER);
+        let commands = doc.find("## 关键命令").expect("关键命令");
+        assert!(doc.find("**结论**").expect("结论") < commands);
+        assert!(commands < doc.find("## 信息冲突").expect("冲突"));
+        assert!(
+            doc.contains("1. 调大连接池（应用服务器）\n\n```\nsed -i 's/maxPoolSize=10/maxPoolSize=50/' app.conf\n```\n\n看：重启后看日志不再报 timeout"),
+            "{doc}"
+        );
     }
 
     #[test]

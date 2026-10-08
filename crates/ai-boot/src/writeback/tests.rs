@@ -22,6 +22,7 @@ fn answer(keys: &[&str]) -> Answer {
         status: Status::Answered,
         confidence: Confidence::High,
         summary: "连接池耗尽，3.2.2 已修复".into(),
+        commands: vec![],
         corrections: vec![],
         conflicts: vec![],
         sections: vec![Section {
