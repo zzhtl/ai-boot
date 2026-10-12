@@ -174,7 +174,12 @@ impl Ingest {
             tracing::info!(open_id = operator, "非白名单用户点了卡片按钮，已拒绝");
             return Ok(Some(Toast::error("你没有操作这个机器人的权限").to_bytes()));
         }
-        let Some((kind, turn_id)) = Action::parse(&action.action.value, &action.action.input_value)
+        let selected = if action.action.option.is_empty() {
+            action.action.input_value.as_str()
+        } else {
+            action.action.option.as_str()
+        };
+        let Some((kind, turn_id)) = Action::parse(&action.action.value, selected)
         else {
             return Ok(Some(Toast::warning("无法识别的操作").to_bytes()));
         };
@@ -185,7 +190,13 @@ impl Ingest {
                 turn_id,
                 card_message_id: action.context.open_message_id.clone(),
                 chat_id: action.context.open_chat_id.clone(),
-                text: action.action.input_value.clone(),
+                text: action
+                    .action
+                    .form_value
+                    .get("follow_up")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&action.action.input_value)
+                    .to_owned(),
                 operator: operator.to_owned(),
                 reply,
             },
@@ -834,5 +845,76 @@ mod tests {
         let f = fixture(true).await;
         handle(&f, b"not json".to_vec()).await;
         handle(&f, vec![0xff, 0xfe]).await;
+    }
+
+    #[tokio::test]
+    async fn model_dropdown_option_is_forwarded_without_input_text() {
+        let mut f = fixture(true).await;
+        let mut payload: Value = serde_json::from_slice(&card_action(
+            BOSS,
+            Action::Model {
+                model: String::new(),
+            }
+            .value("t-9"),
+        ))
+        .expect("JSON");
+        payload["event"]["action"]["tag"] = serde_json::json!("select_static");
+        payload["event"]["action"]["option"] = serde_json::json!("daily-model");
+        let (response, ()) = tokio::join!(
+            f.ingest
+                .handle(DataKind::Event, serde_json::to_vec(&payload).expect("JSON")),
+            async {
+                match f.jobs.recv().await {
+                    Some(Job::Action {
+                        action,
+                        turn_id,
+                        reply,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            action,
+                            Action::Model {
+                                model: "daily-model".into()
+                            }
+                        );
+                        assert_eq!(turn_id, "t-9");
+                        let _ = reply.send(Toast::success("已切换"));
+                    }
+                    _ => panic!("下拉选择应转给设置操作"),
+                }
+            }
+        );
+        assert_eq!(toast_text(response.expect("成功")), "已切换");
+    }
+
+    #[tokio::test]
+    async fn submitted_follow_up_form_keeps_multiline_text() {
+        let mut f = fixture(true).await;
+        let text = "补充现场日志：\r\n  java.net.UnknownHostException\r\n    at example.Login.run(Login.java:42)";
+        let mut payload: Value =
+            serde_json::from_slice(&card_action(BOSS, Action::FollowUp.value("t-9")))
+                .expect("JSON");
+        payload["event"]["action"]["tag"] = serde_json::json!("button");
+        payload["event"]["action"]["form_value"] = serde_json::json!({"follow_up": text});
+        let (response, ()) = tokio::join!(
+            f.ingest
+                .handle(DataKind::Event, serde_json::to_vec(&payload).expect("JSON")),
+            async {
+                match f.jobs.recv().await {
+                    Some(Job::FollowUp {
+                        text: received,
+                        turn_id,
+                        reply,
+                        ..
+                    }) => {
+                        assert_eq!(received, text);
+                        assert_eq!(turn_id, "t-9");
+                        let _ = reply.send(Toast::success("已发送"));
+                    }
+                    _ => panic!("表单提交应作为追问"),
+                }
+            }
+        );
+        assert_eq!(toast_text(response.expect("成功")), "已发送");
     }
 }

@@ -116,6 +116,12 @@ pub struct ActionBody {
     /// 输入框提交的内容（`tag` 是 `input` 时）。
     #[serde(default, deserialize_with = "crate::nullable")]
     pub input_value: String,
+    /// 下拉框选中的回传值。
+    #[serde(default, deserialize_with = "crate::nullable")]
+    pub option: String,
+    /// 表单提交包含各个输入组件的值。
+    #[serde(default, deserialize_with = "crate::nullable")]
+    pub form_value: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

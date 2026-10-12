@@ -130,7 +130,7 @@ pub struct BackendInfo {
 }
 
 /// 当前后端模型目录中允许展示的选择。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelOption {
     pub id: String,
     pub name: String,

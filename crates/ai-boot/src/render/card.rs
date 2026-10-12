@@ -62,7 +62,7 @@ pub struct Footer {
     /// 底部的补充说明（比如写回前会确认），空的不显示。
     pub hint: &'static str,
     pub elapsed: Duration,
-    /// 给了就在卡片底部放多行输入框（这一轮的 ID）：Enter 发送，Shift+Enter 换行。
+    /// 给了就在卡片底部放多行追问表单（这一轮的 ID）。
     pub follow_up: Option<String>,
     /// 这一轮是在卡片输入框里问的，群里看不到这句话：显示在卡片顶上。
     pub asked: Option<String>,
@@ -70,6 +70,7 @@ pub struct Footer {
     pub effort: Option<String>,
     /// 当前会话的设置入口，旧答案被更正后只展示本轮配置。
     pub configure: Option<String>,
+    pub models: Vec<ModelOption>,
 }
 
 impl Footer {
@@ -100,17 +101,18 @@ impl Footer {
     fn input(&self) -> Option<Value> {
         let turn_id = self.follow_up.as_deref()?;
         Some(json!({
-            "tag": "input",
-            "element_id": "follow_up",
-            "name": "follow_up",
-            "placeholder": { "tag": "plain_text", "content": "补充或纠正，Enter 发送，Shift+Enter 换行" },
-            "input_type": "multiline_text",
-            "rows": 3,
-            "auto_resize": true,
-            "max_rows": 8,
-            "width": "fill",
-            "max_length": 1000,
-            "behaviors": [{ "type": "callback", "value": Action::FollowUp.value(turn_id) }],
+            "tag": "form", "element_id": "follow_up_form", "name": "follow_up_form",
+            "elements": [{
+                "tag": "input", "element_id": "follow_up", "name": "follow_up",
+                "placeholder": { "tag": "plain_text", "content": "补充或纠正，可粘贴多行内容" },
+                "input_type": "multiline_text", "rows": 3, "auto_resize": true,
+                "max_rows": 8, "width": "fill", "max_length": 1000, "required": true,
+            }, {
+                "tag": "button", "element_id": "follow_up_submit", "name": "follow_up_submit",
+                "text": { "tag": "plain_text", "content": "发送追问" },
+                "type": "primary", "size": "small", "form_action_type": "submit",
+                "behaviors": [{ "type": "callback", "value": Action::FollowUp.value(turn_id) }],
+            }],
         }))
     }
 }
@@ -383,6 +385,7 @@ pub struct Progress<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub configure: Option<&'a str>,
+    pub models: &'a [ModelOption],
 }
 
 /// 分析中。
@@ -397,6 +400,7 @@ pub fn progress(view: &Progress<'_>) -> Value {
         model,
         effort,
         configure,
+        models,
     } = *view;
     // 卡片引用着提问，副标题里也有，正文不再重复
     let mut elements = Vec::new();
@@ -424,7 +428,7 @@ pub fn progress(view: &Progress<'_>) -> Value {
             Some(("停止这一轮分析？", "停止后可以在卡片上点重试。")),
         ));
     }
-    elements.extend(model_elements(model, effort, configure));
+    elements.extend(model_elements(model, effort, configure, models));
     card("⏳ 分析中", question, "wathet", elements)
 }
 
@@ -721,12 +725,13 @@ fn build_answer(
         }
     }
     elements.push(markdown(footer.line()));
-    elements.extend(footer.input());
     elements.extend(model_elements(
         footer.model.as_deref(),
         footer.effort.as_deref(),
         footer.configure.as_deref(),
+        &footer.models,
     ));
+    elements.extend(footer.input());
     // 标题旁的标签只说结论到了哪一步，把握度只在不高的时候提。头部统一蓝色，状态的颜色
     // 只放在标签上：橙色头部、橙色标签、橙色行首标签叠在一起太刺眼
     let diagnosis = answer.kind == Kind::Diagnosis;
@@ -909,12 +914,13 @@ pub fn text_reply(text: &str, footer: &Footer, links: &dyn LinkPolicy) -> Value 
     let mut elements: Vec<Value> = footer.asked_line().into_iter().collect();
     elements.extend(markdown_blocks(&truncate(text, SECTION_CHARS * 2), links));
     elements.push(markdown(footer.line()));
-    elements.extend(footer.input());
     elements.extend(model_elements(
         footer.model.as_deref(),
         footer.effort.as_deref(),
         footer.configure.as_deref(),
+        &footer.models,
     ));
+    elements.extend(footer.input());
     card("分析结果", "未按约定格式输出，按原文展示", "blue", elements)
 }
 
@@ -926,12 +932,17 @@ pub fn with_model(
     turn_id: Option<&str>,
 ) -> Value {
     if let Some(elements) = card["body"]["elements"].as_array_mut() {
-        elements.extend(model_elements(Some(model), effort, turn_id));
+        elements.extend(model_elements(Some(model), effort, turn_id, &[]));
     }
     card
 }
 
-fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&str>) -> Vec<Value> {
+fn model_elements(
+    model: Option<&str>,
+    effort: Option<&str>,
+    turn_id: Option<&str>,
+    models: &[ModelOption],
+) -> Vec<Value> {
     let Some(model) = model else {
         return Vec::new();
     };
@@ -941,17 +952,10 @@ fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&st
         inline(effort.unwrap_or("未记录")),
     ))];
     if let Some(turn_id) = turn_id {
+        elements.push(model_select(models, model, turn_id));
         let mut controls = vec![
             markdown(
                 "仅修改当前会话，下一轮或重试生效。立即重做可先切换，再停止、重试。".to_owned(),
-            ),
-            button(
-                "选择模型（实时查询）",
-                "primary",
-                "models_query",
-                &Action::Models,
-                turn_id,
-                None,
             ),
         ];
         let columns: Vec<Value> = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
@@ -969,7 +973,7 @@ fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&st
             turn_id,
             None,
         ));
-        elements.push(panel("切换模型 / 推理强度", false, controls));
+        elements.push(panel("推理强度 / 恢复默认", false, controls));
     }
     elements
 }
@@ -977,55 +981,59 @@ fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&st
 /// 独立选择卡，不修改正在由轮次任务刷新的进度或答案卡。
 pub fn model_choices(models: &[ModelOption], model: &str, effort: &str, turn_id: &str) -> Value {
     let mut elements = vec![markdown(format!(
-        "当前会话：{} · {}\n点击模型保存，下一轮或重试生效。",
+        "当前会话：{} · {}\n选择后保存，下一轮或重试生效。",
         inline(model),
         inline(effort),
     ))];
-    for (index, choice) in models.iter().take(5).enumerate() {
-        elements.push(button(
-            &choice.name,
-            "primary",
-            &format!("model_{index}"),
-            &Action::Model {
-                model: choice.id.clone(),
-            },
-            turn_id,
-            None,
-        ));
-    }
-    elements.push(button(
-        "重新查询",
-        "default",
-        "models_refresh",
-        &Action::Models,
-        turn_id,
-        None,
-    ));
+    elements.push(model_select(models, model, turn_id));
     card(
         "选择 Codex 模型",
-        "刚查询的模型目录 · 最多 5 个",
+        "每日更新的模型目录",
         "blue",
         elements,
     )
 }
 
-pub fn model_choices_failed(turn_id: &str) -> Value {
-    card(
-        "模型列表查询失败",
-        "稍后重新查询",
-        "orange",
-        vec![
-            markdown("未取得可选模型，请稍后重新查询。".to_owned()),
-            button(
-                "重新查询",
-                "primary",
-                "models_refresh",
-                &Action::Models,
-                turn_id,
-                None,
-            ),
-        ],
-    )
+fn model_select(models: &[ModelOption], model: &str, turn_id: &str) -> Value {
+    let mut select = json!({
+        "tag": "select_static", "element_id": "model_select",
+        "width": "fill", "disabled": models.is_empty(),
+        "placeholder": { "tag": "plain_text", "content": if models.is_empty() { "模型列表暂不可用" } else { "选择下一轮模型（每日更新）" } },
+        "options": models.iter().take(5).map(|choice| json!({
+            "text": { "tag": "plain_text", "content": plain(&choice.name, 40) }, "value": choice.id,
+        })).collect::<Vec<_>>(),
+        "behaviors": [{ "type": "callback", "value": Action::Model { model: String::new() }.value(turn_id) }],
+    });
+    select_model(&mut select, model);
+    select
+}
+
+fn select_model(select: &mut Value, model: &str) {
+    if select["options"]
+        .as_array()
+        .is_some_and(|options| options.iter().any(|option| option["value"] == model))
+    {
+        select["initial_option"] = json!(model);
+    } else if let Some(object) = select.as_object_mut() {
+        object.remove("initial_option");
+    }
+}
+
+/// 重画卡片时使用每日缓存和当前会话设置，避免撤回用户刚选中的模型。
+pub fn refresh_model_select(card: &mut Value, models: &[ModelOption], model: &str) {
+    let Some(elements) = card["body"]["elements"].as_array_mut() else {
+        return;
+    };
+    for element in elements
+        .iter_mut()
+        .filter(|element| element["element_id"] == "model_select")
+    {
+        let turn = element["behaviors"][0]["value"]["turn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        *element = model_select(models, model, &turn);
+    }
 }
 
 /// 失败、超时、中断。`retry` 是这一轮的 ID，给了就带「重试」按钮。
@@ -1467,10 +1475,19 @@ mod tests {
         let elements = card["body"]["elements"].as_array().expect("elements");
         assert_eq!(
             elements.last().map(|e| &e["tag"]),
-            Some(&json!("input")),
-            "最底下是输入框"
+            Some(&json!("form")),
+            "最底下是追问表单"
         );
-        let input = elements.last().expect("补充输入框");
+        let form = elements.last().expect("追问表单");
+        let input = &form["elements"][0];
+        assert_eq!(form["elements"][1]["form_action_type"], "submit");
+        assert_eq!(form["elements"][1]["name"], "follow_up_submit");
+        assert!(
+            !input["placeholder"]["content"]
+                .as_str()
+                .expect("提示")
+                .contains("Enter 发送")
+        );
         assert_eq!(input["input_type"], "multiline_text");
         assert_eq!(input["auto_resize"], true);
         assert_eq!(input["max_rows"], 8);
@@ -1819,7 +1836,8 @@ mod tests {
         let encoded = card.to_string();
         assert!(encoded.len() <= MAX_CARD_BYTES, "{}", encoded.len());
         assert!(encoded.contains("本轮模型：complex-model · 推理强度：xhigh"));
-        assert!(encoded.contains("models_query"));
+        assert!(encoded.contains("model_select"));
+        assert!(!encoded.contains("models_query"));
         assert!(!encoded.contains("model_input"));
         assert!(encoded.contains("effort_high"));
         assert!(encoded.contains("effort_xhigh"));

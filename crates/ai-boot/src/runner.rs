@@ -25,6 +25,7 @@ use crate::alert::Alerts;
 use crate::answer::{self, Reply as AnswerReply};
 use crate::context;
 use crate::knowledge;
+use crate::model_cache::ModelCache;
 use crate::oauth::{Access, Oauth};
 use crate::prompt::{self, Prior};
 use crate::render::card::{self, Footer};
@@ -95,6 +96,7 @@ pub struct Runner {
     backends: HashMap<String, Arc<dyn AgentBackend>>,
     settings: Settings,
     known_issues: knowledge::Index,
+    models: Arc<ModelCache>,
     slots: Arc<Semaphore>,
     bot_open_id: Arc<OnceLock<String>>,
     /// 以提问人的身份读云文档；没配就不读。
@@ -204,6 +206,7 @@ struct Screen<'a> {
     model: Option<&'a str>,
     effort: Option<Effort>,
     codex: bool,
+    models: &'a ModelCache,
 }
 
 /// 分析过程中进度卡上会变的部分。
@@ -215,6 +218,7 @@ struct Live<'a> {
 
 impl Screen<'_> {
     fn progress(&self, live: &Live<'_>, stoppable: bool) -> Value {
+        let models = self.models.choices();
         card::progress(&card::Progress {
             question: self.preview,
             read: self.read,
@@ -225,6 +229,7 @@ impl Screen<'_> {
             model: self.codex.then(|| self.model.unwrap_or("CLI 默认")),
             effort: self.effort.map(|e| e.as_str()),
             configure: self.codex.then_some(self.spec.turn_id.as_str()),
+            models: &models,
         })
     }
 }
@@ -249,23 +254,14 @@ impl Runner {
             Ok(Some(conversation)) if conversation.backend == "codex" => conversation,
             _ => return,
         };
-        let Some(backend) = self.backends.get(&conversation.backend) else {
-            return;
-        };
-        let view = match backend.models().await {
-            Ok(models) => card::model_choices(
-                &models,
-                self.model(&conversation).unwrap_or("CLI 默认"),
-                self.effort(&conversation)
-                    .map(|e| e.as_str())
-                    .unwrap_or("后端默认"),
-                &turn.id,
-            ),
-            Err(err) => {
-                tracing::warn!(%err, "实时查询模型目录失败");
-                card::model_choices_failed(&turn.id)
-            }
-        };
+        let view = card::model_choices(
+            &self.models.choices(),
+            self.model(&conversation).unwrap_or("CLI 默认"),
+            self.effort(&conversation)
+                .map(|e| e.as_str())
+                .unwrap_or("后端默认"),
+            &turn.id,
+        );
         if let Err(err) = self
             .api
             .reply(Reply {
@@ -289,10 +285,15 @@ impl Runner {
         max_concurrent: usize,
         bot_open_id: Arc<OnceLock<String>>,
     ) -> Self {
+        let models = Arc::new(ModelCache::new(settings.data_dir.join("codex-models.json")));
+        if let Some(backend) = backends.get("codex") {
+            models.start(Arc::clone(backend));
+        }
         Self {
             api,
             store,
             backends,
+            models,
             known_issues: knowledge::Index::new(&settings.data_dir),
             settings,
             slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
@@ -309,6 +310,7 @@ impl Runner {
     }
 
     pub fn with_writer(mut self, writer: Arc<Writer>) -> Self {
+        writer.set_models(Arc::clone(&self.models), self.settings.model.clone());
         self.writer = Some(writer);
         self
     }
@@ -415,6 +417,7 @@ impl Runner {
                 .then(|| self.model(&conversation).unwrap_or("CLI 默认")),
             effort: self.effort(&conversation).map(|e| e.as_str()),
             configure: (conversation.backend == "codex").then_some(spec.turn_id.as_str()),
+            models: &self.models.choices(),
             ..card::Progress::default()
         });
         let Some(card_id) = self.open_card(&spec, &reply_to, &opening).await else {
@@ -452,6 +455,7 @@ impl Runner {
                         .then(|| self.model(&conversation).unwrap_or("CLI 默认")),
                     effort: self.effort(&conversation).map(|e| e.as_str()),
                     configure: (conversation.backend == "codex").then_some(spec.turn_id.as_str()),
+                    models: &self.models.choices(),
                     ..card::Progress::default()
                 });
                 self.update(&card_id, &waiting).await;
@@ -779,6 +783,7 @@ impl Runner {
             model: self.model(conversation),
             effort: self.effort(conversation),
             codex: conversation.backend == "codex",
+            models: &self.models,
         };
         let gathering = Instant::now();
         let context = self
@@ -1006,6 +1011,7 @@ impl Runner {
             model: self.model(conversation),
             effort: self.effort(conversation),
             codex: conversation.backend == "codex",
+            models: &self.models,
         };
         let (session, materials, mut resumed) = match &conversation.agent_session_id {
             Some(session_id) => (
@@ -1125,7 +1131,12 @@ impl Runner {
                     i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
                 ),
             };
-            if let Some(card) = writeback::closure_card(&record, &[], &self.settings.link_hosts) {
+            if let Some(card) = writeback::closure_card(
+                &record,
+                &[],
+                &self.settings.link_hosts,
+                &self.models.choices(),
+            ) {
                 report.card = card;
             }
         }
@@ -1368,7 +1379,7 @@ impl Runner {
             rules.push_str(knowledge::RULES);
         } else {
             rules.push_str(
-                "\n本轮已知问题索引不可用，请直接查询原始资料，不使用或更新以前轮次的索引副本。",
+                "\n本轮索引不可用。",
             );
         }
         let request = TurnRequest {
@@ -1656,6 +1667,7 @@ impl Runner {
             }),
             effort: self.effort(conversation).map(|e| e.as_str().to_owned()),
             configure: (conversation.backend == "codex").then(|| spec.turn_id.clone()),
+            models: self.models.choices(),
             ..Footer::default()
         };
         let retry = Some(spec.turn_id.as_str());
@@ -2057,16 +2069,36 @@ impl Runner {
         parse_event(&payload)
     }
 
+    async fn model_controls(&self, card_id: &str, card: &Value) -> Value {
+        let mut card = card.clone();
+        let selectable = card["body"]["elements"].as_array().is_some_and(|elements| {
+            elements
+                .iter()
+                .any(|element| element["element_id"] == "model_select")
+        });
+        if selectable && let Ok(Some(conversation)) = self.store.conversation_by_card(card_id).await
+        {
+            card::refresh_model_select(
+                &mut card,
+                &self.models.choices(),
+                self.model(&conversation).unwrap_or_default(),
+            );
+        }
+        card
+    }
+
     async fn update(&self, card_id: &str, card: &Value) {
-        if let Err(err) = self.api.update_card(card_id, card).await {
+        let card = self.model_controls(card_id, card).await;
+        if let Err(err) = self.api.update_card(card_id, &card).await {
             tracing::warn!(%err, card_id, "更新卡片失败");
         }
     }
 
     /// 最终结果必须送到：失败了隔几秒再试几次。返回是否送到。
     async fn update_final(&self, card_id: &str, card: &Value) -> bool {
+        let card = self.model_controls(card_id, card).await;
         for attempt in 1..=3 {
-            match self.api.update_card(card_id, card).await {
+            match self.api.update_card(card_id, &card).await {
                 Ok(()) => return true,
                 Err(err) => {
                     tracing::warn!(%err, attempt, card_id, "更新最终卡片失败");

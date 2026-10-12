@@ -12,6 +12,7 @@ mod ingest;
 mod knowledge;
 mod lock;
 mod maintenance;
+mod model_cache;
 mod oauth;
 mod prompt;
 mod render;

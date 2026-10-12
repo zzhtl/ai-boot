@@ -171,7 +171,7 @@ impl Registry {
                 Ok(Some(_)) if action == Action::Models => {
                     let runner = Arc::clone(&self.runner);
                     tokio::spawn(async move { runner.show_models(&turn_id).await });
-                    let _ = reply.send(Toast::info("正在查询最新可选模型"));
+                    let _ = reply.send(Toast::info("正在加载缓存模型"));
                 }
                 Ok(Some(turn)) => self.send(
                     turn.conversation_id,

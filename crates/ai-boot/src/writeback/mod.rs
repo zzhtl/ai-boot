@@ -12,9 +12,10 @@
 pub mod format;
 pub mod mcp;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
+use ai_boot_agent::ModelOption;
 use ai_boot_feishu::api::ApiClient;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ use serde_json::{Value, json};
 
 use crate::answer::Answer;
 use crate::callback::{Target, Toast};
+use crate::model_cache::ModelCache;
 use crate::render::card::{self, Footer, WritebackState, WritebackView};
 use crate::render::markdown::HostAllowlist;
 use crate::store::{
@@ -69,6 +71,7 @@ pub struct Writer {
     settings: Settings,
     link_hosts: Vec<String>,
     serial: tokio::sync::Mutex<()>,
+    models: OnceLock<(Arc<ModelCache>, Option<String>)>,
 }
 
 enum Failure {
@@ -79,6 +82,10 @@ enum Failure {
 }
 
 impl Writer {
+    pub fn set_models(&self, models: Arc<ModelCache>, default: Option<String>) {
+        self.models.get_or_init(|| (models, default));
+    }
+
     pub fn new(
         api: Arc<ApiClient>,
         store: Store,
@@ -91,6 +98,7 @@ impl Writer {
             settings,
             link_hosts,
             serial: tokio::sync::Mutex::new(()),
+            models: OnceLock::new(),
         }
     }
 
@@ -341,12 +349,34 @@ impl Writer {
             return;
         };
         let rows = self.store.writebacks(turn_id).await.unwrap_or_default();
-        let (Some(card_id), Some(card)) = (
+        let (Some(card_id), Some(mut card)) = (
             record.card_message_id.clone(),
-            closure_card(&record, &rows, &self.link_hosts),
+            closure_card(
+                &record,
+                &rows,
+                &self.link_hosts,
+                &self
+                    .models
+                    .get()
+                    .map(|(cache, _)| cache.choices())
+                    .unwrap_or_default(),
+            ),
         ) else {
             return;
         };
+        if let Some((cache, default)) = self.models.get()
+            && let Ok(Some(conversation)) = self.store.conversation_by_card(&card_id).await
+        {
+            card::refresh_model_select(
+                &mut card,
+                &cache.choices(),
+                conversation
+                    .model_override
+                    .as_deref()
+                    .or(default.as_deref())
+                    .unwrap_or_default(),
+            );
+        }
         for attempt in 1..=3 {
             match self.api.update_card(&card_id, &card).await {
                 Ok(()) => return,
@@ -414,6 +444,7 @@ pub fn closure_card(
     record: &TurnRecord,
     rows: &[Writeback],
     link_hosts: &[String],
+    models: &[ModelOption],
 ) -> Option<Value> {
     let answer: Answer = serde_json::from_str(record.answer_json.as_deref()?).ok()?;
     let targets: Vec<TargetSpec> = record
@@ -456,6 +487,7 @@ pub fn closure_card(
     let footer = Footer {
         turn: u32::try_from(record.seq).unwrap_or(u32::MAX),
         hint: "写回前会弹窗确认",
+        models: models.to_vec(),
         model: record.reasoning_effort.as_ref().map(|_| {
             record
                 .model

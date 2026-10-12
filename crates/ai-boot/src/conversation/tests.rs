@@ -2854,7 +2854,7 @@ async fn codex_retry_and_session_recovery_keep_the_new_options() {
     say(&w, "om_1", "查问题", json!({})).await;
     let turns = until(&w, "首轮失败", all_finished(1)).await;
     let failure = last_card(&w, "om_card_1").await.to_string();
-    assert!(failure.contains("切换模型 / 推理强度"));
+    assert!(failure.contains("model_select"));
     press(
         &w,
         Action::Model {
@@ -2924,7 +2924,7 @@ async fn invalid_model_names_and_non_codex_switches_do_not_change_settings() {
     let toast = press(&claude, Action::Effort(Effort::Xhigh), &turns[0].id).await;
     assert!(toast.text.contains("只有 Codex"));
     let card = last_card(&claude, "om_card_1").await.to_string();
-    assert!(!card.contains("切换模型 / 推理强度"));
+    assert!(!card.contains("model_select"));
 }
 
 #[tokio::test]
@@ -2961,7 +2961,7 @@ async fn codex_stop_and_restart_cards_keep_the_executed_options() {
         .await;
     let restarted = last_card(&w, "om_card_1").await.to_string();
     assert!(restarted.contains("本轮模型：opus · 推理强度：high"));
-    assert!(restarted.contains("切换模型 / 推理强度"));
+    assert!(restarted.contains("model_select"));
     press_retry(&w, &turns[0].id).await;
     let requests = requests_until(&w, 2).await;
     until(&w, "重做完成", |t| t[0].status == TurnStatus::Succeeded).await;
@@ -2991,7 +2991,7 @@ async fn codex_closure_cards_retain_their_model_when_redrawn() {
     let turns = until(&w, "闭环完成", all_finished(2)).await;
     let card = last_card(&w, "om_card_2").await.to_string();
     assert!(card.contains("本轮模型：complex-model · 推理强度：xhigh"));
-    assert!(card.contains("切换模型 / 推理强度"));
+    assert!(card.contains("model_select"));
     press(&w, Action::Effort(Effort::High), &turns[1].id).await;
     let record = w
         .store
@@ -2999,139 +2999,98 @@ async fn codex_closure_cards_retain_their_model_when_redrawn() {
         .await
         .expect("查询")
         .expect("闭环轮次");
-    let redrawn = crate::writeback::closure_card(&record, &[], &[])
+    let redrawn = crate::writeback::closure_card(&record, &[], &[], &[])
         .expect("闭环卡片")
         .to_string();
     assert!(redrawn.contains("本轮模型：complex-model · 推理强度：xhigh"));
     assert_eq!(w.backend.requests()[1].effort, Some(Effort::Xhigh));
 }
 
-async fn model_picker(w: &World, title: &str) -> Value {
-    for _ in 0..100 {
-        let cards: Vec<Value> = replies(w)
-            .await
-            .into_iter()
-            .filter_map(|reply| serde_json::from_str(reply["content"].as_str()?).ok())
-            .collect();
-        if let Some(card) = cards
-            .into_iter()
-            .rev()
-            .find(|card| card["header"]["title"]["content"] == title)
-        {
-            return card;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("未收到 {title}");
-}
-
 #[tokio::test]
-async fn model_picker_queries_each_time_and_buttons_select_without_input() {
+async fn model_dropdown_uses_the_daily_cache_and_switches_without_an_extra_card() {
     let w = codex_world(vec![
         vec![started("s-1"), answered("第一轮")],
-        vec![started("s-1"), answered("新模型答复")],
+        vec![started("s-1"), answered("新模型")],
     ])
     .await;
     say(&w, "om_1", "查问题", json!({})).await;
-    let turns = until(&w, "第一轮完成", all_finished(1)).await;
-    assert!(
-        press(&w, Action::Models, &turns[0].id)
-            .await
-            .text
-            .contains("正在查询")
-    );
-    let picker = model_picker(&w, "选择 Codex 模型").await;
-    let choices: Vec<_> = picker["body"]["elements"]
+    let turns = until(&w, "完成", all_finished(1)).await;
+    let card = last_card(&w, "om_card_1").await;
+    let select = card["body"]["elements"]
         .as_array()
         .expect("元素")
         .iter()
-        .filter_map(|element| Action::parse(&element["behaviors"][0]["value"], ""))
-        .filter(|(action, _)| matches!(action, Action::Model { .. }))
-        .collect();
-    assert_eq!(choices.len(), 5);
-    assert!(!picker.to_string().contains("catalog-6"));
-    assert!(
-        press(&w, choices[0].0.clone(), &choices[0].1)
-            .await
-            .text
-            .contains("catalog-1")
-    );
+        .find(|element| element["element_id"] == "model_select")
+        .expect("直接可见的模型下拉框");
+    assert_eq!(select["tag"], "select_static");
+    assert_eq!(select["options"].as_array().expect("选择").len(), 5);
+    assert!(!card.to_string().contains("models_query"));
+    let (action, turn_id) = Action::parse(
+        &select["behaviors"][0]["value"],
+        select["options"][1]["value"].as_str().expect("模型"),
+    )
+    .expect("下拉回调");
+    let reply_count = replies(&w).await.len();
+    press(&w, action, &turn_id).await;
+    assert_eq!(replies(&w).await.len(), reply_count, "切换不弹出另一张卡片");
     say(&w, "om_2", "继续", json!({})).await;
-    until(&w, "新模型答复", all_finished(2)).await;
-    assert_eq!(w.backend.requests()[1].model.as_deref(), Some("catalog-1"));
-    *w.backend.models.lock().expect("锁") = Ok(vec![ModelOption {
-        id: "latest-model".into(),
-        name: "最新模型".into(),
-    }]);
-    press(&w, Action::Models, &turns[0].id).await;
-    let updated = card_picker_until(&w, "latest-model").await;
-    assert!(updated.to_string().contains("latest-model"));
-    assert!(!updated.to_string().contains("catalog-2"));
-    assert_eq!(w.backend.model_queries.load(Ordering::SeqCst), 2);
-    assert_eq!(w.backend.requests().len(), 2, "目录查询不调用分析");
-}
-
-async fn card_picker_until(w: &World, model: &str) -> Value {
-    for _ in 0..100 {
-        let card = model_picker(w, "选择 Codex 模型").await;
-        if card.to_string().contains(model) {
-            return card;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("模型选择没有刷新");
+    until(&w, "第二轮完成", all_finished(2)).await;
+    assert_eq!(w.backend.requests()[1].model.as_deref(), Some("catalog-2"));
+    let new_card = last_card(&w, "om_card_2").await;
+    assert!(
+        new_card
+            .to_string()
+            .contains("\"initial_option\":\"catalog-2\"")
+    );
+    assert_eq!(
+        w.backend.model_queries.load(Ordering::SeqCst),
+        1,
+        "打开和选择模型不会再次查询"
+    );
+    assert_eq!(turns.len(), 1);
 }
 
 #[tokio::test]
-async fn failed_model_queries_offer_a_refresh_without_changing_the_conversation() {
-    let w = codex_world(vec![vec![started("s-1"), answered("完成")]]).await;
-    say(&w, "om_1", "查问题", json!({})).await;
-    let turns = until(&w, "完成", all_finished(1)).await;
-    *w.backend.models.lock().expect("锁") = Err("查询不可用".into());
-    press(&w, Action::Models, &turns[0].id).await;
-    let failed = model_picker(&w, "模型列表查询失败").await;
-    assert_eq!(button(&failed), Some((Action::Models, turns[0].id.clone())));
-    assert!(!failed.to_string().contains("retry_btn"));
-    let saved = w
-        .store
-        .conversation(&turns[0].conversation_id)
-        .await
-        .expect("查询")
-        .expect("会话");
-    assert!(saved.model_override.is_none());
-    assert_eq!(w.backend.requests().len(), 1);
-}
-
-#[tokio::test]
-async fn a_slow_model_query_does_not_block_stopping_the_running_turn() {
-    let w = codex_world(vec![vec![started("s-1"), Beat::UntilCancelled]]).await;
+async fn model_dropdown_keeps_the_saved_selection_when_a_running_card_is_redrawn() {
     let gate = Arc::new(tokio::sync::Notify::new());
-    *w.backend.models_gate.lock().expect("锁") = Some(Arc::clone(&gate));
+    let w = codex_world(vec![vec![
+        started("s-1"),
+        Beat::Gate(Arc::clone(&gate)),
+        Beat::Event(AgentEvent::Step(Step::Text("新的分析进展".into()))),
+        Beat::UntilCancelled,
+    ]])
+    .await;
     say(&w, "om_1", "查问题", json!({})).await;
     requests_until(&w, 1).await;
-    let turns = until(&w, "执行中", |t| {
-        t.len() == 1 && t[0].status == TurnStatus::Running
+    let turns = until(&w, "执行中", |turns| {
+        turns.len() == 1 && turns[0].status == TurnStatus::Running
     })
     .await;
-    assert!(
-        press(&w, Action::Models, &turns[0].id)
-            .await
-            .text
-            .contains("正在查询")
-    );
-    assert!(
-        press(&w, Action::Stop, &turns[0].id)
-            .await
-            .text
-            .contains("正在停止")
-    );
-    until(&w, "已经停止", |t| {
-        t[0].status == TurnStatus::Interrupted
-    })
+    press(
+        &w,
+        Action::Model {
+            model: "catalog-2".into(),
+        },
+        &turns[0].id,
+    )
     .await;
     gate.notify_one();
-    model_picker(&w, "选择 Codex 模型").await;
-    let stopped = last_card(&w, "om_card_1").await.to_string();
-    assert!(stopped.contains("已停止"));
-    assert!(stopped.contains("本轮模型：opus"));
+    press(&w, Action::Stop, &turns[0].id).await;
+    until(&w, "停止", |turns| {
+        turns[0].status == TurnStatus::Interrupted
+    })
+    .await;
+    let card = last_card(&w, "om_card_1").await;
+    let select = card["body"]["elements"]
+        .as_array()
+        .expect("元素")
+        .iter()
+        .find(|element| element["element_id"] == "model_select")
+        .expect("下拉框");
+    assert_eq!(select["initial_option"], "catalog-2");
+    assert!(
+        card.to_string().contains("本轮模型：opus"),
+        "本轮执行模型仍保留原值"
+    );
+    assert_eq!(w.backend.model_queries.load(Ordering::SeqCst), 1);
 }
