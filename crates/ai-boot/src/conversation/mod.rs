@@ -168,6 +168,11 @@ impl Registry {
                 operator,
                 reply,
             } => match self.store.turn(&turn_id).await {
+                Ok(Some(_)) if action == Action::Models => {
+                    let runner = Arc::clone(&self.runner);
+                    tokio::spawn(async move { runner.show_models(&turn_id).await });
+                    let _ = reply.send(Toast::info("正在查询最新可选模型"));
+                }
                 Ok(Some(turn)) => self.send(
                     turn.conversation_id,
                     Msg::Action {

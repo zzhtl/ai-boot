@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use ai_boot_agent::Effort;
+use ai_boot_agent::{Effort, ModelOption};
 use serde_json::{Value, json};
 
 use super::markdown::{LinkPolicy, escape, render};
@@ -945,12 +945,14 @@ fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&st
             markdown(
                 "仅修改当前会话，下一轮或重试生效。立即重做可先切换，再停止、重试。".to_owned(),
             ),
-            json!({
-                "tag": "input", "element_id": "model_input", "name": "model",
-                "placeholder": { "tag": "plain_text", "content": "输入模型名称，Enter 保存" },
-                "input_type": "text", "width": "fill", "max_length": 128,
-                "behaviors": [{ "type": "callback", "value": Action::Model { model: String::new() }.value(turn_id) }],
-            }),
+            button(
+                "选择模型（实时查询）",
+                "primary",
+                "models_query",
+                &Action::Models,
+                turn_id,
+                None,
+            ),
         ];
         let columns: Vec<Value> = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
             .into_iter().map(|level| json!({
@@ -970,6 +972,60 @@ fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&st
         elements.push(panel("切换模型 / 推理强度", false, controls));
     }
     elements
+}
+
+/// 独立选择卡，不修改正在由轮次任务刷新的进度或答案卡。
+pub fn model_choices(models: &[ModelOption], model: &str, effort: &str, turn_id: &str) -> Value {
+    let mut elements = vec![markdown(format!(
+        "当前会话：{} · {}\n点击模型保存，下一轮或重试生效。",
+        inline(model),
+        inline(effort),
+    ))];
+    for (index, choice) in models.iter().take(5).enumerate() {
+        elements.push(button(
+            &choice.name,
+            "primary",
+            &format!("model_{index}"),
+            &Action::Model {
+                model: choice.id.clone(),
+            },
+            turn_id,
+            None,
+        ));
+    }
+    elements.push(button(
+        "重新查询",
+        "default",
+        "models_refresh",
+        &Action::Models,
+        turn_id,
+        None,
+    ));
+    card(
+        "选择 Codex 模型",
+        "刚查询的模型目录 · 最多 5 个",
+        "blue",
+        elements,
+    )
+}
+
+pub fn model_choices_failed(turn_id: &str) -> Value {
+    card(
+        "模型列表查询失败",
+        "稍后重新查询",
+        "orange",
+        vec![
+            markdown("未取得可选模型，请稍后重新查询。".to_owned()),
+            button(
+                "重新查询",
+                "primary",
+                "models_refresh",
+                &Action::Models,
+                turn_id,
+                None,
+            ),
+        ],
+    )
 }
 
 /// 失败、超时、中断。`retry` 是这一轮的 ID，给了就带「重试」按钮。
@@ -1763,7 +1819,8 @@ mod tests {
         let encoded = card.to_string();
         assert!(encoded.len() <= MAX_CARD_BYTES, "{}", encoded.len());
         assert!(encoded.contains("本轮模型：complex-model · 推理强度：xhigh"));
-        assert!(encoded.contains("model_input"));
+        assert!(encoded.contains("models_query"));
+        assert!(!encoded.contains("model_input"));
         assert!(encoded.contains("effort_high"));
         assert!(encoded.contains("effort_xhigh"));
         assert!(encoded.contains("reset_model"));

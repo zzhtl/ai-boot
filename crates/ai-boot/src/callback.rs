@@ -52,6 +52,8 @@ pub enum Action {
     Model {
         model: String,
     },
+    /// 实时查询模型目录，显示最多五个选择。
+    Models,
     Effort(Effort),
     ResetModel,
 }
@@ -64,7 +66,8 @@ impl Action {
             Self::Retry => json!({ "action": "retry", "turn": turn_id }),
             Self::Resolve => json!({ "action": "resolve", "turn": turn_id }),
             Self::FollowUp => json!({ "action": "follow_up", "turn": turn_id }),
-            Self::Model { .. } => json!({ "action": "model", "turn": turn_id }),
+            Self::Model { model } => json!({ "action": "model", "turn": turn_id, "model": model }),
+            Self::Models => json!({ "action": "models", "turn": turn_id }),
             Self::Effort(effort) => json!({
                 "action": "effort", "turn": turn_id, "effort": effort.as_str(),
             }),
@@ -97,8 +100,9 @@ impl Action {
             "resolve" => Self::Resolve,
             "follow_up" => Self::FollowUp,
             "model" => Self::Model {
-                model: input_value.trim().to_owned(),
+                model: field("model").unwrap_or(input_value).trim().to_owned(),
             },
+            "models" => Self::Models,
             "effort" => Self::Effort(Effort::parse(field("effort")?)?),
             "reset_model" => Self::ResetModel,
             "writeback" => Self::Writeback {
@@ -169,6 +173,10 @@ mod tests {
             Action::Retry,
             Action::Resolve,
             Action::FollowUp,
+            Action::Models,
+            Action::Model {
+                model: "current-model".into(),
+            },
             Action::Effort(Effort::High),
             Action::Effort(Effort::Xhigh),
             Action::ResetModel,

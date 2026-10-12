@@ -2,6 +2,7 @@
 //! 复用本机 CODEX_HOME、配置、skills、插件和规则；提问和回复约束只走 stdin。
 
 pub mod decode;
+mod models;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use std::time::Duration;
 
 use crate::process::{self, ProcessSpec};
 use crate::{
-    AgentBackend, AgentError, BackendInfo, BackendKind, Effort, SessionRef, TurnHandle, TurnRequest,
+    AgentBackend, AgentError, BackendInfo, BackendKind, Effort, ModelOption, SessionRef,
+    TurnHandle, TurnRequest,
 };
 
 pub const RECORDED_VERSION: &str = "0.161.0";
@@ -162,6 +164,10 @@ impl CodexBackend {
 impl AgentBackend for CodexBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Codex
+    }
+
+    async fn models(&self) -> Result<Vec<ModelOption>, AgentError> {
+        self.query_models().await
     }
 
     async fn start_turn(&self, mut request: TurnRequest) -> Result<TurnHandle, AgentError> {

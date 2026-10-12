@@ -236,6 +236,51 @@ enum Transcript {
 }
 
 impl Runner {
+    /// 模型查询不占用会话 actor，不触发分析，也不重画原来的卡片。
+    pub async fn show_models(&self, turn_id: &str) {
+        let turn = match self.store.turn(turn_id).await {
+            Ok(Some(turn)) => turn,
+            _ => return,
+        };
+        let Some(card_id) = turn.card_message_id.as_deref() else {
+            return;
+        };
+        let conversation = match self.store.conversation(&turn.conversation_id).await {
+            Ok(Some(conversation)) if conversation.backend == "codex" => conversation,
+            _ => return,
+        };
+        let Some(backend) = self.backends.get(&conversation.backend) else {
+            return;
+        };
+        let view = match backend.models().await {
+            Ok(models) => card::model_choices(
+                &models,
+                self.model(&conversation).unwrap_or("CLI 默认"),
+                self.effort(&conversation)
+                    .map(|e| e.as_str())
+                    .unwrap_or("后端默认"),
+                &turn.id,
+            ),
+            Err(err) => {
+                tracing::warn!(%err, "实时查询模型目录失败");
+                card::model_choices_failed(&turn.id)
+            }
+        };
+        if let Err(err) = self
+            .api
+            .reply(Reply {
+                message_id: card_id,
+                msg_type: "interactive",
+                content: view.to_string(),
+                reply_in_thread: false,
+                uuid: Uuid::now_v7().to_string(),
+            })
+            .await
+        {
+            tracing::warn!(%err, "发送模型选择卡失败");
+        }
+    }
+
     pub fn new(
         api: Arc<ApiClient>,
         store: Store,

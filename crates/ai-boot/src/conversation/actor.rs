@@ -169,6 +169,8 @@ impl Actor {
                     Action::Model { .. } | Action::Effort(_) | Action::ResetModel => {
                         self.configure_model(action).await
                     }
+                    // registry 已经将目录查询放到独立任务，不占用 actor。
+                    Action::Models => Toast::info("正在查询模型列表"),
                     Action::Writeback {
                         target,
                         reference,

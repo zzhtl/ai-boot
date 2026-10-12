@@ -129,6 +129,13 @@ pub struct BackendInfo {
     pub recorded_version: Option<&'static str>,
 }
 
+/// 当前后端模型目录中允许展示的选择。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AgentError {
@@ -160,6 +167,11 @@ pub enum AgentError {
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
     fn kind(&self) -> BackendKind;
+
+    /// 每次请求都查询当前目录，不在 ai-boot 内缓存模型名称。
+    async fn models(&self) -> Result<Vec<ModelOption>, AgentError> {
+        Err(AgentError::Preflight("此后端不支持查询模型列表".into()))
+    }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnHandle, AgentError>;
 
