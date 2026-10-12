@@ -6,6 +6,7 @@
 //! （[`policy`]）和同一份输出契约。
 
 pub mod claude;
+pub mod codex;
 pub mod event;
 pub mod policy;
 mod process;
@@ -51,6 +52,17 @@ pub enum Effort {
 }
 
 impl Effort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",

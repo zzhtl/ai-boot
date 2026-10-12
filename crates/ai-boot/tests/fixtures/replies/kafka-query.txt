@@ -1,0 +1,13 @@
+查下 3.x K3s 部署 Kafka 消息队列堆积的命令。
+
+以下是只供评测使用的已查证资料，不是生产代码中的回复模板：
+- 本现场 namespace 为 qtsa，Kafka 为 StatefulSet，Pod 名固定为 kafka-0、kafka-1、kafka-2；kafka-0 正常且只有一个容器。
+- 在 Kafka Pod 内执行工具，通过 kafka-svc:9092 连接集群。
+- 工具路径为 /usr/local/qingteng/kafka/bin/kafka-consumer-groups.sh，认证配置为 /usr/local/qingteng/kafka/config/consumer.properties。
+- 查询所有消费者组使用 --describe --all-groups；查询一个消费者组将 --all-groups 换成 --group，二者互斥。
+- 本版本 --describe 不支持通过 --topic 筛选 Topic，需要筛选输出；--topic 在其他操作中有不同含义。
+- 输出列依次是 GROUP、TOPIC、PARTITION、CURRENT-OFFSET、LOG-END-OFFSET、LAG 等，TOPIC 是第二列。
+- GROUP 与 TOPIC 的实际名称可以从主查询结果读取；队列对应 Topic，消费者组对应 GROUP。
+- 同一消费者组、同一 Topic 的各分区 LAG 相加是该组该 Topic 的总滞后；不要跨消费者组混算。
+
+目标是在能运行 kubectl 的 K3s 管理节点执行一条主查询命令。

@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ai_boot_agent::{
-    AgentBackend, AgentError, AgentEvent, BackendInfo, BackendKind, FailKind, McpServer, McpStatus,
-    Outcome, SessionRef, Started, Step, TurnHandle, TurnRequest, Usage,
+    AgentBackend, AgentError, AgentEvent, BackendInfo, BackendKind, Effort, FailKind, McpServer,
+    McpStatus, Outcome, SessionRef, Started, Step, TurnHandle, TurnRequest, Usage,
 };
 use ai_boot_feishu::api::ApiClient;
 use secrecy::SecretString;
@@ -31,6 +31,8 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 #[derive(Clone)]
 enum Beat {
     Event(AgentEvent),
+    /// 模拟模型用 Bash 修订本轮索引副本。
+    Index(String),
     /// 等测试放行（或被取消）：让「前一轮还在跑」这类状态可控。
     Gate(Arc<tokio::sync::Notify>),
     /// 一直等到被取消（停止按钮），然后以中断结束。
@@ -39,6 +41,7 @@ enum Beat {
 
 /// 每次 `start_turn` 取下一段剧本；记下收到的请求。
 struct FakeBackend {
+    kind: BackendKind,
     scripts: Mutex<VecDeque<Vec<Beat>>>,
     requests: Mutex<Vec<TurnRequest>>,
 }
@@ -52,10 +55,13 @@ impl FakeBackend {
 #[async_trait::async_trait]
 impl AgentBackend for FakeBackend {
     fn kind(&self) -> BackendKind {
-        BackendKind::Claude
+        self.kind
     }
 
     async fn start_turn(&self, request: TurnRequest) -> Result<TurnHandle, AgentError> {
+        let workdir = request.workdir.clone();
+        let codex_model =
+            (self.kind == BackendKind::Codex).then(|| request.model.clone().unwrap_or_default());
         self.requests.lock().expect("锁").push(request);
         let script = self
             .scripts
@@ -69,7 +75,16 @@ impl AgentBackend for FakeBackend {
         tokio::spawn(async move {
             for beat in script {
                 match beat {
-                    Beat::Event(event) => {
+                    Beat::Index(text) => {
+                        std::fs::write(workdir.join("context/known-issues.md"), text)
+                            .expect("修订索引副本");
+                    }
+                    Beat::Event(mut event) => {
+                        if let AgentEvent::Started(started) = &mut event
+                            && let Some(model) = &codex_model
+                        {
+                            started.model = model.clone();
+                        }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         if watch.is_cancelled() {
                             let _ = tx.send(AgentEvent::Finished(Outcome::Interrupted)).await;
@@ -103,11 +118,23 @@ impl AgentBackend for FakeBackend {
 
     async fn preflight(&self) -> Result<BackendInfo, AgentError> {
         Ok(BackendInfo {
-            kind: BackendKind::Claude,
+            kind: self.kind,
             version: "test".into(),
             recorded_version: None,
         })
     }
+}
+
+/// 请求正文保持短小，相关上下文通过工作目录中的资料文件交给模型。
+fn materials(request: &TurnRequest) -> String {
+    let reference = request
+        .prompt
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("相关资料："))
+        .expect("资料指引");
+    let path = reference.split('（').next().expect("资料路径").trim();
+    std::fs::read_to_string(request.workdir.join(path)).expect("模型可读取的资料文件")
 }
 
 fn started(session: &str) -> Beat {
@@ -232,6 +259,17 @@ async fn world_full(
     docs: bool,
     writer: Option<Value>,
 ) -> World {
+    world_backend(scripts, debounce, window, docs, writer, "claude").await
+}
+
+async fn world_backend(
+    scripts: Vec<Vec<Beat>>,
+    debounce: Duration,
+    window: Option<(usize, Duration)>,
+    docs: bool,
+    writer: Option<Value>,
+    backend_name: &str,
+) -> World {
     let server = MockServer::start().await;
     let ok = |data: Value| {
         ResponseTemplate::new(200).set_body_json(json!({"code": 0, "msg": "ok", "data": data}))
@@ -278,6 +316,11 @@ async fn world_full(
     let base = url::Url::parse(&format!("{}/", server.uri())).expect("地址");
     let api = Arc::new(ApiClient::new(base, "cli_x", SecretString::from("s")).expect("客户端"));
     let backend = Arc::new(FakeBackend {
+        kind: if backend_name == "codex" {
+            BackendKind::Codex
+        } else {
+            BackendKind::Claude
+        },
         scripts: Mutex::new(scripts.into()),
         requests: Mutex::new(Vec::new()),
     });
@@ -287,7 +330,7 @@ async fn world_full(
         Arc::clone(&api),
         store.clone(),
         HashMap::from([(
-            "claude".to_owned(),
+            backend_name.to_owned(),
             Arc::clone(&backend) as Arc<dyn AgentBackend>,
         )]),
         Settings {
@@ -349,7 +392,7 @@ async fn world_full(
         store.clone(),
         Arc::clone(&runner),
         bot,
-        "claude".into(),
+        backend_name.into(),
         debounce,
     )
     .with_eraser(Arc::new(crate::maintenance::Maintenance {
@@ -591,7 +634,90 @@ fn button(card: &Value) -> Option<(Action, String)> {
         .as_array()?
         .iter()
         .find(|e| e["tag"] == "button")
-        .and_then(|b| Action::parse(&b["behaviors"][0]["value"]))
+        .and_then(|b| Action::parse(&b["behaviors"][0]["value"], ""))
+}
+
+#[tokio::test]
+async fn known_issue_updates_require_a_confirmed_answer_and_a_successful_source_read() {
+    let mut partial = answer_json("证据不足");
+    partial["status"] = json!("partial");
+    let mut uncertain = answer_json("把握不足");
+    uncertain["confidence"] = json!("medium");
+    let mut missing = answer_json("仍需配置");
+    missing["open_questions"] = json!(["请提供生效配置"]);
+    let finish = |structured| {
+        Beat::Event(AgentEvent::Finished(Outcome::Success {
+            structured: Some(structured),
+            text: String::new(),
+            turns: 1,
+        }))
+    };
+    let cases = [
+        ("已核实", Some(true), answered("已核实"), true),
+        ("正文读取失败", Some(false), answered("正文读取失败"), false),
+        ("只有搜索", None, answered("只有搜索"), false),
+        ("证据不足", Some(true), finish(partial), false),
+        ("把握不足", Some(true), finish(uncertain), false),
+        ("仍缺关键资料", Some(true), finish(missing), false),
+        (
+            "超时",
+            Some(true),
+            Beat::Event(AgentEvent::Finished(Outcome::TimedOut)),
+            false,
+        ),
+        (
+            "中断",
+            Some(true),
+            Beat::Event(AgentEvent::Finished(Outcome::Interrupted)),
+            false,
+        ),
+    ];
+    for (name, read_ok, outcome, should_save) in cases {
+        let updated = format!(
+            "{}| 登录 500 / 连接池 | 产品 3.2 | 连接池耗尽 | https://wiki.example.com/pages/viewpage.action?pageId=123 | 已核验 |\n",
+            crate::knowledge::EMPTY
+        );
+        let mut script = vec![started("s-1")];
+        script.push(Beat::Event(AgentEvent::Step(Step::ToolCall {
+            id: "source".into(),
+            tool: if read_ok.is_some() {
+                "mcp__qtmcp__confluence_page"
+            } else {
+                "mcp__qtmcp__confluence_search"
+            }
+            .into(),
+            input: json!({"action": "get", "page_id": "123"}),
+        })));
+        script.push(Beat::Event(AgentEvent::Step(Step::ToolDone {
+            id: "source".into(),
+            ok: read_ok.unwrap_or(true),
+            preview: "正文".into(),
+        })));
+        script.push(Beat::Index(updated.clone()));
+        script.push(outcome);
+        let w = world(vec![script, vec![started("s-1"), answered("后续复用")]]).await;
+        say(&w, "om_q", "登录 500 如何处理", json!({})).await;
+        until(&w, "索引回存完成", all_finished(1)).await;
+        let local =
+            std::fs::read_to_string(w._dir.path().join("known-issues.md")).expect("本地索引");
+        let expected = if should_save {
+            updated.as_str()
+        } else {
+            crate::knowledge::EMPTY
+        };
+        assert_eq!(local, expected, "{name}");
+        if should_save {
+            say(&w, "om_q2", "同类问题再查一次", json!({})).await;
+            until(&w, "后续轮次完成", all_finished(2)).await;
+            let next = w.backend.requests().pop().expect("后续请求");
+            assert!(next.rules.contains(crate::knowledge::RULES));
+            assert_eq!(
+                std::fs::read_to_string(next.workdir.join("context/known-issues.md"))
+                    .expect("索引副本"),
+                updated
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -618,7 +744,8 @@ async fn a_question_ends_as_a_folded_answer_card() {
     assert!(!request.prompt.contains("@_user_1"), "@机器人 要去掉");
     assert!(!request.prompt.contains("提问人"), "提问人不算上下文");
     assert_eq!(request.schema, *crate::answer::schema());
-    assert_eq!(request.rules, crate::prompt::RULES);
+    assert!(request.rules.starts_with(crate::prompt::RULES));
+    assert!(request.rules.contains("context/known-issues.md"));
     assert!(!request.run_dir.exists(), "本轮的 MCP、hook 配置用完即删");
     let transcript = std::fs::read_to_string(request.workdir.join("context/transcript.md"))
         .expect("完整记录落盘");
@@ -703,7 +830,7 @@ async fn a_follow_up_resumes_the_session_and_counts_only_its_own_tokens() {
 
     let requests = w.backend.requests();
     assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
-    assert!(requests[1].prompt.starts_with("# 本轮提问"));
+    assert!(requests[1].prompt.starts_with("那 3.3 有没有这个问题"));
     assert_eq!(
         requests[0].workdir, requests[1].workdir,
         "续接要求同一个工作目录"
@@ -916,14 +1043,14 @@ async fn a_lost_session_is_replaced_by_a_new_one_with_the_earlier_conclusions() 
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
     assert_eq!(requests[2].session, SessionRef::New);
-    assert!(requests[2].prompt.contains("# 前情"));
+    assert!(materials(&requests[2]).contains("# 前情"));
     assert!(
-        requests[2].prompt.contains("连接池耗尽"),
+        materials(&requests[2]).contains("连接池耗尽"),
         "带上前几轮的结论"
     );
     assert!(requests[2].prompt.contains("怎么修"));
     // 之前的上下文不重拉、不重发：告诉新会话去工作目录里查
-    assert!(requests[2].prompt.contains("context/transcript.md"));
+    assert!(materials(&requests[2]).contains("context/transcript.md"));
     let calls = chat_calls(&w.server.received_requests().await.expect("请求记录"));
     assert_eq!(calls.len(), 2, "续接失败不重新拉群聊记录：{calls:?}");
     let transcript =
@@ -979,10 +1106,12 @@ async fn different_people_in_a_group_share_the_session_but_not_a_turn() {
     let requests = w.backend.requests();
     assert!(requests[1].prompt.contains("订单页打不开"));
     assert!(
-        !requests[1].prompt.contains("3.2.1"),
+        !materials(&requests[1]).contains("3.2.1"),
         "别人的补充不进这一轮"
     );
-    assert!(requests[2].prompt.contains("3.2.1") && requests[2].prompt.contains("HikariPool"));
+    assert!(
+        materials(&requests[2]).contains("3.2.1") && materials(&requests[2]).contains("HikariPool")
+    );
     assert!(
         requests[1..]
             .iter()
@@ -1010,7 +1139,8 @@ async fn a_supplement_typed_on_the_card_follows_up_in_the_same_session() {
         supplement(&w, &turns[0].id, "om_card_1", "  ").await.text,
         "内容是空的"
     );
-    let toast = supplement(&w, &turns[0].id, "om_card_1", "连接池监控是正常的").await;
+    let multiline = "连接池监控是正常的\n\n现场日志：\n  java.net.UnknownHostException\n    at example.Login.run(Login.java:42)";
+    let toast = supplement(&w, &turns[0].id, "om_card_1", multiline).await;
     assert_eq!(toast.text, "收到，正在分析");
     let turns = until(&w, "第二轮结束", all_finished(2)).await;
     assert_eq!(turns[1].conversation_id, turns[0].conversation_id);
@@ -1018,11 +1148,14 @@ async fn a_supplement_typed_on_the_card_follows_up_in_the_same_session() {
     let requests = w.backend.requests();
     assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
     assert!(
-        requests[1].prompt.contains("（针对第 1 轮的回答）"),
+        requests[1].prompt.contains("（补充第 1 轮）"),
         "{}",
         requests[1].prompt
     );
-    assert!(requests[1].prompt.contains("连接池监控是正常的"));
+    assert!(
+        requests[1].prompt.contains(multiline),
+        "换行、空行和缩进应保留到模型请求里"
+    );
     let reply_paths: Vec<String> = w
         .server
         .received_requests()
@@ -1426,7 +1559,7 @@ async fn images_files_forwards_and_the_group_window_reach_the_agent_in_their_lay
     assert_eq!(turns[0].status, TurnStatus::Succeeded);
 
     let request = w.backend.requests().pop().expect("启动过");
-    let prompt = &request.prompt;
+    let prompt = materials(&request);
     let t1 = prompt.find("# 本轮提问").expect("T1");
     let t2 = prompt.find("# 群聊记录（T2").expect("T2");
     let thread = prompt.find("## 话题里的消息").expect("话题");
@@ -1551,7 +1684,7 @@ async fn the_group_window_pages_until_it_has_enough_messages() {
     say(&w, "om_1", "看下上面的讨论", json!({})).await;
     until(&w, "结束", all_finished(1)).await;
 
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     for kept in ["第四条", "第三条", "第二条"] {
         assert!(prompt.contains(kept), "缺 {kept}：{prompt}");
     }
@@ -1657,7 +1790,7 @@ async fn an_explicit_count_in_the_question_narrows_the_group_window() {
     say(&w, "om_1", "总结下最近2条消息", json!({})).await;
     until(&w, "结束", all_finished(1)).await;
 
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     assert!(prompt.contains("只看最近 2 条消息"), "{prompt}");
     assert!(
         prompt.contains("第四条") && prompt.contains("第三条"),
@@ -1723,7 +1856,7 @@ async fn system_notices_stay_out_of_the_chat_record() {
     say(&w, "om_1", "上面说了什么", json!({})).await;
     until(&w, "结束", all_finished(1)).await;
 
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     assert!(prompt.contains("昨天发版了"), "{prompt}");
     assert!(!prompt.contains("系统消息"), "{prompt}");
     assert!(!prompt.contains("（无）"), "空的层不出现：{prompt}");
@@ -1753,7 +1886,7 @@ async fn jira_keys_from_the_group_window_are_not_pre_read() {
     say(&w, "om_1", "看下 QA-1 为什么失败", json!({})).await;
     until(&w, "结束", all_finished(1)).await;
 
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     let t2 = prompt
         .split("# 识别到的 Jira 单")
         .nth(1)
@@ -1808,41 +1941,69 @@ async fn progress_with(w: &World, text: &str) -> String {
     panic!("进度卡上一直没有出现「{text}」");
 }
 
-/// 分析中：模型说的进展和写到一半的结论（概述和命令）先露在进度卡上，不用干等整份答案。
+/// 分析中只显示进度；草稿即使随后失败或中断，也不能成为可执行的答案。
 #[tokio::test]
-async fn the_progress_card_shows_what_the_model_found_and_the_conclusion_as_it_is_written() {
-    let gate = Arc::new(tokio::sync::Notify::new());
-    let w = world(vec![vec![
-        started("s-1"),
-        Beat::Event(AgentEvent::Step(Step::Text(
-            "已定位到代码：登录会按主键更新\n用户表那一行".into(),
-        ))),
-        Beat::Gate(Arc::clone(&gate)),
-        Beat::Event(AgentEvent::Draft(ai_boot_agent::Draft {
-            title: Some("登录锁等待超时".into()),
-            summary: Some("**根因**：用户表那一行的锁被别的事务占住".into()),
-            commands: Some(json!([{
-                "title": "查占锁的事务", "where": "数据库", "command": "SHOW ENGINE INNODB STATUS", "look": ""
-            }])),
-        })),
-        Beat::Gate(Arc::clone(&gate)),
-        answered("登录锁等待超时"),
-    ]])
-    .await;
-    say(&w, "om_1", "看下这个报错", json!({})).await;
-    let thought = progress_with(&w, "已定位到代码").await;
-    assert!(
-        thought.contains("登录会按主键更新 用户表那一行"),
-        "多行压成一行：{thought}"
-    );
-    gate.notify_one();
-    let draft = progress_with(&w, "用户表那一行的锁被别的事务占住").await;
-    assert!(draft.contains("结论（还在写详情）"), "{draft}");
-    // 命令紧跟概述写完，详情还在写时就露出来，人可以先动手
-    assert!(draft.contains("SHOW ENGINE INNODB STATUS"), "{draft}");
-    assert!(draft.contains("text_tag"), "概述的标签着色：{draft}");
-    gate.notify_one();
-    until(&w, "结束", all_finished(1)).await;
+async fn conclusions_and_commands_are_shown_only_after_success() {
+    let mut answer = answer_json("登录锁等待超时");
+    answer["summary"] = json!("已核实的结论");
+    answer["commands"] = json!([{
+        "title": "查占锁的事务", "where": "数据库", "command": "SHOW ENGINE INNODB STATUS", "look": ""
+    }]);
+    for outcome in [
+        Outcome::Success {
+            structured: Some(answer),
+            text: String::new(),
+            turns: 1,
+        },
+        Outcome::Failed {
+            kind: FailKind::Api,
+            reason: "上游请求失败".into(),
+        },
+        Outcome::Interrupted,
+    ] {
+        let success = matches!(outcome, Outcome::Success { .. });
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let w = world(vec![vec![
+            started("s-1"),
+            Beat::Event(AgentEvent::Step(Step::Text("未经核实的推测".into()))),
+            Beat::Event(AgentEvent::Draft(ai_boot_agent::Draft {
+                title: Some("临时草稿标题".into()),
+                summary: Some("临时草稿结论".into()),
+                commands: Some(json!([{
+                    "title": "草稿命令", "where": "数据库", "command": "SELECT draft_only", "look": ""
+                }])),
+            })),
+            Beat::Event(AgentEvent::Activity(ai_boot_agent::Activity::Concluding)),
+            Beat::Gate(Arc::clone(&gate)),
+            Beat::Event(AgentEvent::Finished(outcome)),
+        ]]).await;
+        say(&w, "om_1", "看下这个报错", json!({})).await;
+        let progress = progress_with(&w, "正在整理结论").await;
+        assert!(progress.contains("停止"));
+        assert!(!progress.contains("已核实的结论"));
+        gate.notify_one();
+        until(&w, "结束", all_finished(1)).await;
+        let final_card = last_card(&w, "om_card_1").await.to_string();
+        assert_eq!(final_card.contains("已核实的结论"), success, "{final_card}");
+        assert_eq!(
+            final_card.contains("SHOW ENGINE INNODB STATUS"),
+            success,
+            "{final_card}"
+        );
+        for request in w.server.received_requests().await.expect("请求记录") {
+            if request.method.as_str() == "PATCH" {
+                let body = String::from_utf8_lossy(&request.body);
+                for hidden in [
+                    "未经核实的推测",
+                    "临时草稿标题",
+                    "临时草稿结论",
+                    "SELECT draft_only",
+                ] {
+                    assert!(!body.contains(hidden), "草稿泄露：{body}");
+                }
+            }
+        }
+    }
 }
 
 /// 会话上下文已经很长：下一轮把前几轮收拢成结论、换新会话，之前的答案全文留在
@@ -1868,7 +2029,7 @@ async fn a_long_session_is_compacted_into_conclusions_for_the_next_turn() {
 
     let requests = w.backend.requests();
     assert_eq!(requests[1].session, SessionRef::New, "上下文太长就换新会话");
-    let prompt = &requests[1].prompt;
+    let prompt = materials(&requests[1]);
     assert!(
         prompt.starts_with("# 前情（之前的会话上下文太长"),
         "{prompt}"
@@ -1911,7 +2072,7 @@ async fn quoting_a_purged_card_hands_its_old_answer_to_the_model() {
     )
     .await;
     until(&w, "结束", all_finished(1)).await;
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     let quoted = prompt.find("## 提问引用的消息").expect("有引用");
     assert!(
         prompt[quoted..].contains("机器人（之前的回答）"),
@@ -1949,7 +2110,7 @@ async fn messages_that_arrived_after_the_question_are_not_sent_again() {
         .await;
     say(&w, "om_1", "登录报 500", json!({})).await;
     until(&w, "第一轮结束", all_finished(1)).await;
-    assert!(w.backend.requests()[0].prompt.contains("我这边也复现了"));
+    assert!(materials(&w.backend.requests()[0]).contains("我这边也复现了"));
     let quote =
         json!({"parent_id": "om_card_1", "root_id": "om_1", "create_time": "1790588400000"});
     say(&w, "om_2", "怎么修", quote).await;
@@ -1995,7 +2156,7 @@ async fn a_forward_shared_in_the_group_is_expanded_into_the_group_records() {
     say(&w, "om_1", "看下上面转发的", json!({})).await;
     until(&w, "结束", all_finished(1)).await;
 
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     let t2 = prompt.find("# 群聊记录（T2").expect("T2");
     let forward = prompt.find("在群里转发的聊天记录").expect("转发展开了");
     assert!(t2 < forward, "{prompt}");
@@ -2087,12 +2248,13 @@ async fn a_linked_document_is_read_with_the_askers_authorisation() {
     until(&w, "结束", all_finished(1)).await;
 
     let request = w.backend.requests().pop().expect("启动过");
-    let t2 = request.prompt.find("# 识别到的 Jira 单").expect("T2");
-    let t1 = &request.prompt[..t2];
+    let data = materials(&request);
+    let t2 = data.find("# 识别到的 Jira 单").expect("T2");
+    let t1 = &data[..t2];
     assert!(t1.contains("## 提问附带的文件与文档"), "{}", request.prompt);
     assert!(t1.contains("故障复盘"));
     assert!(t1.contains("连接池耗尽"));
-    assert!(request.prompt.contains("- QA-77"), "文档里的单号也识别出来");
+    assert!(data.contains("- QA-77"), "文档里的单号也识别出来");
     let requests = w.server.received_requests().await.expect("请求记录");
     let doc_call = requests
         .iter()
@@ -2130,7 +2292,7 @@ async fn without_authorisation_the_turn_goes_on_and_the_asker_gets_one_card() {
     say(&w, "om_1", &format!("看下 {DOC_LINK}"), json!({})).await;
     let turns = until(&w, "第一轮结束", all_finished(1)).await;
     assert_eq!(turns[0].status, TurnStatus::Succeeded, "没授权也照常回答");
-    let prompt = &w.backend.requests()[0].prompt;
+    let prompt = materials(&w.backend.requests()[0]);
     assert!(prompt.contains("没能读取的内容"));
     assert!(prompt.contains("已私聊发了授权链接"), "{prompt}");
 
@@ -2161,7 +2323,7 @@ fn button_value(card: &Value, id: &str) -> Value {
 }
 
 async fn press_value(w: &World, value: &Value) -> Toast {
-    let (action, turn_id) = Action::parse(value).expect("认得出的按钮");
+    let (action, turn_id) = Action::parse(value, "").expect("认得出的按钮");
     for _ in 0..100 {
         let toast = press(w, action.clone(), &turn_id).await;
         if !toast.text.contains("还有一轮没结束") {
@@ -2374,10 +2536,20 @@ async fn clearing_the_context_stops_the_chat_erases_its_data_and_starts_over() {
 }
 
 #[tokio::test]
-async fn files_named_in_the_answer_are_sent_under_the_card_and_escapes_are_refused() {
+async fn files_named_in_the_answer_stay_in_one_card_and_escapes_are_refused() {
     let gate = Arc::new(tokio::sync::Notify::new());
-    let mut answer = answer_json("给出检查脚本");
-    answer["files"] = json!(["out/check.sh", "../../etc/passwd"]);
+    let mut answer = answer_json("Hive 白屏：导航父子排序异常");
+    answer["files"] = json!([
+        "out/order-diagnosis.md",
+        "out/nav-audit.sql",
+        "out/reproduce-nav.cjs",
+        "out/reproduction.txt",
+        "../../etc/passwd"
+    ]);
+    answer["file_views"] = json!([{
+        "name": "伪造附件", "body": null, "note": null,
+        "download_url": "https://untrusted.example/file"
+    }]);
     let w = world(vec![vec![
         started("s-1"),
         Beat::Gate(Arc::clone(&gate)),
@@ -2391,19 +2563,17 @@ async fn files_named_in_the_answer_are_sent_under_the_card_and_escapes_are_refus
     Mock::given(method("POST"))
         .and(path("/open-apis/im/v1/files"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(
-                json!({"code": 0, "msg": "ok", "data": {"file_key": "file_v3_check"}}),
-            ),
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"code": 0, "msg": "ok", "data": {"file_key": "unused"}})),
         )
-        .expect(1)
+        .expect(0)
         .mount(&w.server)
         .await;
-    say(&w, "om_q1", "给我一个检查脚本", json!({})).await;
+    say(&w, "om_q1", "分析白屏并给出检查文件", json!({})).await;
     let turns = until(&w, "开跑", |turns| {
         turns.iter().any(|t| t.status == TurnStatus::Running)
     })
     .await;
-    // Agent 在工作目录里写好脚本，再交答案
     let out = w
         ._dir
         .path()
@@ -2411,13 +2581,98 @@ async fn files_named_in_the_answer_are_sent_under_the_card_and_escapes_are_refus
         .join(&turns[0].conversation_id)
         .join("out");
     std::fs::create_dir_all(&out).expect("目录");
-    std::fs::write(out.join("check.sh"), "#!/bin/sh\nss -s\n").expect("脚本");
+    let files = [
+        (
+            "order-diagnosis.md",
+            "**导航排序异常**，父节点应先于子节点。",
+        ),
+        ("nav-audit.sql", "SELECT id, parent_id FROM navigation;"),
+        (
+            "reproduce-nav.cjs",
+            "console.log('navigation reproduction');",
+        ),
+        (
+            "reproduction.txt",
+            "reproduction: navigation order mismatch",
+        ),
+    ];
+    for (name, content) in files {
+        std::fs::write(out.join(name), content).expect("交付文件");
+    }
     gate.notify_one();
     until(&w, "结束", all_finished(1)).await;
+    let card = last_card(&w, "om_card_1").await;
+    let elements = card["body"]["elements"].as_array().expect("卡片内容");
+    for (name, content) in files {
+        let row = elements
+            .iter()
+            .find(|element| {
+                element["tag"] == "collapsible_panel"
+                    && element["header"]["title"]["content"]
+                        .as_str()
+                        .is_some_and(|title| title.contains(name))
+            })
+            .expect("文件应在原卡片里独立成行");
+        assert_eq!(row["expanded"], false, "默认不展开");
+        assert!(row.to_string().contains(content), "展示完整的小文件内容");
+    }
+    let text = card.to_string();
+    assert!(text.contains("../../etc/passwd") && text.contains("无法读取"));
+    assert!(!text.contains("untrusted.example"), "模型不能注入下载入口");
+    let requests = w.server.received_requests().await.expect("请求记录");
+    let replies: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path().ends_with("/reply")
+        })
+        .collect();
+    assert_eq!(replies.len(), 1, "答案和全部文件共用一条回复");
+}
 
-    let mut sent = Vec::new();
+#[tokio::test]
+async fn binary_files_keep_native_downloads_until_inline_storage_is_configured() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut answer = answer_json("交付文本和二进制证据");
+    answer["files"] = json!(["out/report.md", "out/evidence.bin"]);
+    let w = world(vec![vec![
+        started("s-1"),
+        Beat::Gate(Arc::clone(&gate)),
+        Beat::Event(AgentEvent::Finished(Outcome::Success {
+            structured: Some(answer),
+            text: String::new(),
+            turns: 1,
+        })),
+    ]])
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/im/v1/files"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!({"code": 0, "msg": "ok", "data": {"file_key": "file_v3_binary"}}),
+            ),
+        )
+        .expect(1)
+        .mount(&w.server)
+        .await;
+    say(&w, "om_q1", "交付排查证据", json!({})).await;
+    let turns = until(&w, "开跑", |turns| {
+        turns.iter().any(|t| t.status == TurnStatus::Running)
+    })
+    .await;
+    let out = w
+        ._dir
+        .path()
+        .join("sessions")
+        .join(&turns[0].conversation_id)
+        .join("out");
+    std::fs::create_dir_all(&out).expect("目录");
+    std::fs::write(out.join("report.md"), "已验证的结论").expect("文本");
+    std::fs::write(out.join("evidence.bin"), b"\0\xff\x01").expect("二进制");
+    gate.notify_one();
+    until(&w, "结束", all_finished(1)).await;
+    let mut downloads = Vec::new();
     for _ in 0..100 {
-        sent = w
+        downloads = w
             .server
             .received_requests()
             .await
@@ -2429,25 +2684,22 @@ async fn files_named_in_the_answer_are_sent_under_the_card_and_escapes_are_refus
             })
             .map(|r| serde_json::from_slice::<Value>(&r.body).expect("JSON"))
             .collect();
-        if sent.len() >= 2 {
+        if !downloads.is_empty() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(downloads.len(), 1, "只为无法预览的二进制保留原下载消息");
+    assert_eq!(downloads[0]["msg_type"], "file");
     assert!(
-        sent.iter().any(|r| r["msg_type"] == "file"
-            && r["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("file_v3_check"))),
-        "脚本应当作为文件回复在答案卡下面：{sent:?}"
+        downloads[0]["content"]
+            .as_str()
+            .expect("消息内容")
+            .contains("file_v3_binary")
     );
-    assert!(
-        sent.iter().any(|r| r["msg_type"] == "text"
-            && r["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("../../etc/passwd") && c.contains("没有发出"))),
-        "越界的路径要拒绝并说明：{sent:?}"
-    );
+    let card = last_card(&w, "om_card_1").await.to_string();
+    assert!(card.contains("report.md") && card.contains("已验证的结论"));
+    assert!(card.contains("evidence.bin") && card.contains("可点击下载"));
 }
 
 #[tokio::test]
@@ -2477,4 +2729,255 @@ async fn clear_typed_into_the_card_input_really_clears() {
     assert!(confirmed, "确认要回复在那张卡片下面");
     assert!(w.store.all_turns().await.is_empty());
     assert_eq!(w.backend.requests().len(), 1, "清空不能交给模型当追问");
+}
+
+async fn codex_world(scripts: Vec<Vec<Beat>>) -> World {
+    world_backend(scripts, DEBOUNCE, None, false, None, "codex").await
+}
+
+async fn requests_until(w: &World, count: usize) -> Vec<TurnRequest> {
+    for _ in 0..200 {
+        let requests = w.backend.requests();
+        if requests.len() >= count {
+            return requests;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("没有收到 {count} 次 Agent 请求");
+}
+
+#[tokio::test]
+async fn codex_model_switch_is_persisted_and_applies_to_queued_turns() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let w = codex_world(vec![
+        vec![
+            started("s-1"),
+            Beat::Gate(Arc::clone(&gate)),
+            answered("第一轮"),
+        ],
+        vec![started("s-1"), answered("第二轮")],
+        vec![started("s-2"), answered("其他会话")],
+    ])
+    .await;
+    say(&w, "om_1", "查问题", json!({})).await;
+    requests_until(&w, 1).await;
+    say(&w, "om_2", "继续查", json!({})).await;
+    let turns = until(&w, "第二轮排队", |t| {
+        t.len() == 2 && t[1].status == TurnStatus::Queued
+    })
+    .await;
+    let toast = press(
+        &w,
+        Action::Model {
+            model: "complex-model".into(),
+        },
+        &turns[0].id,
+    )
+    .await;
+    assert!(toast.text.contains("complex-model"), "{toast:?}");
+    assert!(
+        press(&w, Action::Effort(Effort::Xhigh), &turns[0].id)
+            .await
+            .text
+            .contains("xhigh")
+    );
+    gate.notify_one();
+    let turns = until(&w, "两轮完成", all_finished(2)).await;
+    let requests = w.backend.requests();
+    assert_eq!(requests[0].model.as_deref(), Some("opus"));
+    assert_eq!(requests[0].effort, Some(Effort::High));
+    assert_eq!(requests[1].model.as_deref(), Some("complex-model"));
+    assert_eq!(requests[1].effort, Some(Effort::Xhigh));
+    assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
+    let first = last_card(&w, "om_card_1").await.to_string();
+    let second = last_card(&w, "om_card_2").await.to_string();
+    assert!(first.contains("本轮模型：opus · 推理强度：high"), "{first}");
+    assert!(
+        second.contains("本轮模型：complex-model · 推理强度：xhigh"),
+        "{second}"
+    );
+    let reopened = Store::open(w._dir.path()).await.expect("重开数据库");
+    let saved = reopened
+        .conversation(&turns[0].conversation_id)
+        .await
+        .expect("查询")
+        .expect("会话");
+    assert_eq!(saved.model_override.as_deref(), Some("complex-model"));
+    assert_eq!(saved.effort_override.as_deref(), Some("xhigh"));
+    let old = reopened
+        .turn_record(&turns[0].id)
+        .await
+        .expect("查询")
+        .expect("轮次");
+    assert_eq!(old.model.as_deref(), Some("opus"));
+    assert_eq!(old.reasoning_effort.as_deref(), Some("high"));
+    say(&w, "om_3", "另一个群的问题", json!({"chat_id": "oc_2"})).await;
+    until(&w, "其他会话完成", all_finished(3)).await;
+    let requests = w.backend.requests();
+    assert_eq!(requests[2].model.as_deref(), Some("opus"));
+    assert_eq!(requests[2].effort, Some(Effort::High));
+}
+
+#[tokio::test]
+async fn codex_retry_and_session_recovery_keep_the_new_options() {
+    let w = codex_world(vec![
+        vec![started("s-1"), failed(FailKind::Cli, "临时失败")],
+        vec![failed(FailKind::SessionNotFound, "会话丢失")],
+        vec![started("s-2"), answered("重试成功")],
+        vec![started("s-2"), answered("恢复默认")],
+    ])
+    .await;
+    say(&w, "om_1", "查问题", json!({})).await;
+    let turns = until(&w, "首轮失败", all_finished(1)).await;
+    let failure = last_card(&w, "om_card_1").await.to_string();
+    assert!(failure.contains("切换模型 / 推理强度"));
+    press(
+        &w,
+        Action::Model {
+            model: "complex-model".into(),
+        },
+        &turns[0].id,
+    )
+    .await;
+    press(&w, Action::Effort(Effort::Xhigh), &turns[0].id).await;
+    assert!(
+        press_retry(&w, &turns[0].id)
+            .await
+            .text
+            .contains("开始重试")
+    );
+    let requests = requests_until(&w, 3).await;
+    until(&w, "重试成功", |t| {
+        t.len() == 1 && t[0].status == TurnStatus::Succeeded
+    })
+    .await;
+    for request in &requests[1..] {
+        assert_eq!(request.model.as_deref(), Some("complex-model"));
+        assert_eq!(request.effort, Some(Effort::Xhigh));
+    }
+    assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
+    assert_eq!(requests[2].session, SessionRef::New);
+    assert!(
+        press(&w, Action::ResetModel, &turns[0].id)
+            .await
+            .text
+            .contains("high")
+    );
+    say(&w, "om_2", "继续", json!({})).await;
+    until(&w, "默认配置完成", all_finished(2)).await;
+    let requests = w.backend.requests();
+    assert_eq!(requests[3].model.as_deref(), Some("opus"));
+    assert_eq!(requests[3].effort, Some(Effort::High));
+}
+
+#[tokio::test]
+async fn invalid_model_names_and_non_codex_switches_do_not_change_settings() {
+    let w = codex_world(vec![vec![started("s-1"), answered("完成")]]).await;
+    say(&w, "om_1", "查问题", json!({})).await;
+    let turns = until(&w, "完成", all_finished(1)).await;
+    for model in [
+        "".to_owned(),
+        "--help".to_owned(),
+        "a b".to_owned(),
+        "a\nb".to_owned(),
+        "x".repeat(129),
+    ] {
+        let toast = press(&w, Action::Model { model }, &turns[0].id).await;
+        assert!(toast.text.contains("有效模型名称"), "{toast:?}");
+    }
+    let saved = w
+        .store
+        .conversation(&turns[0].conversation_id)
+        .await
+        .expect("查询")
+        .expect("会话");
+    assert!(saved.model_override.is_none());
+    assert!(saved.effort_override.is_none());
+    assert_eq!(w.backend.requests().len(), 1, "设置不会作为提问发给 Agent");
+    let claude = world(vec![vec![started("c-1"), answered("完成")]]).await;
+    say(&claude, "om_1", "查问题", json!({})).await;
+    let turns = until(&claude, "完成", all_finished(1)).await;
+    let toast = press(&claude, Action::Effort(Effort::Xhigh), &turns[0].id).await;
+    assert!(toast.text.contains("只有 Codex"));
+    let card = last_card(&claude, "om_card_1").await.to_string();
+    assert!(!card.contains("切换模型 / 推理强度"));
+}
+
+#[tokio::test]
+async fn codex_stop_and_restart_cards_keep_the_executed_options() {
+    let w = codex_world(vec![
+        vec![started("s-1"), Beat::UntilCancelled],
+        vec![started("s-1"), answered("重做完成")],
+    ])
+    .await;
+    say(&w, "om_1", "复杂问题", json!({})).await;
+    requests_until(&w, 1).await;
+    let turns = until(&w, "开始执行", |t| {
+        t.len() == 1 && t[0].status == TurnStatus::Running
+    })
+    .await;
+    press(
+        &w,
+        Action::Model {
+            model: "complex-model".into(),
+        },
+        &turns[0].id,
+    )
+    .await;
+    press(&w, Action::Effort(Effort::Xhigh), &turns[0].id).await;
+    press(&w, Action::Stop, &turns[0].id).await;
+    until(&w, "停止", |t| t[0].status == TurnStatus::Interrupted).await;
+    let stopped = last_card(&w, "om_card_1").await.to_string();
+    assert!(stopped.contains("本轮模型：opus · 推理强度：high"));
+    w.runner
+        .mark_interrupted(vec![crate::store::InterruptedTurn {
+            id: turns[0].id.clone(),
+            card_message_id: Some("om_card_1".into()),
+        }])
+        .await;
+    let restarted = last_card(&w, "om_card_1").await.to_string();
+    assert!(restarted.contains("本轮模型：opus · 推理强度：high"));
+    assert!(restarted.contains("切换模型 / 推理强度"));
+    press_retry(&w, &turns[0].id).await;
+    let requests = requests_until(&w, 2).await;
+    until(&w, "重做完成", |t| t[0].status == TurnStatus::Succeeded).await;
+    assert_eq!(requests[1].model.as_deref(), Some("complex-model"));
+    assert_eq!(requests[1].effort, Some(Effort::Xhigh));
+}
+
+#[tokio::test]
+async fn codex_closure_cards_retain_their_model_when_redrawn() {
+    let w = codex_world(vec![
+        vec![started("s-1"), answered("已解决")],
+        vec![started("s-1"), answered("闭环方案")],
+    ])
+    .await;
+    say(&w, "om_1", "查问题", json!({})).await;
+    let turns = until(&w, "第一轮完成", all_finished(1)).await;
+    press(
+        &w,
+        Action::Model {
+            model: "complex-model".into(),
+        },
+        &turns[0].id,
+    )
+    .await;
+    press(&w, Action::Effort(Effort::Xhigh), &turns[0].id).await;
+    press_when_idle(&w, Action::Resolve, &turns[0].id).await;
+    let turns = until(&w, "闭环完成", all_finished(2)).await;
+    let card = last_card(&w, "om_card_2").await.to_string();
+    assert!(card.contains("本轮模型：complex-model · 推理强度：xhigh"));
+    assert!(card.contains("切换模型 / 推理强度"));
+    press(&w, Action::Effort(Effort::High), &turns[1].id).await;
+    let record = w
+        .store
+        .turn_record(&turns[1].id)
+        .await
+        .expect("查询")
+        .expect("闭环轮次");
+    let redrawn = crate::writeback::closure_card(&record, &[], &[])
+        .expect("闭环卡片")
+        .to_string();
+    assert!(redrawn.contains("本轮模型：complex-model · 推理强度：xhigh"));
+    assert_eq!(w.backend.requests()[1].effort, Some(Effort::Xhigh));
 }

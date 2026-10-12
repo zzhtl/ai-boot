@@ -166,6 +166,9 @@ impl Actor {
                     Action::Stop => self.stop(&turn_id),
                     Action::Retry => self.retry(&turn_id).await,
                     Action::Resolve => self.resolve(&turn_id).await,
+                    Action::Model { .. } | Action::Effort(_) | Action::ResetModel => {
+                        self.configure_model(action).await
+                    }
                     Action::Writeback {
                         target,
                         reference,
@@ -270,6 +273,64 @@ impl Actor {
         }
         // 排队的任务提前结束了（比如卡片没回出去）
         self.pending.retain(|p| p.turn_id != turn_id);
+    }
+
+    async fn configure_model(&self, action: Action) -> Toast {
+        let mut conversation = match self.store.conversation(&self.conversation_id).await {
+            Ok(Some(conversation)) if conversation.backend == "codex" => conversation,
+            Ok(Some(_)) => return Toast::warning("只有 Codex 会话支持切换模型和推理强度"),
+            Ok(None) => return Toast::warning("会话已被清理，请重新提问"),
+            Err(err) => {
+                tracing::error!("{err:#}");
+                return Toast::error("读取模型配置失败，稍后再试");
+            }
+        };
+        match action {
+            Action::Model { model } => {
+                let model = model.trim();
+                if model.is_empty()
+                    || model.len() > 128
+                    || !model.starts_with(|c: char| c.is_ascii_alphanumeric())
+                    || !model
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"-._/:".contains(&c))
+                {
+                    return Toast::warning("请输入有效模型名称（最多 128 字符，不能包含空格）");
+                }
+                conversation.model_override = Some(model.to_owned());
+            }
+            Action::Effort(effort) => {
+                conversation.effort_override = Some(effort.as_str().to_owned())
+            }
+            Action::ResetModel => {
+                conversation.model_override = None;
+                conversation.effort_override = None;
+            }
+            _ => return Toast::warning("无法识别的模型设置"),
+        }
+        match self
+            .store
+            .set_model_options(
+                &self.conversation_id,
+                conversation.model_override.as_deref(),
+                conversation.effort_override.as_deref(),
+            )
+            .await
+        {
+            Ok(true) => Toast::success(format!(
+                "已保存：{} · {}。下一轮或重试生效",
+                self.runner.model(&conversation).unwrap_or("CLI 默认"),
+                self.runner
+                    .effort(&conversation)
+                    .map(|e| e.as_str())
+                    .unwrap_or("后端默认"),
+            )),
+            Ok(false) => Toast::warning("会话已结束，请重新提问"),
+            Err(err) => {
+                tracing::error!("{err:#}");
+                Toast::error("保存模型配置失败，稍后再试")
+            }
+        }
     }
 
     fn stop(&mut self, turn_id: &str) -> Toast {

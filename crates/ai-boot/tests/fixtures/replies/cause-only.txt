@@ -1,0 +1,6 @@
+只解释启动失败的原因，不需要处理步骤或命令。
+
+以下是只供评测使用的已核实现场资料：
+- 堆栈为 ClassNotFoundException: com.mysql.cj.jdbc.Driver。
+- 应用启动时调用 Class.forName("com.mysql.cj.jdbc.Driver")。
+- 同一版本的制品解包清单及实际启动 classpath 均不包含 MySQL Connector/J 驱动。

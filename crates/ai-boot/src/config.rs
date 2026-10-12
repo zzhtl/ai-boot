@@ -89,6 +89,8 @@ pub struct FeishuConfig {
     /// 开放平台地址，必须以 `/` 结尾。
     #[serde(default = "default_base_url")]
     pub base_url: Url,
+    /// 配置后由官方 Go SDK 子进程维持长连接；不配则使用内置客户端。
+    pub go_sdk_program: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,7 +113,7 @@ pub struct StorageConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
-    /// 目前只有 claude；codex 在 M7 接入。
+    /// claude 或 codex。
     #[serde(default = "default_backend")]
     pub backend: String,
     pub model: Option<String>,
@@ -124,7 +126,11 @@ pub struct AgentConfig {
     /// 同时跑几轮分析。SSO 共享会话（qtmcp Q-auth）上线前保持 1。
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
+    #[serde(default)]
     pub claude: ClaudeSection,
+    #[serde(default)]
+    pub codex: CodexSection,
+    #[serde(default)]
     pub hook: HookSection,
     #[serde(default)]
     pub mcp: Vec<McpSection>,
@@ -140,6 +146,71 @@ pub struct ClaudeSection {
     pub env_passthrough: Vec<String>,
 }
 
+impl Default for ClaudeSection {
+    fn default() -> Self {
+        Self {
+            program: "/opt/ai-boot/bin/claude".into(),
+            env_passthrough: default_env_passthrough(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexSection {
+    pub program: PathBuf,
+    /// 对应 CODEX_HOME 下的 <profile>.config.toml。
+    pub profile: Option<String>,
+    #[serde(default = "default_codex_env")]
+    pub env_passthrough: Vec<String>,
+}
+
+impl Default for CodexSection {
+    fn default() -> Self {
+        Self {
+            program: "/opt/ai-boot/bin/codex".into(),
+            profile: None,
+            env_passthrough: default_codex_env(),
+        }
+    }
+}
+
+fn default_codex_env() -> Vec<String> {
+    [
+        "HOME",
+        "PATH",
+        "LANG",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "CODEX_HOME",
+        "SSH_AUTH_SOCK",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "JAVA_HOME",
+        "GOPATH",
+        "GOROOT",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "KUBECONFIG",
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_CONFIG",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "all_proxy",
+        "no_proxy",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookSection {
@@ -147,6 +218,15 @@ pub struct HookSection {
     pub program: PathBuf,
     #[serde(default = "default_hook_timeout_secs")]
     pub timeout_secs: u32,
+}
+
+impl Default for HookSection {
+    fn default() -> Self {
+        Self {
+            program: "/opt/ai-boot/bin/ai-boot".into(),
+            timeout_secs: default_hook_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +340,11 @@ impl Config {
         if self.feishu.app_id.trim().is_empty() {
             bail!("feishu.app_id 不能为空");
         }
+        if let Some(program) = &self.feishu.go_sdk_program
+            && !program.is_absolute()
+        {
+            bail!("feishu.go_sdk_program 必须是绝对路径");
+        }
         // 缺了结尾的 /，Url::join 会把最后一段路径吃掉
         if !self.feishu.base_url.path().ends_with('/') {
             bail!("feishu.base_url 必须以 / 结尾");
@@ -305,8 +390,8 @@ impl Config {
 
 impl AgentConfig {
     fn validate(&self) -> anyhow::Result<()> {
-        if self.backend != "claude" {
-            bail!("agent.backend 目前只支持 claude，收到 {:?}", self.backend);
+        if !matches!(self.backend.as_str(), "claude" | "codex") {
+            bail!("agent.backend 只能是 claude/codex，收到 {:?}", self.backend);
         }
         if let Some(effort) = &self.effort
             && self.effort_level().is_none()
@@ -324,10 +409,29 @@ impl AgentConfig {
         {
             bail!("agent.budget_usd 必须是正数");
         }
-        for (key, path) in [
-            ("agent.claude.program", &self.claude.program),
-            ("agent.hook.program", &self.hook.program),
-        ] {
+        if self.backend == "codex" && self.budget_usd.is_some() {
+            bail!("Codex 不提供美元预算参数，请去掉 agent.budget_usd");
+        }
+        if let Some(profile) = &self.codex.profile
+            && (profile.is_empty()
+                || !profile
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
+        {
+            bail!("agent.codex.profile 只能使用字母、数字、下划线和连字符");
+        }
+        let programs = if self.backend == "codex" {
+            vec![
+                ("agent.codex.program", &self.codex.program),
+                ("agent.hook.program", &self.hook.program),
+            ]
+        } else {
+            vec![
+                ("agent.claude.program", &self.claude.program),
+                ("agent.hook.program", &self.hook.program),
+            ]
+        };
+        for (key, path) in programs {
             if !path.is_absolute() {
                 bail!("{key} 必须是绝对路径：{}", path.display());
             }
@@ -394,6 +498,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_config_needs_no_claude_and_does_not_accept_an_unsupported_budget() {
+        let raw = include_str!("../../../config.codex.example.toml");
+        let config = Config::parse(raw).expect("Codex 示例");
+        assert_eq!(config.agent.backend, "codex");
+        assert_eq!(config.agent.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(
+            config.agent.effort_level(),
+            Some(ai_boot_agent::Effort::High)
+        );
+        assert_eq!(config.agent.codex.profile.as_deref(), Some("ai-boot"));
+        let bad = raw.replace(
+            "backend = \"codex\"",
+            "backend = \"codex\"\nbudget_usd = 5.0",
+        );
+        assert!(Config::parse(&bad).is_err_and(|err| err.to_string().contains("budget_usd")));
+        let bad = raw.replace("profile = \"ai-boot\"", "profile = \"../config\"");
+        assert!(Config::parse(&bad).is_err_and(|err| err.to_string().contains("profile")));
+    }
+
+    #[test]
     fn unknown_keys_are_rejected() {
         let raw = format!("{EXAMPLE}\n[extra]\nkey = 1\n");
         assert!(Config::parse(&raw).is_err());
@@ -437,7 +561,7 @@ mod tests {
     #[test]
     fn agent_settings_are_validated() {
         for (patch, fragment) in [
-            ("backend = \"codex\"", "claude"),
+            ("backend = \"unknown\"", "backend"),
             ("effort = \"extreme\"", "effort"),
             ("timeout_secs = 5", "timeout"),
             ("max_concurrent = 9", "max_concurrent"),

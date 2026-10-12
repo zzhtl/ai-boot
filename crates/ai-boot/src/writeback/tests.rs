@@ -35,6 +35,7 @@ fn answer(keys: &[&str]) -> Answer {
         open_questions: vec![],
         references: vec![],
         files: vec![],
+        file_views: vec![],
         jira_keys: keys.iter().map(|k| (*k).to_owned()).collect(),
         image_keys: Default::default(),
     }
@@ -117,6 +118,7 @@ async fn finish_resolve(env: &Env, answer: &Answer, targets: &[TargetSpec]) {
             conversation_id: "c1",
             status: TurnStatus::Succeeded,
             model: "opus",
+            reasoning_effort: None,
             answer_json: Some(&serde_json::to_string(answer).expect("序列化")),
             error_kind: None,
             error: None,

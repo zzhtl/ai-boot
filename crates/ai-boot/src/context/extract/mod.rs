@@ -24,6 +24,15 @@ use tokio::process::Command;
 pub use image::{WORKERS as IMAGE_WORKERS, is_image, normalize, normalize_tiled};
 pub use sheet::child as sheet_child;
 
+/// 交付文件的文本预览：按内容判断格式，无法完整解码时保留为下载附件。
+pub fn readable_text(name: &str, bytes: &[u8]) -> Option<String> {
+    if !matches!(detect(name, bytes), Kind::Text) {
+        return None;
+    }
+    let decoded = text::decode(bytes)?;
+    (decoded.replaced == 0).then_some(decoded.text)
+}
+
 /// 单个文件解析出的文字上限（字节）。更长的先压缩（日志保留头尾和出错的行）；prompt 里
 /// 各层的预算也按字节算，按字符截的话中文要超出三倍，压缩好的结尾又被截掉。
 pub const TEXT_BYTES: usize = 24 * 1024;
@@ -293,6 +302,21 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivered_file_previews_use_content_and_support_common_text_encodings() {
+        assert_eq!(
+            readable_text("nav.sql", b"SELECT id FROM navigation;"),
+            Some("SELECT id FROM navigation;".into())
+        );
+        let (gbk, _, _) = encoding_rs::GB18030.encode("导航排序检查");
+        assert_eq!(
+            readable_text("report.txt", &gbk),
+            Some("导航排序检查".into())
+        );
+        assert!(readable_text("report.txt", b"%PDF-1.4\nASCII PDF body").is_none());
+        assert!(readable_text("data.bin", b"\0\xff\x01").is_none());
+    }
 
     #[test]
     fn detection_goes_by_content_not_by_name() {

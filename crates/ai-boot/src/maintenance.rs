@@ -321,6 +321,7 @@ mod tests {
                 conversation_id: "old",
                 status: TurnStatus::Succeeded,
                 model: "opus",
+                reasoning_effort: None,
                 answer_json: Some("{}"),
                 error_kind: None,
                 error: None,

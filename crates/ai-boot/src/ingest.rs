@@ -174,7 +174,8 @@ impl Ingest {
             tracing::info!(open_id = operator, "非白名单用户点了卡片按钮，已拒绝");
             return Ok(Some(Toast::error("你没有操作这个机器人的权限").to_bytes()));
         }
-        let Some((kind, turn_id)) = Action::parse(&action.action.value) else {
+        let Some((kind, turn_id)) = Action::parse(&action.action.value, &action.action.input_value)
+        else {
             return Ok(Some(Toast::warning("无法识别的操作").to_bytes()));
         };
         tracing::info!(action = ?kind, turn = %turn_id, "卡片按钮");
@@ -699,10 +700,11 @@ mod tests {
         assert_eq!(toast_text(reply.expect("处理成功")), "正在停止");
     }
 
-    /// 答案卡输入框里回车：内容在 `input_value`，连同卡片和群一起转给会话调度。
+    /// 答案卡多行输入框提交：内容在 `input_value`，连同卡片和群一起转给会话调度。
     #[tokio::test]
     async fn text_typed_on_the_card_becomes_a_follow_up() {
         let mut f = fixture(true).await;
+        let multiline = "连接池监控是正常的\r\n\r\n现场日志：\r\n  java.net.UnknownHostException\r\n    at example.Login.run(Login.java:42)";
         let payload = serde_json::json!({
             "schema": "2.0",
             "header": {"event_id": "e", "event_type": "card.action.trigger"},
@@ -710,7 +712,7 @@ mod tests {
                 "operator": {"open_id": BOSS},
                 "action": {
                     "tag": "input",
-                    "input_value": "连接池监控是正常的",
+                    "input_value": multiline,
                     "value": crate::callback::Action::FollowUp.value("t-9"),
                 },
                 "context": {"open_message_id": "om_card", "open_chat_id": "oc_1"}
@@ -733,7 +735,7 @@ mod tests {
                         (turn_id.as_str(), card_message_id.as_str(), chat_id.as_str()),
                         ("t-9", "om_card", "oc_1")
                     );
-                    assert_eq!(text, "连接池监控是正常的");
+                    assert_eq!(text, multiline, "粘贴文本的换行、空行和缩进完整传给调度");
                     assert_eq!(operator, BOSS);
                     let _ = reply.send(Toast::success("收到，正在分析"));
                 }
@@ -741,6 +743,53 @@ mod tests {
             }
         });
         assert_eq!(toast_text(reply.expect("处理成功")), "收到，正在分析");
+    }
+
+    #[tokio::test]
+    async fn model_input_uses_the_authorized_card_callback() {
+        let mut f = fixture(true).await;
+        let value = Action::Model {
+            model: String::new(),
+        }
+        .value("t-9");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&card_action(BOSS, value)).expect("JSON");
+        payload["event"]["action"]["tag"] = serde_json::json!("input");
+        payload["event"]["action"]["input_value"] = serde_json::json!(" complex-model ");
+        let ingest = &f.ingest;
+        let (response, ()) = tokio::join!(
+            ingest.handle(DataKind::Event, serde_json::to_vec(&payload).expect("JSON")),
+            async {
+                match f.jobs.recv().await {
+                    Some(Job::Action {
+                        action,
+                        turn_id,
+                        operator,
+                        reply,
+                    }) => {
+                        assert_eq!(
+                            action,
+                            Action::Model {
+                                model: "complex-model".into()
+                            }
+                        );
+                        assert_eq!(turn_id, "t-9");
+                        assert_eq!(operator, BOSS);
+                        let _ = reply.send(Toast::success("已保存"));
+                    }
+                    _ => panic!("模型设置应直接交给会话调度"),
+                }
+            }
+        );
+        assert_eq!(toast_text(response.expect("成功")), "已保存");
+        payload["event"]["operator"]["open_id"] = serde_json::json!("ou_other");
+        let response = f
+            .ingest
+            .handle(DataKind::Event, serde_json::to_vec(&payload).expect("JSON"))
+            .await
+            .expect("成功");
+        assert!(toast_text(response).contains("没有操作"));
+        assert_eq!(next_job(&mut f), None);
     }
 
     #[tokio::test]

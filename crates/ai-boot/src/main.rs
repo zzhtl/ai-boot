@@ -9,6 +9,7 @@ mod conversation;
 mod doctor;
 mod hook;
 mod ingest;
+mod knowledge;
 mod lock;
 mod maintenance;
 mod oauth;
@@ -28,6 +29,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use ai_boot_agent::claude::{ClaudeBackend, ClaudeConfig};
+use ai_boot_agent::codex::{CodexBackend, CodexConfig};
 use ai_boot_agent::{AgentBackend, McpServer};
 use ai_boot_feishu::api::ApiClient;
 use ai_boot_feishu::ws::{WsClient, WsConfig};
@@ -169,15 +171,26 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         cancel.clone(),
     ));
 
-    let backend = claude_backend(&config.agent);
-    let claude_config_dir = backend.config_dir();
+    let claude_config_dir = (config.agent.backend == "claude")
+        .then(|| claude_backend(&config.agent).config_dir())
+        .flatten();
+    let codex_records = (config.agent.backend == "codex")
+        .then(|| codex_backend(&config.agent).records_root())
+        .flatten();
+    let backend = agent_backend(&config.agent);
     let info = backend
         .preflight()
         .await
-        .context("claude 不可用，检查 agent.claude.program")?;
-    tracing::info!(backend = ?info.kind, version = %info.version, "Agent 后端就绪");
+        .context("Agent 不可用，检查对应的 agent.<backend>.program")?;
+    tracing::info!(
+        backend = ?info.kind,
+        version = %info.version,
+        model = config.agent.model.as_deref().unwrap_or("CLI 默认"),
+        effort = config.agent.effort.as_deref().unwrap_or("后端默认"),
+        "Agent 后端就绪"
+    );
     let backends: HashMap<String, Arc<dyn AgentBackend>> =
-        HashMap::from([(info.kind.as_str().to_owned(), Arc::new(backend) as _)]);
+        HashMap::from([(info.kind.as_str().to_owned(), backend)]);
     let scratch = data_dir.join("tmp");
     prepare_data_dir(&scratch)?;
     let window = (config.context.window_messages > 0).then(|| {
@@ -272,18 +285,27 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
         Arc::clone(&whitelist),
     )));
     let runner = Arc::new(runner);
+    let codex_records = codex_records.map(|root| maintenance::AgentRecords {
+        root: root.clone(),
+        dir_name: ai_boot_agent::claude::project_slug,
+        paths: Box::new(move |workdir: &Path| {
+            vec![root.join(ai_boot_agent::claude::project_slug(workdir))]
+        }),
+    });
     // 定时清理和「清空上下文」共用：删会话数据的办法只有这一处
     let maintenance = Arc::new(maintenance::Maintenance {
         store: store.clone(),
         data_dir: data_dir.clone(),
         // 和传给 claude 的环境一致：复用本机登录时没有 CLAUDE_CONFIG_DIR，会话记录在 ~/.claude
-        agent_records: claude_config_dir.map(|dir| maintenance::AgentRecords {
-            root: dir.join("projects"),
-            dir_name: ai_boot_agent::claude::project_slug,
-            paths: Box::new(move |workdir: &Path| {
-                ai_boot_agent::claude::session_records(&dir, workdir)
-            }),
-        }),
+        agent_records: claude_config_dir
+            .map(|dir| maintenance::AgentRecords {
+                root: dir.join("projects"),
+                dir_name: ai_boot_agent::claude::project_slug,
+                paths: Box::new(move |workdir: &Path| {
+                    ai_boot_agent::claude::session_records(&dir, workdir)
+                }),
+            })
+            .or(codex_records),
     });
     tokio::spawn(maintenance::run(Arc::clone(&maintenance), cancel.clone()));
 
@@ -334,9 +356,15 @@ async fn run(config_path: &Path) -> anyhow::Result<()> {
     );
     let mut ws_config = WsConfig::new(config.feishu.app_id.clone(), app_secret);
     ws_config.base_url = config.feishu.base_url.clone();
-    let client = WsClient::new(ws_config).context("创建长连接客户端失败")?;
     tracing::info!("ai-boot 已启动");
-    client.run(ingest, cancel).await;
+    if let Some(program) = &config.feishu.go_sdk_program {
+        ai_boot_feishu::ws::run_go_sdk(program, ws_config, ingest, cancel)
+            .await
+            .context("Go SDK 长连接服务失败")?;
+    } else {
+        let client = WsClient::new(ws_config).context("创建长连接客户端失败")?;
+        client.run(ingest, cancel).await;
+    }
     tracing::info!("ai-boot 已退出");
     Ok(())
 }
@@ -350,6 +378,32 @@ pub(crate) fn claude_backend(agent: &config::AgentConfig) -> ClaudeBackend {
         env: claude_env(agent),
         stop_grace: Duration::from_secs(10),
     })
+}
+
+pub(crate) fn codex_env(agent: &config::AgentConfig) -> Vec<(OsString, OsString)> {
+    agent
+        .codex
+        .env_passthrough
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+        .collect()
+}
+
+pub(crate) fn codex_backend(agent: &config::AgentConfig) -> CodexBackend {
+    CodexBackend::new(CodexConfig {
+        program: agent.codex.program.clone(),
+        profile: agent.codex.profile.clone(),
+        env: codex_env(agent),
+        stop_grace: Duration::from_secs(10),
+    })
+}
+
+pub(crate) fn agent_backend(agent: &config::AgentConfig) -> Arc<dyn AgentBackend> {
+    if agent.backend == "codex" {
+        Arc::new(codex_backend(agent))
+    } else {
+        Arc::new(claude_backend(agent))
+    }
 }
 
 /// 传给 claude 的环境变量：按白名单从 ai-boot 自己的环境里挑，其余一律不传。

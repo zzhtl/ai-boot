@@ -58,6 +58,8 @@ pub struct Conversation {
     pub origin: Origin,
     pub thread_id: Option<String>,
     pub backend: String,
+    pub model_override: Option<String>,
+    pub effort_override: Option<String>,
     pub agent_session_id: Option<String>,
     pub session_tokens: i64,
     pub history_cursor_ms: Option<i64>,
@@ -83,7 +85,11 @@ macro_rules! conversation_columns {
             $prefix,
             "history_cursor_ms, ",
             $prefix,
-            "context_tokens"
+            "context_tokens, ",
+            $prefix,
+            "model_override, ",
+            $prefix,
+            "effort_override"
         )
     };
 }
@@ -121,6 +127,8 @@ pub struct TurnRecord {
     pub answer_json: Option<String>,
     pub writeback_targets: Option<String>,
     pub duration_ms: Option<i64>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 /// 收件箱里的一条消息，以及它被分到的会话。
@@ -153,6 +161,7 @@ pub struct FinishedTurn<'a> {
     pub conversation_id: &'a str,
     pub status: TurnStatus,
     pub model: &'a str,
+    pub reasoning_effort: Option<&'a str>,
     pub answer_json: Option<&'a str>,
     pub error_kind: Option<&'a str>,
     pub error: Option<&'a str>,
@@ -177,6 +186,26 @@ pub struct InterruptedTurn {
 }
 
 impl Store {
+    /// 仅覆盖当前仍有效的 Codex 会话，空值用于恢复默认配置。
+    pub async fn set_model_options(
+        &self,
+        conversation_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE conversations SET model_override = ?, effort_override = ?
+             WHERE id = ? AND status = 'active' AND backend = 'codex'",
+        )
+        .bind(model)
+        .bind(effort)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await
+        .context("保存会话模型配置失败")?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// 按话题或话题根消息找进行中的会话。
     pub async fn find_conversation(
         &self,
@@ -259,7 +288,7 @@ impl Store {
     ) -> anyhow::Result<Option<TurnRecord>> {
         sqlx::query_as(
             "SELECT id, seq, kind, status, card_message_id, answer_json, writeback_targets,
-                    duration_ms
+                    duration_ms, model, reasoning_effort
              FROM turns
              WHERE card_message_id = ? AND kind = 'ask' AND status = 'succeeded'
                AND answer_json IS NOT NULL",
@@ -443,7 +472,7 @@ impl Store {
     pub async fn turn_record(&self, turn_id: &str) -> anyhow::Result<Option<TurnRecord>> {
         sqlx::query_as(
             "SELECT id, seq, kind, status, card_message_id, answer_json, writeback_targets,
-                    duration_ms
+                    duration_ms, model, reasoning_effort
              FROM turns WHERE id = ?",
         )
         .bind(turn_id)
@@ -461,7 +490,7 @@ impl Store {
     ) -> anyhow::Result<Option<TurnRecord>> {
         sqlx::query_as(
             "SELECT id, seq, kind, status, card_message_id, answer_json, writeback_targets,
-                    duration_ms
+                    duration_ms, model, reasoning_effort
              FROM turns
              WHERE conversation_id = ? AND seq < ? AND kind = 'ask' AND status = 'succeeded'
                AND answer_json IS NOT NULL AND card_message_id IS NOT NULL
@@ -564,6 +593,23 @@ impl Store {
         Ok(done.rows_affected() == 1)
     }
 
+    /// 开跑前保存配置快照，服务重启重画卡片时仍显示这一轮的配置。
+    pub async fn set_turn_model_options(
+        &self,
+        turn_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE turns SET model = ?, reasoning_effort = ? WHERE id = ?")
+            .bind(model)
+            .bind(effort)
+            .bind(turn_id)
+            .execute(&self.pool)
+            .await
+            .context("保存本轮模型配置失败")?;
+        Ok(())
+    }
+
     /// 一轮结束：记结果、收件箱里的消息标记完成、更新会话的续接信息。
     pub async fn finish_turn(&self, turn: &FinishedTurn<'_>) -> anyhow::Result<()> {
         let mut tx = self
@@ -573,13 +619,14 @@ impl Store {
             .context("开启事务失败")?;
         sqlx::query(
             "UPDATE turns
-             SET status = ?, model = ?, answer_json = ?, error_kind = ?, error = ?,
+             SET status = ?, model = ?, reasoning_effort = ?, answer_json = ?, error_kind = ?, error = ?,
                  tokens = tokens + ?, tool_calls = tool_calls + ?, duration_ms = ?,
                  finished_at_ms = ?
              WHERE id = ?",
         )
         .bind(turn.status)
         .bind(turn.model)
+        .bind(turn.reasoning_effort)
         .bind(turn.answer_json)
         .bind(turn.error_kind)
         .bind(turn.error)
@@ -985,6 +1032,7 @@ mod tests {
             conversation_id: "c1",
             status,
             model: "opus",
+            reasoning_effort: None,
             answer_json: None,
             error_kind: None,
             error: None,

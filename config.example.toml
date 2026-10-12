@@ -17,7 +17,7 @@ allowed_open_ids = []
 data_dir = "/var/lib/ai-boot"
 
 [agent]
-# 目前只有 claude
+# claude 或 codex；本机 Codex 部署示例见 config.codex.example.toml
 backend = "claude"
 # 不写就用 CLI 的默认模型（目前是 Opus），CLI 升级后自动跟上新的默认；要锁定就写全名
 # model = "claude-opus-5-5"

@@ -6,8 +6,7 @@ use serde_json::Value;
 pub enum AgentEvent {
     Started(Started),
     Step(Step),
-    /// 会话累计用量。Claude 和 Codex 在 resume 之后报的都是整个会话的累计值，
-    /// 每轮用量由调用方按前后两次做差。
+    /// Claude 报会话累计用量，Codex exec 报本轮用量；调用方按后端换算。
     Usage(Usage),
     /// 终态，每轮恰好一条且在最后。
     Finished(Outcome),

@@ -3,7 +3,7 @@
 //!
 //! 一张卡片只由它所属这一轮的执行任务更新；按钮回调只回 toast。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::alert::Alerts;
 use crate::answer::{self, Reply as AnswerReply};
 use crate::context;
+use crate::knowledge;
 use crate::oauth::{Access, Oauth};
 use crate::prompt::{self, Prior};
 use crate::render::card::{self, Footer};
@@ -45,7 +46,7 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const STALL_AFTER: Duration = Duration::from_secs(90);
 /// 进度卡上的阶段。
 const PHASE_READING: &str = "📥 正在读取上下文…";
-const PHASE_STARTING: &str = "🚀 正在启动 Claude";
+const PHASE_STARTING: &str = "🚀 正在启动分析";
 const PHASE_THINKING: &str = "💭 思考中";
 const PHASE_WRITING: &str = "✍️ 正在输出";
 const PHASE_TOOL: &str = "🔧 调用工具中";
@@ -93,6 +94,7 @@ pub struct Runner {
     /// 按名字（会话绑定的 `backend`）找后端。
     backends: HashMap<String, Arc<dyn AgentBackend>>,
     settings: Settings,
+    known_issues: knowledge::Index,
     slots: Arc<Semaphore>,
     bot_open_id: Arc<OnceLock<String>>,
     /// 以提问人的身份读云文档；没配就不读。
@@ -139,6 +141,8 @@ struct Attempt {
     stopped: bool,
     /// 从启动进程算起，各阶段开始的时刻：慢的时候看得出慢在哪一段。
     timings: Timings,
+    /// 本轮成功读取正文的 Confluence 页面，供索引回存核对来源。
+    read_pages: HashSet<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -197,18 +201,15 @@ struct Screen<'a> {
     read: &'a [String],
     started_at: Instant,
     stop: &'a CancellationToken,
+    model: Option<&'a str>,
+    effort: Option<Effort>,
+    codex: bool,
 }
 
 /// 分析过程中进度卡上会变的部分。
 #[derive(Default)]
 struct Live<'a> {
     steps: &'a [String],
-    /// 模型最近一次说明的进展。
-    thought: Option<&'a str>,
-    /// 正在写的结论里已经写完的概述。
-    draft: Option<&'a str>,
-    /// 已经写完的关键命令。
-    commands: &'a [answer::Command],
     notes: &'a [String],
 }
 
@@ -218,12 +219,12 @@ impl Screen<'_> {
             question: self.preview,
             read: self.read,
             steps: live.steps,
-            thought: live.thought,
-            draft: live.draft,
-            commands: live.commands,
             elapsed: self.started_at.elapsed(),
             notes: live.notes,
             stop: stoppable.then_some(self.spec.turn_id.as_str()),
+            model: self.codex.then(|| self.model.unwrap_or("CLI 默认")),
+            effort: self.effort.map(|e| e.as_str()),
+            configure: self.codex.then_some(self.spec.turn_id.as_str()),
         })
     }
 }
@@ -247,6 +248,7 @@ impl Runner {
             api,
             store,
             backends,
+            known_issues: knowledge::Index::new(&settings.data_dir),
             settings,
             slots: Arc::new(Semaphore::new(max_concurrent.max(1))),
             bot_open_id,
@@ -275,6 +277,38 @@ impl Runner {
         self
     }
 
+    /// 当前会话的覆盖值优先于服务默认配置。
+    pub fn model<'a>(&'a self, conversation: &'a Conversation) -> Option<&'a str> {
+        conversation
+            .model_override
+            .as_deref()
+            .or(self.settings.model.as_deref())
+    }
+
+    pub fn effort(&self, conversation: &Conversation) -> Option<Effort> {
+        conversation
+            .effort_override
+            .as_deref()
+            .and_then(Effort::parse)
+            .or(self.settings.effort)
+            .or_else(|| (conversation.backend == "codex").then_some(Effort::High))
+    }
+
+    async fn snapshot_model(&self, spec: &TurnSpec, conversation: &Conversation) {
+        if conversation.backend == "codex"
+            && let Err(err) = self
+                .store
+                .set_turn_model_options(
+                    &spec.turn_id,
+                    self.model(conversation),
+                    self.effort(conversation).map(|e| e.as_str()),
+                )
+                .await
+        {
+            tracing::warn!("{err:#}");
+        }
+    }
+
     /// 执行一轮，直到它结束（完成、失败、被停止或取消）。
     pub async fn run_turn(&self, spec: TurnSpec, mut control: TurnControl) {
         let started_at = Instant::now();
@@ -289,6 +323,7 @@ impl Runner {
                 return;
             }
         };
+        self.snapshot_model(&spec, &conversation).await;
         let (reply_to, preview) = match spec.kind {
             TurnKind::Ask => match self.first_input(&spec.turn_id).await {
                 Ok((first_id, first)) => {
@@ -331,6 +366,10 @@ impl Runner {
             read: &read,
             notes: &notes,
             stop,
+            model: (conversation.backend == "codex")
+                .then(|| self.model(&conversation).unwrap_or("CLI 默认")),
+            effort: self.effort(&conversation).map(|e| e.as_str()),
+            configure: (conversation.backend == "codex").then_some(spec.turn_id.as_str()),
             ..card::Progress::default()
         });
         let Some(card_id) = self.open_card(&spec, &reply_to, &opening).await else {
@@ -364,6 +403,10 @@ impl Runner {
                     elapsed: started_at.elapsed(),
                     notes: &["排队中，其他会话的问题完成后开始".to_owned()],
                     stop,
+                    model: (conversation.backend == "codex")
+                        .then(|| self.model(&conversation).unwrap_or("CLI 默认")),
+                    effort: self.effort(&conversation).map(|e| e.as_str()),
+                    configure: (conversation.backend == "codex").then_some(spec.turn_id.as_str()),
                     ..card::Progress::default()
                 });
                 self.update(&card_id, &waiting).await;
@@ -390,7 +433,8 @@ impl Runner {
                 conversation
             }
         };
-        let report = match spec.kind {
+        self.snapshot_model(&spec, &conversation).await;
+        let mut report = match spec.kind {
             TurnKind::Ask => {
                 self.analyse(
                     &spec,
@@ -415,6 +459,21 @@ impl Runner {
             }
         };
         drop(permit);
+        if report.model.is_empty() {
+            report.model = self.model(&conversation).unwrap_or_default().to_owned();
+        }
+        if conversation.backend == "codex" && report.status != TurnStatus::Succeeded {
+            report.card = card::with_model(
+                report.card,
+                if report.model.is_empty() {
+                    "CLI 默认"
+                } else {
+                    &report.model
+                },
+                self.effort(&conversation).map(|e| e.as_str()),
+                Some(&spec.turn_id),
+            );
+        }
         self.record(&spec, &conversation, &report, started_at).await;
         if !self.update_final(&card_id, &report.card).await {
             // 图表、图片被飞书拒收也不能让进度卡一直挂着：去掉它们再送一次
@@ -424,8 +483,7 @@ impl Runner {
             }
         }
         if report.status == TurnStatus::Succeeded {
-            self.send_files(&card_id, &conversation, report.answer_json.as_deref())
-                .await;
+            self.send_download_files(&card_id, report.answer_json.as_deref()).await;
         }
         if spec.kind == TurnKind::Ask && report.status == TurnStatus::Succeeded {
             self.mark_superseded(&spec, &conversation, report.answer_json.as_deref())
@@ -434,57 +492,79 @@ impl Runner {
         self.alert(&report).await;
     }
 
-    /// 答案附带的文件（脚本、报告、导出的数据）：上传后作为文件消息回复在答案卡下面。
-    /// 发不出去的回一句原因，免得提问人以为没有附件。
-    async fn send_files(
-        &self,
-        card_id: &str,
-        conversation: &Conversation,
-        answer_json: Option<&str>,
-    ) {
+    /// 将交付文件读取成原答案中的折叠行，错误也留在同一张卡片里。
+    async fn prepare_files(&self, answer: &mut answer::Answer, workdir: &Path) {
+        answer.file_views.clear();
+        let mut seen = HashSet::new();
+        for path in answer
+            .files
+            .iter()
+            .filter(|path| seen.insert(*path))
+            .take(MAX_FILES)
+        {
+            let mut view = answer::AnswerFile {
+                name: Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone()),
+                body: None,
+                download_url: None,
+                file_key: None,
+                note: None,
+            };
+            match workdir_file(workdir, path, MAX_FILE_BYTES).await {
+                Ok((name, bytes)) => {
+                    view.name = name;
+                    if let Some(text) = context::extract::readable_text(&view.name, &bytes) {
+                        let (text, clipped) = context::extract::clip_bytes(&text, 16 * 1024);
+                        if clipped {
+                            view.note = Some("文件较长，当前展示开头预览。".into());
+                        }
+                        view.body = Some(if view.name.ends_with(".md") {
+                            text
+                        } else {
+                            let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+                            let fence = "`".repeat((longest + 1).max(3));
+                            format!("{fence}\n{text}\n{fence}")
+                        });
+                    } else {
+                        match self.api.upload_file(&view.name, bytes).await {
+                            Ok(key) => {
+                                view.file_key = Some(key);
+                                view.note = Some("文件无法直接预览，原文件见下方附件，可点击下载。".into());
+                            }
+                            Err(err) => view.note = Some(format!("附件上传失败：{err}")),
+                        }
+                    }
+                }
+                Err(reason) => view.note = Some(format!("附件无法读取：{reason}")),
+            }
+            answer.file_views.push(view);
+        }
+    }
+
+    /// 卡片内下载入口接通前，二进制文件保留原有文件消息下载方式。
+    async fn send_download_files(&self, card_id: &str, answer_json: Option<&str>) {
         let Some(answer) =
             answer_json.and_then(|json| serde_json::from_str::<answer::Answer>(json).ok())
         else {
             return;
         };
-        let workdir = self
-            .settings
-            .data_dir
-            .join("sessions")
-            .join(&conversation.id);
-        for path in answer.files.iter().take(MAX_FILES) {
-            let uploaded = match workdir_file(&workdir, path, MAX_FILE_BYTES).await {
-                Ok((name, bytes)) => self
-                    .api
-                    .upload_file(&name, bytes)
-                    .await
-                    .map_err(|err| format!("上传失败：{err}")),
-                Err(reason) => Err(reason),
-            };
-            let reply = match &uploaded {
-                Ok(file_key) => Reply {
-                    message_id: card_id,
-                    msg_type: "file",
-                    content: serde_json::json!({ "file_key": file_key }).to_string(),
-                    reply_in_thread: false,
-                    uuid: idempotency_key("file", file_key),
-                },
-                Err(reason) => {
-                    tracing::warn!(%reason, conversation = %conversation.id, "答案附带的文件发不出去");
-                    Reply {
-                        message_id: card_id,
-                        msg_type: "text",
-                        content: serde_json::json!({
-                            "text": format!("附件 {path} 没有发出：{reason}")
-                        })
-                        .to_string(),
-                        reply_in_thread: false,
-                        uuid: idempotency_key("file-error", &format!("{card_id}/{path}")),
-                    }
-                }
+        for file in answer
+            .file_views
+            .iter()
+            .filter(|file| file.download_url.is_none())
+        {
+            let Some(key) = &file.file_key else { continue };
+            let reply = Reply {
+                message_id: card_id,
+                msg_type: "file",
+                content: serde_json::json!({ "file_key": key }).to_string(),
+                reply_in_thread: false,
+                uuid: idempotency_key("file", key),
             };
             if let Err(err) = self.api.reply(reply).await {
-                tracing::warn!(%err, "回复附件失败");
+                tracing::warn!(%err, file = %file.name, "回复下载附件失败");
             }
         }
     }
@@ -530,6 +610,13 @@ impl Runner {
         // 旧卡片上不再放输入框：以最新的回复为准
         let footer = Footer {
             turn: u32::try_from(previous.seq).unwrap_or(u32::MAX),
+            model: previous.reasoning_effort.as_ref().map(|_| {
+                previous
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "CLI 默认".to_owned())
+            }),
+            effort: previous.reasoning_effort.clone(),
             elapsed: Duration::from_millis(
                 u64::try_from(previous.duration_ms.unwrap_or(0)).unwrap_or(0),
             ),
@@ -644,6 +731,9 @@ impl Runner {
             read: &reading,
             started_at,
             stop,
+            model: self.model(conversation),
+            effort: self.effort(conversation),
+            codex: conversation.backend == "codex",
         };
         let gathering = Instant::now();
         let context = self
@@ -680,7 +770,7 @@ impl Runner {
         {
             tracing::warn!("{err:#}");
         }
-        let (session, prompt, transcript) = match &resume {
+        let (session, materials, transcript) = match &resume {
             Some(session_id) => {
                 let (prompt, appended) = prompt::follow_up(&context, spec.seq);
                 (
@@ -710,7 +800,10 @@ impl Runner {
                 (SessionRef::New, prompt, Transcript::Replace(transcript))
             }
         };
-        if let Err(err) = write_transcript(&workdir, &transcript) {
+        let material_name = format!("turn-{}.md", spec.seq);
+        if let Err(err) = write_transcript(&workdir, &transcript)
+            .and_then(|()| write_materials(&workdir, &material_name, &materials))
+        {
             let reason = format!("{err}");
             return Report::early(
                 card::failure("❌ 准备工作目录失败", &reason, "查看服务日志", retry),
@@ -722,6 +815,7 @@ impl Runner {
         let cursor = context.newest_ms;
         let mut resumed = resume.is_some();
         let images = absolute_images(&workdir, &context);
+        let prompt = prompt::request(&context, spec.seq);
         let ((), mut attempt) = tokio::join!(
             self.update(card_id, &read_card),
             self.attempt(&*backend, &screen, &workdir, session, prompt, images, 1),
@@ -739,7 +833,21 @@ impl Runner {
             // 不再从飞书重拉、重发：告诉新会话去哪里查，只给本轮新增的
             tracing::warn!(conversation = %conversation.id, "会话续接不上，新开会话，之前的上下文让它从工作目录读");
             let prior = self.priors(conversation, spec.seq).await;
-            let prompt = prompt::recovered(&context, &prior, prompt::Handoff::Lost);
+            let materials = prompt::recovered(&context, &prior, prompt::Handoff::Lost);
+            if let Err(err) = write_materials(&workdir, &material_name, &materials) {
+                return Report::early(
+                    card::failure(
+                        "❌ 准备补充资料失败",
+                        &err.to_string(),
+                        "查看服务日志",
+                        retry,
+                    ),
+                    TurnStatus::Failed,
+                    "workdir",
+                    err.to_string(),
+                );
+            }
+            let prompt = prompt::request(&context, spec.seq);
             resumed = false;
             let images = absolute_images(&workdir, &context);
             attempt = self
@@ -850,8 +958,11 @@ impl Runner {
             read: &[],
             started_at,
             stop,
+            model: self.model(conversation),
+            effort: self.effort(conversation),
+            codex: conversation.backend == "codex",
         };
-        let (session, prompt, mut resumed) = match &conversation.agent_session_id {
+        let (session, materials, mut resumed) = match &conversation.agent_session_id {
             Some(session_id) => (
                 SessionRef::Resume(session_id.clone()),
                 prompt::resolve(),
@@ -863,6 +974,24 @@ impl Runner {
                 false,
             ),
         };
+        let material_name = format!("closure-{}.md", spec.seq);
+        if let Err(err) = write_materials(&workdir, &material_name, &materials) {
+            return Report::early(
+                card::failure(
+                    "❌ 准备补充资料失败",
+                    &err.to_string(),
+                    "查看服务日志",
+                    Some(&spec.turn_id),
+                ),
+                TurnStatus::Failed,
+                "workdir",
+                err.to_string(),
+            );
+        }
+        let prompt = format!(
+            "{}\n相关资料：context/{material_name}（按需读取）。",
+            prompt::resolve()
+        );
         let mut attempt = self
             .attempt(&*backend, &screen, &workdir, session, prompt, Vec::new(), 1)
             .await;
@@ -875,7 +1004,24 @@ impl Runner {
         );
         if resumed && lost && !attempt.stopped {
             tracing::warn!(conversation = %conversation.id, "会话续接不上，用前几轮的结论生成闭环方案");
-            let prompt = prompt::resolve_fresh(&self.priors(conversation, spec.seq).await);
+            let materials = prompt::resolve_fresh(&self.priors(conversation, spec.seq).await);
+            if let Err(err) = write_materials(&workdir, &material_name, &materials) {
+                return Report::early(
+                    card::failure(
+                        "❌ 准备补充资料失败",
+                        &err.to_string(),
+                        "查看服务日志",
+                        Some(&spec.turn_id),
+                    ),
+                    TurnStatus::Failed,
+                    "workdir",
+                    err.to_string(),
+                );
+            }
+            let prompt = format!(
+                "{}\n相关资料：context/{material_name}（按需读取）。",
+                prompt::resolve()
+            );
             resumed = false;
             attempt = self
                 .attempt(
@@ -926,6 +1072,10 @@ impl Runner {
                 card_message_id: Some(card_id.to_owned()),
                 answer_json: report.answer_json.clone(),
                 writeback_targets: Some(targets_json),
+                model: Some(report.model.clone()),
+                reasoning_effort: (conversation.backend == "codex")
+                    .then(|| self.effort(conversation).map(|e| e.as_str().to_owned()))
+                    .flatten(),
                 duration_ms: Some(
                     i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
                 ),
@@ -1161,17 +1311,32 @@ impl Runner {
             .data_dir
             .join("run")
             .join(format!("{turn_id}-{n}"));
+        let index = match self.known_issues.prepare(workdir).await {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(%err, "准备已知问题索引失败，本轮直接查询原始资料");
+                None
+            }
+        };
+        let mut rules = prompt::rules(self.knowledge(workdir).await.as_deref());
+        if index.is_some() {
+            rules.push_str(knowledge::RULES);
+        } else {
+            rules.push_str(
+                "\n本轮已知问题索引不可用，请直接查询原始资料，不使用或更新以前轮次的索引副本。",
+            );
+        }
         let request = TurnRequest {
             session,
             prompt,
             workdir: workdir.to_path_buf(),
             run_dir: run_dir.clone(),
             images,
-            rules: prompt::rules(self.knowledge().await.as_deref()),
+            rules,
             schema: answer::schema().clone(),
             mcp_servers: self.settings.mcp_servers.clone(),
-            model: self.settings.model.clone(),
-            effort: self.settings.effort,
+            model: screen.model.map(str::to_owned),
+            effort: screen.effort,
             timeout: self.settings.timeout,
             budget_usd_micros: self.settings.budget_usd_micros,
         };
@@ -1180,6 +1345,8 @@ impl Runner {
                 tracing::info!(
                     turn = %turn_id,
                     session = handle.session_id.as_deref().unwrap_or_default(),
+                    model = screen.model.unwrap_or("CLI 默认"),
+                    effort = screen.effort.map(|effort| effort.as_str()).unwrap_or("后端默认"),
                     "开始分析"
                 );
                 self.follow(handle, screen).await
@@ -1189,15 +1356,34 @@ impl Runner {
                     kind: FailKind::Cli,
                     reason: format!("启动失败：{err}"),
                 },
-                model: self.settings.model.clone().unwrap_or_default(),
+                model: screen.model.unwrap_or_default().to_owned(),
                 tool_calls: 0,
                 usage: None,
                 self_check: None,
                 session_id: None,
                 stopped: false,
                 timings: Timings::default(),
+                read_pages: HashSet::new(),
             },
         };
+        if let Some(before) = index
+            && !attempt.stopped
+            && attempt.self_check.is_none()
+            && let Some(AnswerReply::Structured(answer)) = answer::reply_of(&attempt.outcome)
+        {
+            let confirmed = answer.status == answer::Status::Answered
+                && answer.confidence == answer::Confidence::High
+                && answer.open_questions.is_empty();
+            match self
+                .known_issues
+                .save(workdir, &before, confirmed, &attempt.read_pages)
+                .await
+            {
+                Ok(true) => tracing::info!(turn = %turn_id, "已更新本地已知问题索引"),
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%err, turn = %turn_id, "本轮索引变更未回存"),
+            }
+        }
         // 本轮生成的 MCP、hook 配置用完即删
         if let Err(err) = tokio::fs::remove_dir_all(&run_dir).await
             && err.kind() != std::io::ErrorKind::NotFound
@@ -1207,11 +1393,17 @@ impl Runner {
         attempt
     }
 
-    /// 环境速查的内容：每轮读一次，改了文件不用重启。读不到就不带，照常分析。
-    async fn knowledge(&self) -> Option<String> {
+    /// 环境资料保存到工作目录，模型按需读取；请求里只保留文件指引。
+    async fn knowledge(&self, workdir: &Path) -> Option<String> {
         let path = self.settings.knowledge_file.as_ref()?;
         match tokio::fs::read_to_string(path).await {
-            Ok(text) => Some(text),
+            Ok(text) => match write_materials(workdir, "knowledge.md", &text) {
+                Ok(()) => Some(text),
+                Err(err) => {
+                    tracing::warn!(%err, "保存环境资料失败，这一轮不带");
+                    None
+                }
+            },
             Err(err) => {
                 tracing::warn!(%err, path = %path.display(), "读不到环境速查，这一轮不带");
                 None
@@ -1231,19 +1423,18 @@ impl Runner {
         let spawned = Instant::now();
         let mut result = Attempt {
             outcome: Outcome::Interrupted,
-            model: self.settings.model.clone().unwrap_or_default(),
+            model: screen.model.unwrap_or_default().to_owned(),
             tool_calls: 0,
             usage: None,
             self_check: None,
             session_id: None,
             stopped: false,
             timings: Timings::default(),
+            read_pages: HashSet::new(),
         };
         let mut steps: Vec<String> = Vec::new();
+        let mut page_reads: HashMap<String, String> = HashMap::new();
         let mut notes: Vec<String> = Vec::new();
-        let mut thought: Option<String> = None;
-        let mut draft: Option<String> = None;
-        let mut draft_commands: Vec<answer::Command> = Vec::new();
         let mut dirty = false;
         let mut phase = PHASE_STARTING;
         let mut last_output = Instant::now();
@@ -1292,35 +1483,36 @@ impl Runner {
                             }
                         }
                         AgentEvent::Step(step) => {
+                            match &step {
+                                Step::ToolCall { id, tool, input }
+                                    if tool.ends_with("confluence_page") && input["action"] == "get" => {
+                                    if let Some(page) = input["page_id"].as_str() {
+                                        page_reads.insert(id.clone(), page.to_owned());
+                                    }
+                                }
+                                Step::ToolDone { id, ok, .. } => {
+                                    if let Some(page) = page_reads.remove(id) && *ok {
+                                        result.read_pages.insert(page);
+                                    }
+                                }
+                                Step::Denied { id, .. } => {
+                                    page_reads.remove(id);
+                                }
+                                _ => {}
+                            }
                             if matches!(step, ai_boot_agent::Step::ToolCall { .. }) {
                                 result.tool_calls += 1;
                             }
                             if let ai_boot_agent::Step::RateLimited { resets_at, .. } = &step {
                                 notes.push(rate_limit_note(*resets_at));
                             }
-                            // 模型在工具调用之间说的进展，比工具名更能让人判断要不要等
-                            if let ai_boot_agent::Step::Text(text) = &step {
-                                thought = Some(text.clone());
-                                dirty = true;
-                            }
                             if let Some(label) = steps::label(&step) {
                                 steps.push(label);
                                 dirty = true;
                             }
                         }
-                        AgentEvent::Draft(ai_boot_agent::Draft { summary, commands, .. }) => {
-                            if summary.is_some() {
-                                draft = summary;
-                                dirty = true;
-                            }
-                            // 对不上契约的命令不显示，等最终答案
-                            if let Some(commands) = commands
-                                .and_then(|raw| serde_json::from_value::<Vec<answer::Command>>(raw).ok())
-                            {
-                                draft_commands = commands;
-                                dirty = true;
-                            }
-                        }
+                        // 只有成功终态的答案才能展示，避免用户执行随后可能被改写的草稿命令。
+                        AgentEvent::Draft(_) => {}
                         AgentEvent::Usage(usage) => result.usage = Some(usage),
                         AgentEvent::Finished(outcome) => {
                             result.outcome = outcome;
@@ -1359,12 +1551,12 @@ impl Runner {
                         shown.extend(notes.iter().cloned());
                         let live = Live {
                             steps: &steps,
-                            thought: thought.as_deref(),
-                            draft: draft.as_deref(),
-                            commands: &draft_commands,
                             notes: &shown,
                         };
-                        let progress = screen.progress(&live, !result.stopped);
+                        let progress = Screen {
+                            model: if result.model.is_empty() { screen.model } else { Some(&result.model) },
+                            ..*screen
+                        }.progress(&live, !result.stopped);
                         self.update(screen.card_id, &progress).await;
                     }
                 }
@@ -1385,7 +1577,7 @@ impl Runner {
         cursor: Option<i64>,
         elapsed: Duration,
     ) -> Report {
-        // 后端报的是会话累计用量：续接的会话减去上一轮末的累计值，新会话从 0 算
+        // Claude 报会话累计用量，Codex exec 报本轮用量。
         let cumulative = attempt
             .usage
             .map(|u| i64::try_from(u.input_tokens + u.output_tokens).unwrap_or(i64::MAX));
@@ -1393,6 +1585,11 @@ impl Runner {
             conversation.session_tokens
         } else {
             0
+        };
+        let cumulative = if conversation.backend == "codex" {
+            cumulative.map(|total| total.saturating_add(previous))
+        } else {
+            cumulative
         };
         let tokens = match cumulative {
             Some(total) if total >= previous => total - previous,
@@ -1405,6 +1602,15 @@ impl Runner {
             elapsed,
             follow_up: (spec.kind == TurnKind::Ask).then(|| spec.turn_id.clone()),
             asked: asked.map(str::to_owned),
+            model: (conversation.backend == "codex").then(|| {
+                if attempt.model.is_empty() {
+                    "CLI 默认".to_owned()
+                } else {
+                    attempt.model.clone()
+                }
+            }),
+            effort: self.effort(conversation).map(|e| e.as_str().to_owned()),
+            configure: (conversation.backend == "codex").then(|| spec.turn_id.clone()),
             ..Footer::default()
         };
         let retry = Some(spec.turn_id.as_str());
@@ -1427,6 +1633,7 @@ impl Runner {
                 Outcome::Success { .. } => match answer::reply_of(&attempt.outcome) {
                     Some(AnswerReply::Structured(mut answer)) => {
                         self.prepare_visuals(&mut answer, workdir).await;
+                        self.prepare_files(&mut answer, workdir).await;
                         answer_json = serde_json::to_string(&answer).ok();
                         (
                             card::answer(&answer, &footer, &links),
@@ -1628,7 +1835,7 @@ impl Runner {
         card_id: &str,
         started_at: Instant,
     ) {
-        let report = Report::early(
+        let mut report = Report::early(
             card::failure(
                 "⏹ 已取消",
                 "这一轮在开始前被取消。",
@@ -1639,6 +1846,15 @@ impl Runner {
             "cancelled",
             "开始前被取消".to_owned(),
         );
+        if conversation.backend == "codex" {
+            report.model = self.model(conversation).unwrap_or_default().to_owned();
+            report.card = card::with_model(
+                report.card,
+                self.model(conversation).unwrap_or("CLI 默认"),
+                self.effort(conversation).map(|e| e.as_str()),
+                Some(&spec.turn_id),
+            );
+        }
         self.record(spec, conversation, &report, started_at).await;
         self.update_final(card_id, &report.card).await;
     }
@@ -1655,6 +1871,9 @@ impl Runner {
             conversation_id: &conversation.id,
             status: report.status,
             model: &report.model,
+            reasoning_effort: (conversation.backend == "codex")
+                .then(|| self.effort(conversation).map(|e| e.as_str()))
+                .flatten(),
             answer_json: report.answer_json.as_deref(),
             error_kind: report.error_kind,
             error: report.error.as_deref(),
@@ -1766,8 +1985,18 @@ impl Runner {
     pub async fn mark_interrupted(&self, turns: Vec<InterruptedTurn>) {
         for turn in turns {
             if let Some(card_id) = turn.card_message_id {
-                let card =
+                let mut card =
                     card::failure("⏹ 已中断", "服务重启，这一轮没有完成。", "", Some(&turn.id));
+                if let Ok(Some(record)) = self.store.turn_record(&turn.id).await
+                    && record.reasoning_effort.is_some()
+                {
+                    card = card::with_model(
+                        card,
+                        record.model.as_deref().unwrap_or("CLI 默认"),
+                        record.reasoning_effort.as_deref(),
+                        Some(&turn.id),
+                    );
+                }
                 self.update_final(&card_id, &card).await;
             }
         }
@@ -2046,6 +2275,12 @@ fn write_transcript(workdir: &Path, transcript: &Transcript) -> std::io::Result<
             .open(path)?
             .write_all(text.as_bytes()),
     }
+}
+
+fn write_materials(workdir: &Path, name: &str, text: &str) -> std::io::Result<()> {
+    let dir = workdir.join("context");
+    prepare_dir(&dir)?;
+    std::fs::write(dir.join(name), text)
 }
 
 /// 同一轮的同一种回复，重试时用同一个 uuid：飞书保证 1 小时内只成功一次。

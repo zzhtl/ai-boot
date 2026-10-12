@@ -456,6 +456,14 @@ pub fn closure_card(
     let footer = Footer {
         turn: u32::try_from(record.seq).unwrap_or(u32::MAX),
         hint: "写回前会弹窗确认",
+        model: record.reasoning_effort.as_ref().map(|_| {
+            record
+                .model
+                .clone()
+                .unwrap_or_else(|| "CLI 默认".to_owned())
+        }),
+        effort: record.reasoning_effort.clone(),
+        configure: record.reasoning_effort.as_ref().map(|_| record.id.clone()),
         elapsed: Duration::from_millis(u64::try_from(record.duration_ms.unwrap_or(0)).unwrap_or(0)),
         ..Footer::default()
     };

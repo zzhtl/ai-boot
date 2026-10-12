@@ -46,6 +46,13 @@ const TASK_WAIT: Duration = Duration::from_secs(1);
 /// 逐行解码 CLI 的 JSONL 输出。
 pub(crate) trait Decode: Send + 'static {
     fn line(&mut self, line: &str) -> Vec<AgentEvent>;
+
+    fn abnormal_exit(&self, reason: String) -> Outcome {
+        Outcome::Failed {
+            kind: FailKind::Cli,
+            reason,
+        }
+    }
 }
 
 pub(crate) struct ProcessSpec {
@@ -179,8 +186,8 @@ async fn drive(
                     interrupt(pid);
                     grace_end.as_mut().reset(tokio::time::Instant::now() + spec.stop_grace);
                 }
-                // 没人收事件了：不等下一行输出才发现，立刻让 CLI 停下
-                () = tx.closed(), if running(&stop, &exited) => {
+                // 未完成时接收端消失才中断；终态后让 CLI 正常退出并 flush 遥测。
+                () = tx.closed(), if running(&stop, &exited) && !terminal_sent => {
                     stop = Some(Stop::Cancelled);
                     interrupt(pid);
                     grace_end.as_mut().reset(tokio::time::Instant::now() + spec.stop_grace);
@@ -254,10 +261,7 @@ async fn drive(
     if !terminal_sent {
         let reason = abnormal_exit_reason(status, &tail);
         let _ = tx
-            .send(AgentEvent::Finished(Outcome::Failed {
-                kind: FailKind::Cli,
-                reason,
-            }))
+            .send(AgentEvent::Finished(decoder.abnormal_exit(reason)))
             .await;
     }
 }

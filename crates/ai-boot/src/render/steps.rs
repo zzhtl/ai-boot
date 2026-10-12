@@ -63,24 +63,42 @@ fn tool_label(tool: &str, input: &Value) -> String {
                 _ => format!("💻 GitLab {project}：{}", escape(action)),
             }
         }
+        "gitlab_project" if action == "create_branch" => format!(
+            "🌿 创建分支 {}：{}（基线 {}）",
+            arg("project").unwrap_or_default(),
+            arg("branch").unwrap_or_default(),
+            arg("from_ref").unwrap_or_default()
+        ),
         "gitlab_project" => format!(
             "💻 GitLab 项目 {}",
             arg("project").or_else(|| arg("search")).unwrap_or_default()
         ),
-        "gitlab_mr" => format!("🔀 MR {}", arg("project").unwrap_or_default()),
+        "gitlab_mr" => {
+            let stage = match action {
+                "create" => "创建 MR",
+                "update" => "更新 MR",
+                "changes" => "核对 MR 差异",
+                _ => "查询 MR",
+            };
+            format!("🔀 {stage} {}", arg("project").unwrap_or_default())
+        }
         "gitlab_pipeline" => format!("🚦 流水线 {}", arg("project").unwrap_or_default()),
         "jenkins_job" => format!(
             "🏗 Jenkins 任务 {}",
             arg("job").or_else(|| arg("search")).unwrap_or_default()
         ),
-        "jenkins_build" => match arg("build") {
-            Some(build) => format!("🏗 Jenkins 构建 {} #{build}", arg("job").unwrap_or_default()),
-            None => format!(
-                "🏗 Jenkins 构建 {}：{}",
-                arg("job").unwrap_or_default(),
-                escape(action)
-            ),
-        },
+        "jenkins_build" => {
+            let stage = match action {
+                "trigger" => "触发构建",
+                "get" => "核对构建状态",
+                "log" => "查看构建日志",
+                "queue" => "查询构建队列",
+                "stop" => "停止构建",
+                _ => "查询构建",
+            };
+            let build = arg("build").map(|b| format!(" #{b}")).unwrap_or_default();
+            format!("🏗 {stage} {}{build}", arg("job").unwrap_or_default())
+        }
         "Read" => format!(
             "📄 阅读 {}",
             input
@@ -224,8 +242,33 @@ mod tests {
                 json!({"action": "log", "job": "team/app-build", "build": "lastFailedBuild"})
             )
             .as_deref(),
-            Some("🏗 Jenkins 构建 team/app-build #lastFailedBuild")
+            Some("🏗 查看构建日志 team/app-build #lastFailedBuild")
         );
+    }
+
+    #[test]
+    fn engineering_progress_distinguishes_writes_from_queries() {
+        let branch = call(
+            "mcp__qtmcp__gitlab_project",
+            json!({"action": "create_branch", "project": "team/app", "branch": "fix/ABC-1", "from_ref": "abc1234"}),
+        )
+        .expect("分支进度");
+        assert!(branch.contains("创建分支") && branch.contains("基线 abc1234"));
+        let input = json!({"action": "create", "project": "team/<app>"});
+        let created = call("mcp__qtmcp__gitlab_mr", input).expect("MR 进度");
+        assert!(created.contains("创建 MR") && !created.contains('<'));
+        let triggered = call(
+            "mcp__qtmcp__jenkins_build",
+            json!({"action": "trigger", "job": "team/package"}),
+        )
+        .expect("构建进度");
+        assert!(triggered.contains("触发构建"));
+        let checked = call(
+            "mcp__qtmcp__jenkins_build",
+            json!({"action": "get", "job": "team/package", "build": "42"}),
+        )
+        .expect("构建进度");
+        assert!(checked.contains("核对构建状态") && checked.ends_with("#42"));
     }
 
     #[test]

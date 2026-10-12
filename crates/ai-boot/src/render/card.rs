@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use ai_boot_agent::Effort;
 use serde_json::{Value, json};
 
 use super::markdown::{LinkPolicy, escape, render};
@@ -18,6 +19,8 @@ const SUMMARY_CHARS: usize = 600;
 const SECTION_CHARS: usize = 4000;
 const MAX_SECTIONS: usize = 8;
 const MAX_LIST_ITEMS: usize = 8;
+/// 影响结论的关键问题在命令前展示，其余折叠。
+const SHOWN_QUESTIONS: usize = 2;
 /// 露在外面的更正条数：多了就不「简洁」了，细节在正文里。
 const MAX_CORRECTIONS: usize = 3;
 /// 露在外面的关键命令条数，多出来的折叠；一张卡片最多放的命令。
@@ -29,12 +32,13 @@ const COMMAND_TITLE_CHARS: usize = 40;
 /// 规则要求 20 字、80 字以内；这里是兜底，留出余量免得把半句话截掉。
 const COMMAND_PLACE_CHARS: usize = 80;
 const COMMAND_LOOK_CHARS: usize = 160;
-/// 概述行首的标签和颜色：排查类的「根因 / 解决」，根因没确认时的「可能原因 / 下一步」。
-const LABELS: [(&str, &str); 4] = [
+/// 概述行首的通用标签和颜色；实际结论内容由模型生成。
+const LABELS: [(&str, &str); 5] = [
     ("根因", "red"),
     ("可能原因", "orange"),
     ("解决", "green"),
     ("下一步", "blue"),
+    ("结论", "blue"),
 ];
 /// 标签在渲染前换成这一段私用区字符，渲染后再换成 `text_tag`：正文照常转义，
 /// 卡片标签只能由我们生成。
@@ -42,9 +46,7 @@ const SENTINEL_BASE: u32 = 0xE000;
 const MIN_SECTION_CHARS: usize = 200;
 const TRUNCATED: &str = "\n\n…（内容过长，已截断）";
 /// 进度卡上露出的最近几步：卡片最后会换成答案，不必把过程全摆出来。
-const RECENT_STEPS: usize = 6;
-/// 进度卡上模型那句进展说明的长度上限。
-const THOUGHT_CHARS: usize = 120;
+const RECENT_STEPS: usize = 2;
 /// 一张卡片最多放的图片（截图和流程图合计）和图表；飞书建议图表不超过 5 个。
 pub const MAX_IMAGES: usize = 6;
 const MAX_CHARTS: usize = 5;
@@ -53,17 +55,21 @@ const MAX_CHART_SERIES: usize = 6;
 const LABEL_CHARS: usize = 40;
 
 /// 卡片上答案之外的部分：底部的轮次、用时，追问的输入框，以及卡片输入框里提的问题。
-/// 模型、token 这些是运维信息，看日志。
+/// Codex 卡片同时展示本轮模型、推理强度和会话设置入口。
 #[derive(Debug, Clone, Default)]
 pub struct Footer {
     pub turn: u32,
     /// 底部的补充说明（比如写回前会确认），空的不显示。
     pub hint: &'static str,
     pub elapsed: Duration,
-    /// 给了就在卡片底部放输入框（这一轮的 ID）：输入补充或纠正，回车发送。
+    /// 给了就在卡片底部放多行输入框（这一轮的 ID）：Enter 发送，Shift+Enter 换行。
     pub follow_up: Option<String>,
     /// 这一轮是在卡片输入框里问的，群里看不到这句话：显示在卡片顶上。
     pub asked: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// 当前会话的设置入口，旧答案被更正后只展示本轮配置。
+    pub configure: Option<String>,
 }
 
 impl Footer {
@@ -90,14 +96,18 @@ impl Footer {
         })
     }
 
-    /// 底部的输入框：点进去写补充或纠正，回车发送，接着这个会话问。
+    /// 底部的多行输入框：保留粘贴和键盘输入的换行，提交后接着这个会话问。
     fn input(&self) -> Option<Value> {
         let turn_id = self.follow_up.as_deref()?;
         Some(json!({
             "tag": "input",
             "element_id": "follow_up",
             "name": "follow_up",
-            "placeholder": { "tag": "plain_text", "content": "补充或纠正，回车发送" },
+            "placeholder": { "tag": "plain_text", "content": "补充或纠正，Enter 发送，Shift+Enter 换行" },
+            "input_type": "multiline_text",
+            "rows": 3,
+            "auto_resize": true,
+            "max_rows": 8,
             "width": "fill",
             "max_length": 1000,
             "behaviors": [{ "type": "callback", "value": Action::FollowUp.value(turn_id) }],
@@ -366,25 +376,13 @@ pub struct Progress<'a> {
     /// 读了什么、没读到什么，每行一条。
     pub read: &'a [String],
     pub steps: &'a [String],
-    /// 模型最近一次说明的进展（它在工具调用之间说的话）。
-    pub thought: Option<&'a str>,
-    /// 正在写的结论里已经写完的概述。
-    pub draft: Option<&'a str>,
-    /// 已经写完的关键命令（紧跟概述写出来）：详情还在写，人可以先动手。
-    pub commands: &'a [Command],
     pub elapsed: Duration,
     pub notes: &'a [String],
     /// 这一轮的 ID，给了就带「停止」按钮。
     pub stop: Option<&'a str>,
-}
-
-/// 进度卡上的概述还没定稿，链接等答案卡再按白名单放。
-struct NoLinks;
-
-impl LinkPolicy for NoLinks {
-    fn allows(&self, _url: &str) -> bool {
-        false
-    }
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub configure: Option<&'a str>,
 }
 
 /// 分析中。
@@ -393,12 +391,12 @@ pub fn progress(view: &Progress<'_>) -> Value {
         question,
         read,
         steps,
-        thought,
-        draft,
-        commands,
         elapsed,
         notes,
         stop,
+        model,
+        effort,
+        configure,
     } = *view;
     // 卡片引用着提问，副标题里也有，正文不再重复
     let mut elements = Vec::new();
@@ -409,24 +407,7 @@ pub fn progress(view: &Progress<'_>) -> Value {
             .collect();
         elements.push(markdown(lines.join("\n")));
     }
-    // 结论开始写了就只露结论：过程已经不重要了
-    if let Some(draft) = draft.filter(|d| !d.trim().is_empty()) {
-        elements.push(markdown("**结论（还在写详情）**".to_owned()));
-        elements.extend(summary_blocks(
-            &truncate(draft, SUMMARY_CHARS),
-            &NoLinks,
-            false,
-        ));
-        elements.extend(command_elements(commands, true));
-    } else {
-        if let Some(thought) = thought.filter(|t| !t.trim().is_empty()) {
-            elements.push(markdown(format!(
-                "💬 {}",
-                inline_within(thought, THOUGHT_CHARS)
-            )));
-        }
-        progress_steps(&mut elements, steps);
-    }
+    progress_steps(&mut elements, steps);
     let mut status = format!("⏱ 已用时 {}", human_duration(elapsed));
     for note in notes {
         status.push_str(" · ");
@@ -443,6 +424,7 @@ pub fn progress(view: &Progress<'_>) -> Value {
             Some(("停止这一轮分析？", "停止后可以在卡片上点重试。")),
         ));
     }
+    elements.extend(model_elements(model, effort, configure));
     card("⏳ 分析中", question, "wathet", elements)
 }
 
@@ -461,7 +443,7 @@ fn progress_steps(elements: &mut Vec<Value>, steps: &[String]) {
     elements.push(markdown(recent.join("\n")));
 }
 
-/// 结构化答案：顶上是概述和关键命令，详细内容全部折叠。
+/// 结构化答案：概述、关键待确认事项和命令直接可见，详细依据折叠。
 pub fn answer(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy) -> Value {
     answer_within(answer, footer, links, MAX_CARD_BYTES, false)
 }
@@ -590,8 +572,13 @@ fn answer_within(
         charts: true,
         extra_commands: true,
     };
+    let mut file_bodies: Vec<String> = answer
+        .file_views
+        .iter()
+        .map(|file| truncate(file.body.as_deref().unwrap_or_default(), SECTION_CHARS))
+        .collect();
     loop {
-        let built = build_answer(answer, &bodies, keep, footer, links, muted);
+        let built = build_answer(answer, &bodies, &file_bodies, keep, footer, links, muted);
         if serde_json::to_string(&built).map_or(0, |s| s.len()) <= budget {
             return built;
         }
@@ -599,6 +586,7 @@ fn answer_within(
         // 多余命令。概述、露在外面的命令和底部不动
         let longest = bodies
             .iter_mut()
+            .chain(file_bodies.iter_mut())
             .max_by_key(|body| body.chars().count())
             .filter(|body| body.chars().count() > MIN_SECTION_CHARS);
         match longest {
@@ -629,19 +617,28 @@ struct Room {
 fn build_answer(
     answer: &Answer,
     bodies: &[String],
+    file_bodies: &[String],
     keep: Keep,
     footer: &Footer,
     links: &dyn LinkPolicy,
     muted: bool,
 ) -> Value {
-    // 露在外面的只有概述、关键命令（和本轮的更正）：一眼看到什么问题、怎么解决、
-    // 先执行什么；其余全部折叠且默认收起，群里也不会刷屏
+    // 先看到结论和影响操作的关键问题，再看命令；依据和其余问题折叠。
     let mut elements: Vec<Value> = footer.asked_line().into_iter().collect();
     elements.extend(summary_blocks(
         &truncate(&answer.summary, SUMMARY_CHARS),
         links,
         muted,
     ));
+    if !answer.open_questions.is_empty() {
+        let items: Vec<String> = answer
+            .open_questions
+            .iter()
+            .take(SHOWN_QUESTIONS)
+            .map(|q| format!("- {}", inline(q)))
+            .collect();
+        elements.push(markdown(format!("**需要确认**\n{}", items.join("\n"))));
+    }
     elements.extend(command_elements(&answer.commands, keep.extra_commands));
     if !answer.corrections.is_empty() {
         let items: Vec<String> = answer
@@ -653,7 +650,7 @@ fn build_answer(
         elements.push(markdown(format!("**🔄 本轮更正**\n{}", items.join("\n"))));
     }
 
-    // 正文（根因、方案……）在前，其次是要对方补充的，再是冲突
+    // 折叠的正文、其余待确认事项和冲突。
     let mut room = Room {
         images: MAX_IMAGES,
         charts: if keep.charts { MAX_CHARTS } else { 0 },
@@ -664,14 +661,18 @@ fn build_answer(
         elements.push(panel(&section.title, false, inner));
     }
 
-    if !answer.open_questions.is_empty() {
+    if answer.open_questions.len() > SHOWN_QUESTIONS {
         let items: Vec<String> = answer
             .open_questions
             .iter()
+            .skip(SHOWN_QUESTIONS)
             .take(MAX_LIST_ITEMS)
             .map(|q| format!("- {}", inline(q)))
             .collect();
-        let title = format!("❓ 需要确认或补充（{}）", answer.open_questions.len());
+        let title = format!(
+            "其余待确认事项（{}）",
+            answer.open_questions.len() - SHOWN_QUESTIONS
+        );
         elements.push(panel(&title, false, vec![markdown(items.join("\n"))]));
     }
 
@@ -697,8 +698,35 @@ fn build_answer(
         elements.push(panel(&title, false, vec![markdown(items.join("\n"))]));
     }
 
+    for (file, body) in answer.file_views.iter().zip(file_bodies) {
+        let mut content = Vec::new();
+        if let Some(note) = &file.note {
+            content.push(markdown(escape(&redact(note))));
+        }
+        if !body.is_empty() {
+            content.extend(markdown_blocks(body, links));
+        }
+        if let Some(url) = &file.download_url {
+            content.push(json!({
+                "tag": "button", "type": "default", "size": "small",
+                "text": { "tag": "plain_text", "content": "下载附件" },
+                "behaviors": [{ "type": "open_url", "default_url": url }],
+            }));
+        }
+        if file.body.is_some() {
+            elements.push(panel(&file.name, false, content));
+        } else {
+            elements.push(markdown(format!("**📎 {}**", escape(&redact(&file.name)))));
+            elements.extend(content);
+        }
+    }
     elements.push(markdown(footer.line()));
     elements.extend(footer.input());
+    elements.extend(model_elements(
+        footer.model.as_deref(),
+        footer.effort.as_deref(),
+        footer.configure.as_deref(),
+    ));
     // 标题旁的标签只说结论到了哪一步，把握度只在不高的时候提。头部统一蓝色，状态的颜色
     // 只放在标签上：橙色头部、橙色标签、橙色行首标签叠在一起太刺眼
     let diagnosis = answer.kind == Kind::Diagnosis;
@@ -882,7 +910,66 @@ pub fn text_reply(text: &str, footer: &Footer, links: &dyn LinkPolicy) -> Value 
     elements.extend(markdown_blocks(&truncate(text, SECTION_CHARS * 2), links));
     elements.push(markdown(footer.line()));
     elements.extend(footer.input());
+    elements.extend(model_elements(
+        footer.model.as_deref(),
+        footer.effort.as_deref(),
+        footer.configure.as_deref(),
+    ));
     card("分析结果", "未按约定格式输出，按原文展示", "blue", elements)
+}
+
+/// 给提前结束的卡片补上本轮配置，仍可切换后重试。
+pub fn with_model(
+    mut card: Value,
+    model: &str,
+    effort: Option<&str>,
+    turn_id: Option<&str>,
+) -> Value {
+    if let Some(elements) = card["body"]["elements"].as_array_mut() {
+        elements.extend(model_elements(Some(model), effort, turn_id));
+    }
+    card
+}
+
+fn model_elements(model: Option<&str>, effort: Option<&str>, turn_id: Option<&str>) -> Vec<Value> {
+    let Some(model) = model else {
+        return Vec::new();
+    };
+    let mut elements = vec![markdown(format!(
+        "<font color='grey'>本轮模型：{} · 推理强度：{}</font>",
+        inline(model),
+        inline(effort.unwrap_or("未记录")),
+    ))];
+    if let Some(turn_id) = turn_id {
+        let mut controls = vec![
+            markdown(
+                "仅修改当前会话，下一轮或重试生效。立即重做可先切换，再停止、重试。".to_owned(),
+            ),
+            json!({
+                "tag": "input", "element_id": "model_input", "name": "model",
+                "placeholder": { "tag": "plain_text", "content": "输入模型名称，Enter 保存" },
+                "input_type": "text", "width": "fill", "max_length": 128,
+                "behaviors": [{ "type": "callback", "value": Action::Model { model: String::new() }.value(turn_id) }],
+            }),
+        ];
+        let columns: Vec<Value> = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
+            .into_iter().map(|level| json!({
+                "tag": "column", "width": "weighted", "weight": 1,
+                "elements": [button(level.as_str(), "default", &format!("effort_{}", level.as_str()),
+                    &Action::Effort(level), turn_id, None)],
+            })).collect();
+        controls.push(json!({ "tag": "column_set", "flex_mode": "flow", "columns": columns }));
+        controls.push(button(
+            "恢复默认模型和强度",
+            "default",
+            "reset_model",
+            &Action::ResetModel,
+            turn_id,
+            None,
+        ));
+        elements.push(panel("切换模型 / 推理强度", false, controls));
+    }
+    elements
 }
 
 /// 失败、超时、中断。`retry` 是这一轮的 ID，给了就带「重试」按钮。
@@ -1010,6 +1097,7 @@ mod tests {
             open_questions: vec![],
             references: vec![],
             files: vec![],
+            file_views: vec![],
             jira_keys: vec![],
             image_keys: Default::default(),
         }
@@ -1028,6 +1116,65 @@ mod tests {
     fn render_answer(answer: &Answer) -> Value {
         let hosts = vec!["jira.example.com".to_owned()];
         super::answer(answer, &footer(), &HostAllowlist(&hosts))
+    }
+
+    #[test]
+    fn text_files_are_collapsed_and_binary_downloads_are_in_the_same_card() {
+        let mut answer = answer_with(vec![]);
+        answer.file_views = vec![
+            crate::answer::AnswerFile {
+                name: "order-diagnosis.md".into(),
+                body: Some("**导航父子排序异常**".into()),
+                download_url: None,
+                file_key: None,
+                note: None,
+            },
+            crate::answer::AnswerFile {
+                name: "navigation.zip".into(),
+                body: None,
+                download_url: Some("https://downloads.example/navigation.zip".into()),
+                file_key: None,
+                note: None,
+            },
+        ];
+        let card = render_answer(&answer);
+        let elements = card["body"]["elements"].as_array().expect("卡片内容");
+        let file = elements
+            .iter()
+            .find(|element| element["tag"] == "collapsible_panel")
+            .expect("文本文件折叠行");
+        assert_eq!(file["expanded"], false);
+        assert!(file.to_string().contains("导航父子排序异常"));
+        let download = elements
+            .iter()
+            .find(|element| element["tag"] == "button")
+            .expect("二进制附件下载行");
+        assert_eq!(download["behaviors"][0]["type"], "open_url");
+        assert_eq!(
+            download["behaviors"][0]["default_url"],
+            "https://downloads.example/navigation.zip"
+        );
+        assert!(card.to_string().contains("navigation.zip"));
+    }
+
+    #[test]
+    fn file_previews_share_the_card_budget_and_keep_their_rows() {
+        let mut answer = answer_with(vec![]);
+        answer.file_views = (0..5)
+            .map(|i| crate::answer::AnswerFile {
+                name: format!("report-{i}.txt"),
+                body: Some("长报告内容".repeat(10_000)),
+                download_url: None,
+                file_key: None,
+                note: None,
+            })
+            .collect();
+        let text = render_answer(&answer).to_string();
+        assert!(text.len() <= MAX_CARD_BYTES);
+        assert!(text.contains("内容过长，已截断"));
+        for i in 0..5 {
+            assert!(text.contains(&format!("report-{i}.txt")));
+        }
     }
 
     /// 标题旁的标签：(文字, 颜色)。
@@ -1069,9 +1216,9 @@ mod tests {
             .collect()
     }
 
-    /// 没有命令时，露在外面的只有概述和底部信息，其余全部折叠且默认收起；卡片撑满宽度。
+    /// 待确认事项直接可见，依据和冲突默认折叠；卡片撑满宽度。
     #[test]
-    fn only_the_summary_shows_and_everything_else_is_folded() {
+    fn the_summary_and_questions_show_while_details_are_folded() {
         let mut a = answer_with(vec![
             section("根本原因", "连接池只有 10"),
             section("解决方案", "调到 50"),
@@ -1102,15 +1249,39 @@ mod tests {
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
             .collect();
-        // 两段正文、待确认、信息冲突；参考来源不上卡片
-        assert_eq!(panels.len(), 4, "{card}");
+        // 两段正文、信息冲突；参考来源不上卡片
+        assert_eq!(panels.len(), 3, "{card}");
         assert!(panels.iter().all(|p| p["expanded"] == false), "{card}");
         let text = card.to_string();
         assert!(text.contains("信息冲突（1）"));
-        assert!(text.contains("需要确认或补充（1）"));
+        assert!(elements[1].to_string().contains("需要确认现场的 JDK 版本"));
         let visible = elements.iter().filter(|e| e["tag"] == "markdown").count();
-        assert_eq!(visible, 2, "露在外面的只有概述和底部信息：{card}");
+        assert_eq!(visible, 3, "概述、待确认事项和底部信息直接可见：{card}");
         assert!(!tags(&card).iter().any(|t| t == "button"), "答案卡不带按钮");
+    }
+
+    #[test]
+    fn the_first_two_questions_precede_commands_and_the_rest_are_folded() {
+        let mut a = answer_with(vec![]);
+        a.open_questions = vec![
+            "确认版本".into(),
+            "确认执行位置".into(),
+            "补充现场日志".into(),
+        ];
+        a.commands = vec![command("查看进程", "ps -ef")];
+        let card = render_answer(&a);
+        let elements = card["body"]["elements"].as_array().expect("elements");
+        assert_eq!(elements[1]["tag"], "markdown");
+        let questions = elements[1].to_string();
+        assert!(questions.contains("确认版本") && questions.contains("确认执行位置"));
+        assert!(!questions.contains("补充现场日志"));
+        assert!(elements[2].to_string().contains("ps -ef"));
+        let extra = elements
+            .iter()
+            .find(|e| e["tag"] == "collapsible_panel")
+            .expect("其余问题");
+        assert_eq!(extra["expanded"], false);
+        assert!(extra.to_string().contains("补充现场日志"));
     }
 
     /// 排查类的状态直接说根因查到哪一步；更正露在概述下面，不折叠。
@@ -1200,7 +1371,7 @@ mod tests {
         assert_eq!(values[0]["x"], "3.2.0");
     }
 
-    /// 少即是多：副标题只说结论到了哪一步，把握度只在不高时提；底部没有模型和 token。
+    /// 副标题只说结论到了哪一步，把握度只在不高时提；未提供配置时不显示模型信息。
     #[test]
     fn visuals_can_be_stripped_when_the_card_is_rejected() {
         let mut a = answer_with(vec![section("根本原因", "见截图")]);
@@ -1243,6 +1414,10 @@ mod tests {
             Some(&json!("input")),
             "最底下是输入框"
         );
+        let input = elements.last().expect("补充输入框");
+        assert_eq!(input["input_type"], "multiline_text");
+        assert_eq!(input["auto_resize"], true);
+        assert_eq!(input["max_rows"], 8);
         let footer = elements[elements.len() - 2].to_string();
         assert!(footer.contains("用时 2m15s"), "{footer}");
         assert!(
@@ -1270,6 +1445,36 @@ mod tests {
                 .contains("这条结论已在第 3 轮更正")
         );
         assert!(card.to_string().contains("连接池只有 10"), "原来的内容还在");
+    }
+
+    /// 展示层保留模型生成的重点格式，补充内容放入默认收起的详情。
+    #[test]
+    fn conclusions_are_highlighted_and_optional_details_stay_folded() {
+        let mut a = answer_with(vec![
+            section("相关用法", "**可选范围**：依据已确认的参数调整查询范围。"),
+            section("结果判断", "按实际返回的关键指标判断结果。"),
+        ]);
+        a.kind = Kind::Howto;
+        a.summary = "**结论**：优先采用**已确认的处理方式**。".into();
+        a.commands = vec![command("查看结果", "printf verified")];
+        let card = render_answer(&a);
+        let elements = card["body"]["elements"].as_array().expect("elements");
+        let summary = elements[0]["content"].as_str().expect("概述");
+        assert!(
+            summary.starts_with(r#"<text_tag color="blue">结论</text_tag>"#),
+            "{summary}"
+        );
+        assert!(summary.contains("**已确认的处理方式**"));
+        assert!(elements[1].to_string().contains("verified"));
+        assert!(!elements[1].to_string().contains("可选范围"));
+        let panels: Vec<_> = elements
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .collect();
+        assert_eq!(panels.len(), 2);
+        assert!(panels.iter().all(|p| p["expanded"] == false));
+        assert!(panels[0].to_string().contains("**可选范围**"));
+        assert!(panels[1].to_string().contains("关键指标"));
     }
 
     /// 概述行首的「根因」「解决」换成彩色胶囊，三种写法都认；模型自己写的标签照样转义。
@@ -1510,7 +1715,7 @@ mod tests {
         let stop = only_button(&card);
         assert_eq!(stop["behaviors"][0]["type"], "callback");
         assert_eq!(
-            Action::parse(&stop["behaviors"][0]["value"]),
+            Action::parse(&stop["behaviors"][0]["value"], ""),
             Some((Action::Stop, "t-1".to_owned()))
         );
         assert_eq!(stop["confirm"]["title"]["tag"], "plain_text");
@@ -1537,9 +1742,49 @@ mod tests {
         let card = failure("⏹ 已停止", "本轮分析被中断。", "", Some("t-2"));
         let retry = only_button(&card);
         assert_eq!(
-            Action::parse(&retry["behaviors"][0]["value"]),
+            Action::parse(&retry["behaviors"][0]["value"], ""),
             Some((Action::Retry, "t-2".to_owned()))
         );
         assert!(retry.get("confirm").is_none());
+    }
+
+    #[test]
+    fn codex_controls_and_metadata_survive_card_size_limits() {
+        let mut footer = footer();
+        footer.model = Some("complex-model".into());
+        footer.effort = Some("xhigh".into());
+        footer.configure = Some("t-1".into());
+        let answer = answer_with(vec![section("很长的说明", &"详细说明".repeat(10000))]);
+        let card = super::answer(
+            &answer,
+            &footer,
+            &super::super::markdown::HostAllowlist(&[]),
+        );
+        let encoded = card.to_string();
+        assert!(encoded.len() <= MAX_CARD_BYTES, "{}", encoded.len());
+        assert!(encoded.contains("本轮模型：complex-model · 推理强度：xhigh"));
+        assert!(encoded.contains("model_input"));
+        assert!(encoded.contains("effort_high"));
+        assert!(encoded.contains("effort_xhigh"));
+        assert!(encoded.contains("reset_model"));
+        let progress = progress(&Progress {
+            model: Some("complex-model"),
+            effort: Some("high"),
+            configure: Some("t-1"),
+            ..Progress::default()
+        });
+        assert!(
+            progress
+                .to_string()
+                .contains("本轮模型：complex-model · 推理强度：high")
+        );
+        let failure = with_model(
+            failure("失败", "无法使用模型", "", Some("t-1")),
+            "complex-model",
+            Some("xhigh"),
+            Some("t-1"),
+        );
+        assert!(failure.to_string().contains("effort_xhigh"));
+        assert!(failure.to_string().contains("retry_btn"));
     }
 }

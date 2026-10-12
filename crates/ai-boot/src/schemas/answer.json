@@ -23,11 +23,11 @@
         "howto",
         "other"
       ],
-      "description": "问题类型：diagnosis 故障排查，summary 讨论总结，howto 用法/操作，other 其他"
+      "description": "任务类型"
     },
     "title": {
       "type": "string",
-      "description": "卡片标题，一句话概括问题，不超过 40 个字"
+      "description": "卡片标题"
     },
     "status": {
       "type": "string",
@@ -36,7 +36,7 @@
         "need_more_info",
         "partial"
       ],
-      "description": "answered 已给出结论（排查类即根因已确认）；partial 只有部分结论（排查类即根因待确认，给了可能原因和验证方法）；need_more_info 缺关键信息没法往下分析"
+      "description": "answered 已确认；partial 有依据的判断仍待验证；need_more_info 无可支持的判断且缺关键资料"
     },
     "confidence": {
       "type": "string",
@@ -45,15 +45,15 @@
         "medium",
         "low"
       ],
-      "description": "结论的把握程度：有代码/Jira 等证据支撑为 high，含推测时降低"
+      "description": "主判断的证据把握；候选原因在正文分别标明可信程度，不编造概率"
     },
     "summary": {
       "type": "string",
-      "description": "全文概述，打开卡片第一眼看到的就是它：排查类写成两行，「**根因**：……」和「**解决**：……」（根因还没确认时写「**可能原因**：……」和「**下一步**：……」），每行一句话、60 字左右；其他问题一两句话说清结论。不写命令、依据和来源；环境是推断的，写明按什么环境回答"
+      "description": "首屏概述，支持 Markdown 重点格式"
     },
     "commands": {
       "type": "array",
-      "description": "要执行的关键命令，卡片上按顺序编号放进概述下面的一个命令框，不折叠。只放解决问题必需的，按执行顺序，通常 1 条、最多 3 条；只是查看状态的给最直接的那 1 条；只给一种做法，不按多个环境各给一套；用不着执行命令时为空数组。目标机器上多半要照着手敲：一条命令一行写完、路径写全路径",
+      "description": "本轮主操作，按执行顺序排列",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -66,33 +66,33 @@
         "properties": {
           "title": {
             "type": "string",
-            "description": "这条命令做什么，10 个字以内，比如「查看消费堆积」"
+            "description": "命令用途"
           },
           "where": {
             "type": "string",
-            "description": "在哪执行：哪台机器、哪个容器或 pod、什么用户，20 字以内的纯文字，只写位置，不写「先 cd」这类步骤；不用说明时为空字符串"
+            "description": "执行位置"
           },
           "command": {
             "type": "string",
-            "description": "一行写完的完整命令：路径写全路径，不要靠先 cd 再用相对路径，不用 \\ 续行；对象名拿不准的写成 <占位符>，口令和 token 一律写成占位符"
+            "description": "完整命令"
           },
           "look": {
             "type": "string",
-            "description": "执行后看什么、怎么判断，一两句话纯文字、80 字以内，不放命令；没有就空字符串"
+            "description": "观察或判断要点"
           }
         }
       }
     },
     "corrections": {
       "type": "array",
-      "description": "本轮相对上一轮回答的更正：每条写清原来的结论、改成了什么、依据；第一轮或结论没变时为空数组",
+      "description": "相对此前答复的重要更正",
       "items": {
         "type": "string"
       }
     },
     "conflicts": {
       "type": "array",
-      "description": "上下文之间的冲突及取舍；没有冲突时为空数组",
+      "description": "资料冲突与取舍",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -109,11 +109,11 @@
           },
           "claim": {
             "type": "string",
-            "description": "被否定的说法及其出处"
+            "description": "被否定的说法"
           },
           "adopted": {
             "type": "string",
-            "description": "采信的说法及理由"
+            "description": "采信的内容与依据"
           },
           "sources": {
             "type": "array",
@@ -126,7 +126,7 @@
     },
     "sections": {
       "type": "array",
-      "description": "详细内容，卡片上默认折叠：最多 4 段、合计 800 字左右，不重复 commands 里的命令，也不列提问没要的变体和相关命令。排查类：根因已确认写「根本原因」「解决方案」；根因未确认写「可能原因与验证方法」，不写解决方案。只问原因就只写原因。图片、图表、流程图只在比文字更清楚时才附，用不上就不写这三个字段",
+      "description": "由模型组织的折叠详情",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -140,11 +140,11 @@
           },
           "body": {
             "type": "string",
-            "description": "markdown 正文"
+            "description": "Markdown 正文"
           },
           "images": {
             "type": "array",
-            "description": "这一段要展示的截图：只在要指出群里更早的某张截图时才放，只能用本轮读到过的附件路径（如 attachments/1/03-image.webp）；提问附带的和刚发的截图不要再贴",
+            "description": "要展示的附件截图",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -155,18 +155,18 @@
               "properties": {
                 "path": {
                   "type": "string",
-                  "description": "工作目录里的相对路径"
+                  "description": "工作目录中的附件路径"
                 },
                 "caption": {
                   "type": "string",
-                  "description": "一句话说明图里看什么"
+                  "description": "图片说明"
                 }
               }
             }
           },
           "charts": {
             "type": "array",
-            "description": "数据对比、趋势、占比用图表更直观时才放",
+            "description": "数据图表",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -188,18 +188,18 @@
                     "area",
                     "pie"
                   ],
-                  "description": "柱状、折线、面积、饼图"
+                  "description": "图表类型"
                 },
                 "categories": {
                   "type": "array",
-                  "description": "横轴的分类（饼图是各扇区）",
+                  "description": "横轴类别",
                   "items": {
                     "type": "string"
                   }
                 },
                 "series": {
                   "type": "array",
-                  "description": "每条数据系列的值与 categories 一一对应；饼图只用第一条",
+                  "description": "图表系列",
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -225,7 +225,7 @@
           },
           "diagrams": {
             "type": "array",
-            "description": "调用链、处理流程、依赖关系用图更清楚时才放",
+            "description": "流程或依赖图",
             "items": {
               "type": "object",
               "additionalProperties": false,
@@ -239,7 +239,7 @@
                 },
                 "dot": {
                   "type": "string",
-                  "description": "Graphviz DOT（digraph），节点文字用中文，不超过 30 个节点；不要用 image、URL、href 等属性和 HTML 标签"
+                  "description": "Graphviz DOT 内容"
                 }
               }
             }
@@ -249,21 +249,21 @@
     },
     "open_questions": {
       "type": "array",
-      "description": "需要提问人确认或补充、而且会影响结论的事项；不影响结论的推测不用列，没有就空数组",
+      "description": "影响结论或操作的待确认事项",
       "items": {
         "type": "string"
       }
     },
     "files": {
       "type": "array",
-      "description": "要随答案发给提问人的文件（脚本、报告、导出的数据）：当前工作目录里的相对路径，比如 out/check.sh。只在提问要求、或内容太长放不进正文时才给；短命令直接写在正文的代码块里。用不上就不写这个字段",
+      "description": "交付文件的工作目录相对路径",
       "items": {
         "type": "string"
       }
     },
     "jira_keys": {
       "type": "array",
-      "description": "与本问题直接相关的 Jira 单号，如 ABC-123",
+      "description": "直接相关的工单号",
       "items": {
         "type": "string"
       }

@@ -153,8 +153,32 @@ async fn checks(config_path: &Path) -> Vec<Check> {
         checks.push(feishu(api).await);
         checks.push(whitelist(api, &config).await);
     }
-    checks.push(claude(&config).await);
-    checks.push(hook(&config).await);
+    if let Some(program) = &config.feishu.go_sdk_program {
+        let output = tokio::process::Command::new(program)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let check = match tokio::time::timeout(Duration::from_secs(10), output).await {
+            Ok(Ok(output)) if output.status.success() => Check::ok(
+                "飞书 Go SDK",
+                String::from_utf8_lossy(&output.stdout).trim(),
+            ),
+            _ => Check::fail(
+                "飞书 Go SDK",
+                "SDK 程序不可用",
+                "检查 feishu.go_sdk_program，或重跑 deploy/setup-codex.sh",
+            ),
+        };
+        checks.push(check);
+    }
+    if config.agent.backend == "codex" {
+        checks.push(codex(&config).await);
+    } else {
+        checks.push(claude(&config).await);
+        checks.push(hook(&config).await);
+    }
     for server in &config.agent.mcp {
         checks.push(tool_surface(server).await);
         if let Some(state_dir) = server.env.get("QTMCP_STATE_DIR") {
@@ -270,6 +294,31 @@ async fn whitelist(api: &ApiClient, config: &Config) -> Check {
             "白名单",
             format!("邮箱解析失败：{err}"),
             "应用需要「通过手机号或邮箱获取用户 ID」权限；也可以直接配 allowed_open_ids",
+        ),
+    }
+}
+
+async fn codex(config: &Config) -> Check {
+    let info = match crate::codex_backend(&config.agent).preflight().await {
+        Ok(info) => info,
+        Err(err) => return Check::fail("Codex", err.to_string(), "检查 agent.codex.program"),
+    };
+    let env = crate::codex_env(&config.agent);
+    let output = tokio::process::Command::new(&config.agent.codex.program)
+        .args(["login", "status"])
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(Duration::from_secs(10), output).await {
+        Ok(Ok(output)) if output.status.success() => {
+            Check::ok("Codex", format!("{}，已登录", info.version))
+        }
+        _ => Check::fail(
+            "Codex",
+            "登录状态检查失败",
+            "用服务用户执行 codex login；CODEX_HOME 必须和服务一致",
         ),
     }
 }

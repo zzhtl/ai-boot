@@ -18,7 +18,7 @@ use super::image::{WORKERS, normalize_tiled};
 use super::{Kind, Output, TEXT_BYTES, Tools, XML_LIMIT, blocking, clip_bytes, run, sanitize};
 
 const MAX_SLIDES: usize = 100;
-/// 每份文档最多交给模型几张图（长截图切出的段也算）：每轮一共才 20 张。
+/// 每份文档最多交给模型几张图（长截图切出的段也算）：受每轮总图片上限约束。
 const DOC_IMAGES: usize = 10;
 /// 另存的全文上限，更长的只存前面。
 const FULL_TEXT: usize = 8 * 1024 * 1024;

@@ -3,6 +3,7 @@
 //! 回调只回 toast、不改卡片：卡片统一由这一轮的执行任务（或写回任务）更新，
 //! 回调也去改卡片的话，两边的更新会互相覆盖。
 
+use ai_boot_agent::Effort;
 use ai_boot_feishu::event::{ToastKind, toast_response};
 use serde_json::{Value, json};
 
@@ -47,6 +48,12 @@ pub enum Action {
     },
     /// 答案卡输入框里的补充、纠正。内容在回调的 `input_value` 里，不在回传值里。
     FollowUp,
+    /// 修改当前 Codex 会话，下一轮（包括重试）生效。
+    Model {
+        model: String,
+    },
+    Effort(Effort),
+    ResetModel,
 }
 
 impl Action {
@@ -57,6 +64,11 @@ impl Action {
             Self::Retry => json!({ "action": "retry", "turn": turn_id }),
             Self::Resolve => json!({ "action": "resolve", "turn": turn_id }),
             Self::FollowUp => json!({ "action": "follow_up", "turn": turn_id }),
+            Self::Model { .. } => json!({ "action": "model", "turn": turn_id }),
+            Self::Effort(effort) => json!({
+                "action": "effort", "turn": turn_id, "effort": effort.as_str(),
+            }),
+            Self::ResetModel => json!({ "action": "reset_model", "turn": turn_id }),
             Self::Writeback {
                 target,
                 reference,
@@ -72,7 +84,7 @@ impl Action {
     }
 
     /// 从回传值里认出是哪个按钮、哪一轮。
-    pub fn parse(value: &Value) -> Option<(Self, String)> {
+    pub fn parse(value: &Value, input_value: &str) -> Option<(Self, String)> {
         let field = |key: &str| {
             value
                 .get(key)
@@ -84,6 +96,11 @@ impl Action {
             "retry" => Self::Retry,
             "resolve" => Self::Resolve,
             "follow_up" => Self::FollowUp,
+            "model" => Self::Model {
+                model: input_value.trim().to_owned(),
+            },
+            "effort" => Self::Effort(Effort::parse(field("effort")?)?),
+            "reset_model" => Self::ResetModel,
             "writeback" => Self::Writeback {
                 target: Target::parse(field("target")?)?,
                 reference: field("ref")?.to_owned(),
@@ -147,9 +164,18 @@ mod tests {
             reference: "ABC-12".into(),
             hash: "0123456789abcdef".into(),
         };
-        for action in [Action::Stop, Action::Retry, Action::Resolve, writeback] {
+        for action in [
+            Action::Stop,
+            Action::Retry,
+            Action::Resolve,
+            Action::FollowUp,
+            Action::Effort(Effort::High),
+            Action::Effort(Effort::Xhigh),
+            Action::ResetModel,
+            writeback,
+        ] {
             assert_eq!(
-                Action::parse(&action.value("t-1")),
+                Action::parse(&action.value("t-1"), ""),
                 Some((action, "t-1".to_owned()))
             );
         }
@@ -161,13 +187,15 @@ mod tests {
             json!({}),
             json!({"action": "delete", "turn": "t"}),
             json!({"action": "stop"}),
+            json!({"action": "effort", "turn": "t", "effort": "invalid"}),
+            json!({"action": "effort", "turn": "t"}),
             json!({"action": "stop", "turn": ""}),
             json!({"action": 1, "turn": "t"}),
             json!({"action": "writeback", "turn": "t", "target": "wiki", "ref": "x", "hash": "h"}),
             json!({"action": "writeback", "turn": "t", "target": "jira", "ref": "ABC-1"}),
             json!("stop"),
         ] {
-            assert_eq!(Action::parse(&value), None, "{value}");
+            assert_eq!(Action::parse(&value, ""), None, "{value}");
         }
     }
 }

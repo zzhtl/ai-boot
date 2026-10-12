@@ -17,7 +17,7 @@ use super::flatten::AttachmentRef;
 
 /// 每轮最多交给模型的图片（含扫描件转出的页面、长截图切出的段）。群聊记录里的截图
 /// 常常是关键证据，500 条消息里的图一般不超过这个数。
-pub const MAX_IMAGES: usize = 20;
+pub const MAX_IMAGES: usize = 50;
 /// 每轮最多解析的文件。
 pub const MAX_FILES: usize = 8;
 /// 单个文件的下载上限。
@@ -459,9 +459,9 @@ mod tests {
         let base = url::Url::parse(&format!("{}/", server.uri())).expect("地址");
         let api = ApiClient::new(base, "cli_x", SecretString::from("s")).expect("客户端");
         let slow = Duration::from_millis(2500);
-        // 群里分享的 18 张小图，第一张和第 7 张都慢；提问附带一张长截图（切成 5 段）
+        // 群里分享的 48 张小图，第一张和第 7 张都慢；提问附带一张长截图（切成 5 段）
         let mut wanted = Vec::new();
-        for i in 0..18 {
+        for i in 0..48 {
             let key = format!("s{i:02}");
             let delay = if matches!(i, 0 | 6) {
                 slow
@@ -504,7 +504,7 @@ mod tests {
             .map(|a| a.origin.as_str())
             .collect();
         let mut expected = vec!["tall".to_owned()];
-        expected.extend((0..18).map(|i| format!("s{i:02}")));
+        expected.extend((0..48).map(|i| format!("s{i:02}")));
         assert_eq!(origins, expected);
         let tall = &fetched.attachments[0];
         assert_eq!(tall.images.len(), 5);
@@ -515,9 +515,9 @@ mod tests {
         );
         let given: usize = fetched.attachments.iter().map(|a| a.images.len()).sum();
         assert_eq!(given, MAX_IMAGES);
-        // 5 段加 15 张占满 20 张，最后三张没交给模型
+        // 5 段加 45 张占满 50 张，最后三张没交给模型
         assert!(
-            fetched.attachments[16..]
+            fetched.attachments[46..]
                 .iter()
                 .all(|a| a.images.is_empty())
         );

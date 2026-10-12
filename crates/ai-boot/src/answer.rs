@@ -6,7 +6,7 @@
 //!
 //! 例外是段落里的 images、charts、diagrams 和附带的 files：大多数答案用不上，模型在长
 //! 任务里常把它们整个省掉，整份答案就会被 CLI 拒收、重写一遍（实测多花 20～30 秒），
-//! 所以不放进 required，解析时按空数组处理。接 Codex 的 strict 模式时要放回去。
+//! 所以不放进 required，解析时按空数组处理。Codex 后端写入 schema 时将它们放回 required。
 //!
 //! 参考来源（references）不再让模型输出：卡片上只放根因和解决办法，依据写在正文里；
 //! 字段留着是为了读得懂以前存下的答案。
@@ -134,6 +134,16 @@ pub struct Reference {
     pub url: String,
 }
 
+/// 程序读取交付文件后生成的卡片内容，不属于模型输出契约。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerFile {
+    pub name: String,
+    pub body: Option<String>,
+    pub download_url: Option<String>,
+    pub file_key: Option<String>,
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Answer {
     pub kind: Kind,
@@ -159,6 +169,8 @@ pub struct Answer {
     /// 随答案发出去的文件：工作目录里的相对路径。
     #[serde(default)]
     pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_views: Vec<AnswerFile>,
     #[serde(default)]
     pub jira_keys: Vec<String>,
     /// 截图和流程图上传到飞书后的 image_key（键见 `image_ref`、`diagram_ref`）。
