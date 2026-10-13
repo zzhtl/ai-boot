@@ -103,7 +103,7 @@ impl Action {
                 model: field("model").unwrap_or(input_value).trim().to_owned(),
             },
             "models" => Self::Models,
-            "effort" => Self::Effort(Effort::parse(field("effort")?)?),
+            "effort" => Self::Effort(Effort::parse(field("effort").unwrap_or(input_value))?),
             "reset_model" => Self::ResetModel,
             "writeback" => Self::Writeback {
                 target: Target::parse(field("target")?)?,
@@ -187,6 +187,24 @@ mod tests {
                 Some((action, "t-1".to_owned()))
             );
         }
+    }
+
+    #[test]
+    fn effort_dropdown_accepts_valid_options_and_preserves_old_buttons() {
+        let dropdown = json!({ "action": "effort", "turn": "t-1" });
+        for effort in [
+            Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max,
+        ] {
+            assert_eq!(
+                Action::parse(&dropdown, effort.as_str()),
+                Some((Action::Effort(effort), "t-1".into()))
+            );
+        }
+        assert_eq!(Action::parse(&dropdown, "invalid"), None);
+        assert_eq!(
+            Action::parse(&Action::Effort(Effort::High).value("t-1"), "xhigh"),
+            Some((Action::Effort(Effort::High), "t-1".into()))
+        );
     }
 
     #[test]

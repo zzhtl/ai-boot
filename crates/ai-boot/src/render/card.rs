@@ -19,11 +19,9 @@ const SUMMARY_CHARS: usize = 600;
 const SECTION_CHARS: usize = 4000;
 const MAX_SECTIONS: usize = 8;
 const MAX_LIST_ITEMS: usize = 8;
-/// 影响结论的关键问题在命令前展示，其余折叠。
-const SHOWN_QUESTIONS: usize = 2;
-/// 露在外面的更正条数：多了就不「简洁」了，细节在正文里。
+/// 保留的重要更正条数。
 const MAX_CORRECTIONS: usize = 3;
-/// 露在外面的关键命令条数，多出来的折叠；一张卡片最多放的命令。
+/// 预算不足时保留的关键命令条数；一张卡片最多放的命令。
 const SHOWN_COMMANDS: usize = 3;
 const MAX_COMMANDS: usize = 6;
 /// 命令本身不悄悄截断（截了可能照样能执行、意思却变了），太长才截并标红。
@@ -64,7 +62,7 @@ pub struct Footer {
     pub elapsed: Duration,
     /// 给了就在卡片底部放多行追问表单（这一轮的 ID）。
     pub follow_up: Option<String>,
-    /// 这一轮是在卡片输入框里问的，群里看不到这句话：显示在卡片顶上。
+    /// 这一轮是在卡片输入框里问的，群里看不到这句话：在答案详情后补充显示。
     pub asked: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -86,7 +84,7 @@ impl Footer {
         format!("<font color='grey'>{}</font>", parts.join(" · "))
     }
 
-    /// 顶上的「追问：……」。
+    /// 卡片内输入的「追问：……」。
     fn asked_line(&self) -> Option<Value> {
         let asked = self.asked.as_deref()?.trim();
         (!asked.is_empty()).then(|| {
@@ -101,18 +99,11 @@ impl Footer {
     fn input(&self) -> Option<Value> {
         let turn_id = self.follow_up.as_deref()?;
         Some(json!({
-            "tag": "form", "element_id": "follow_up_form", "name": "follow_up_form",
-            "elements": [{
-                "tag": "input", "element_id": "follow_up", "name": "follow_up",
-                "placeholder": { "tag": "plain_text", "content": "补充或纠正，可粘贴多行内容" },
-                "input_type": "multiline_text", "rows": 3, "auto_resize": true,
-                "max_rows": 8, "width": "fill", "max_length": 1000, "required": true,
-            }, {
-                "tag": "button", "element_id": "follow_up_submit", "name": "follow_up_submit",
-                "text": { "tag": "plain_text", "content": "发送追问" },
-                "type": "primary", "size": "small", "form_action_type": "submit",
-                "behaviors": [{ "type": "callback", "value": Action::FollowUp.value(turn_id) }],
-            }],
+            "tag": "input", "element_id": "follow_up", "name": "follow_up",
+            "placeholder": { "tag": "plain_text", "content": "补充或纠正" },
+            "input_type": "multiline_text", "rows": 1, "auto_resize": true,
+            "max_rows": 3, "width": "fill", "max_length": 1000,
+            "behaviors": [{ "type": "callback", "value": Action::FollowUp.value(turn_id) }],
         }))
     }
 }
@@ -230,8 +221,7 @@ fn summary_blocks(summary: &str, links: &dyn LinkPolicy, muted: bool) -> Vec<Val
         .collect()
 }
 
-/// 关键命令：前几条放进露在概述下面的命令框，其余折叠；`keep_extra` 为 false 时（卡片
-/// 放不下）折叠的那些只留一句说明。
+/// 命令统一放在解决方案中；预算不足时保留前三条，并提示其余命令被省略。
 fn command_elements(commands: &[Command], keep_extra: bool) -> Vec<Value> {
     let commands: Vec<&Command> = commands
         .iter()
@@ -241,20 +231,12 @@ fn command_elements(commands: &[Command], keep_extra: bool) -> Vec<Value> {
     if commands.is_empty() {
         return Vec::new();
     }
-    let numbered = commands.len() > 1;
-    let shown = &commands[..commands.len().min(SHOWN_COMMANDS)];
-    let mut out = vec![command_box(shown, 0, numbered)];
-    let extra = commands.get(SHOWN_COMMANDS..).unwrap_or_default();
-    if extra.is_empty() {
-        return out;
-    }
-    if keep_extra {
-        let inner = vec![command_box(extra, SHOWN_COMMANDS, true)];
-        out.push(panel(&format!("更多命令（{}）", extra.len()), false, inner));
-    } else {
+    let count = if keep_extra { commands.len() } else { commands.len().min(SHOWN_COMMANDS) };
+    let mut out = vec![command_box(&commands[..count], 0, commands.len() > 1)];
+    if count < commands.len() {
         out.push(markdown(format!(
             "<font color='grey'>卡片放不下，另有 {} 条命令没有显示</font>",
-            extra.len()
+            commands.len() - count
         )));
     }
     out
@@ -447,7 +429,7 @@ fn progress_steps(elements: &mut Vec<Value>, steps: &[String]) {
     elements.push(markdown(recent.join("\n")));
 }
 
-/// 结构化答案：概述、关键待确认事项和命令直接可见，详细依据折叠。
+/// 结构化答案：简要结论直接可见，原因、依据和解决方案按顺序折叠展示。
 pub fn answer(answer: &Answer, footer: &Footer, links: &dyn LinkPolicy) -> Value {
     answer_within(answer, footer, links, MAX_CARD_BYTES, false)
 }
@@ -586,8 +568,8 @@ fn answer_within(
         if serde_json::to_string(&built).map_or(0, |s| s.len()) <= budget {
             return built;
         }
-        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方），再去掉折叠着的
-        // 多余命令。概述、露在外面的命令和底部不动
+        // 超长：把最长的一段减半；还压不下去就去掉图表（数据点占地方），再去掉
+        // 多余命令。概述、前三条关键命令和底部不动
         let longest = bodies
             .iter_mut()
             .chain(file_bodies.iter_mut())
@@ -627,23 +609,39 @@ fn build_answer(
     links: &dyn LinkPolicy,
     muted: bool,
 ) -> Value {
-    // 先看到结论和影响操作的关键问题，再看命令；依据和其余问题折叠。
-    let mut elements: Vec<Value> = footer.asked_line().into_iter().collect();
-    elements.extend(summary_blocks(
+    let mut elements = summary_blocks(
         &truncate(&answer.summary, SUMMARY_CHARS),
         links,
         muted,
-    ));
-    if !answer.open_questions.is_empty() {
-        let items: Vec<String> = answer
-            .open_questions
-            .iter()
-            .take(SHOWN_QUESTIONS)
-            .map(|q| format!("- {}", inline(q)))
-            .collect();
-        elements.push(markdown(format!("**需要确认**\n{}", items.join("\n"))));
+    );
+    let mut groups: [Vec<Value>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut suspected = answer.status != Status::Answered;
+    let mut room = Room {
+        images: MAX_IMAGES,
+        charts: if keep.charts { MAX_CHARTS } else { 0 },
+    };
+    for (section, body) in answer.sections.iter().zip(bodies) {
+        let title = section.title.trim();
+        let mut content = if body.trim().is_empty() { Vec::new() } else { markdown_blocks(body, links) };
+        content.extend(visuals(answer, section, &mut room));
+        if content.is_empty() {
+            continue;
+        }
+        // 新答案由 Schema 约束标题；历史答案保留原题目和内容，归入相应详情。
+        let group = if title.contains("原因") || title.contains("根因") {
+            suspected |= title.contains("可疑") || title.contains("可能") || title.contains("疑似");
+            0
+        } else if title.starts_with("解决") || title.starts_with("处理") || title.starts_with("修复")
+            || matches!(title, "相关用法" | "结果判断") {
+            2
+        } else {
+            1
+        };
+        if !title.is_empty() && !matches!(title, "根本原因" | "可疑原因" | "依据" | "解决方案") {
+            groups[group].push(markdown(format!("**{}**", inline(title))));
+        }
+        groups[group].extend(content);
     }
-    elements.extend(command_elements(&answer.commands, keep.extra_commands));
     if !answer.corrections.is_empty() {
         let items: Vec<String> = answer
             .corrections
@@ -651,35 +649,8 @@ fn build_answer(
             .take(MAX_CORRECTIONS)
             .map(|c| format!("- {}", inline(c)))
             .collect();
-        elements.push(markdown(format!("**🔄 本轮更正**\n{}", items.join("\n"))));
+        groups[1].push(markdown(format!("**本轮更正**\n{}", items.join("\n"))));
     }
-
-    // 折叠的正文、其余待确认事项和冲突。
-    let mut room = Room {
-        images: MAX_IMAGES,
-        charts: if keep.charts { MAX_CHARTS } else { 0 },
-    };
-    for (section, body) in answer.sections.iter().zip(bodies) {
-        let mut inner = markdown_blocks(body, links);
-        inner.extend(visuals(answer, section, &mut room));
-        elements.push(panel(&section.title, false, inner));
-    }
-
-    if answer.open_questions.len() > SHOWN_QUESTIONS {
-        let items: Vec<String> = answer
-            .open_questions
-            .iter()
-            .skip(SHOWN_QUESTIONS)
-            .take(MAX_LIST_ITEMS)
-            .map(|q| format!("- {}", inline(q)))
-            .collect();
-        let title = format!(
-            "其余待确认事项（{}）",
-            answer.open_questions.len() - SHOWN_QUESTIONS
-        );
-        elements.push(panel(&title, false, vec![markdown(items.join("\n"))]));
-    }
-
     if !answer.conflicts.is_empty() {
         let items: Vec<String> = answer
             .conflicts
@@ -698,9 +669,25 @@ fn build_answer(
                 line
             })
             .collect();
-        let title = format!("⚠️ 信息冲突（{}）", answer.conflicts.len());
-        elements.push(panel(&title, false, vec![markdown(items.join("\n"))]));
+        groups[1].push(markdown(format!("**信息冲突**\n{}", items.join("\n"))));
     }
+    if !answer.open_questions.is_empty() {
+        let items: Vec<String> = answer
+            .open_questions
+            .iter()
+            .take(MAX_LIST_ITEMS)
+            .map(|q| format!("- {}", inline(q)))
+            .collect();
+        groups[2].insert(0, markdown(format!("**待确认**\n{}", items.join("\n"))));
+    }
+    groups[2].extend(command_elements(&answer.commands, keep.extra_commands));
+    let cause = if suspected { "可疑原因" } else { "根本原因" };
+    for (title, content) in [cause, "依据", "解决方案"].into_iter().zip(groups) {
+        if !content.is_empty() {
+            elements.push(panel(title, false, content));
+        }
+    }
+    elements.extend(footer.asked_line());
 
     for (file, body) in answer.file_views.iter().zip(file_bodies) {
         let mut content = Vec::new();
@@ -736,7 +723,8 @@ fn build_answer(
     // 只放在标签上：橙色头部、橙色标签、橙色行首标签叠在一起太刺眼
     let diagnosis = answer.kind == Kind::Diagnosis;
     let (badge, color) = match answer.status {
-        Status::Answered if diagnosis => ("根因已确认", "green"),
+        Status::Answered if diagnosis && !suspected => ("根因已确认", "green"),
+        Status::Answered if diagnosis => ("根因待确认", "orange"),
         Status::Answered => (kind_label(answer.kind), "blue"),
         Status::NeedMoreInfo => ("需要补充信息", "orange"),
         Status::Partial if diagnosis => ("根因待确认", "orange"),
@@ -946,36 +934,43 @@ fn model_elements(
     let Some(model) = model else {
         return Vec::new();
     };
-    let mut elements = vec![markdown(format!(
-        "<font color='grey'>本轮模型：{} · 推理强度：{}</font>",
-        inline(model),
-        inline(effort.unwrap_or("未记录")),
-    ))];
-    if let Some(turn_id) = turn_id {
-        elements.push(model_select(models, model, turn_id));
-        let mut controls = vec![
-            markdown(
-                "仅修改当前会话，下一轮或重试生效。立即重做可先切换，再停止、重试。".to_owned(),
-            ),
-        ];
-        let columns: Vec<Value> = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
+    let Some(turn_id) = turn_id else {
+        return vec![markdown(format!(
+            "<font color='grey'>{} · {}</font>",
+            inline(model),
+            inline(effort.unwrap_or("未记录")),
+        ))];
+    };
+    let mut reset = button("默认", "default", "reset_model", &Action::ResetModel, turn_id, None);
+    reset["hover_tips"] = json!({
+        "tag": "plain_text",
+        "content": format!("本轮：{} · {}。恢复默认模型和强度，下一轮或重试生效。", plain(model, 128), plain(effort.unwrap_or("未记录"), 20)),
+    });
+    let mut effort_select = json!({
+        "tag": "select_static", "element_id": "effort_select", "type": "text", "width": "fill",
+        "placeholder": { "tag": "plain_text", "content": effort.unwrap_or("未记录") },
+        "options": ([Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max]
             .into_iter().map(|level| json!({
-                "tag": "column", "width": "weighted", "weight": 1,
-                "elements": [button(level.as_str(), "default", &format!("effort_{}", level.as_str()),
-                    &Action::Effort(level), turn_id, None)],
-            })).collect();
-        controls.push(json!({ "tag": "column_set", "flex_mode": "flow", "columns": columns }));
-        controls.push(button(
-            "恢复默认模型和强度",
-            "default",
-            "reset_model",
-            &Action::ResetModel,
-            turn_id,
-            None,
-        ));
-        elements.push(panel("推理强度 / 恢复默认", false, controls));
-    }
-    elements
+                "text": { "tag": "plain_text", "content": level.as_str() }, "value": level.as_str(),
+            })).collect::<Vec<_>>()),
+        "behaviors": [{ "type": "callback", "value": { "action": "effort", "turn": turn_id } }],
+        "margin": "0px",
+    });
+    select_model(&mut effort_select, effort.unwrap_or_default());
+    vec![json!({
+        "tag": "column_set", "element_id": "model_controls", "flex_mode": "none",
+        "horizontal_spacing": "4px", "margin": "0px",
+        "columns": [{
+            "tag": "column", "width": "weighted", "weight": 2, "vertical_align": "center",
+            "elements": [model_select(models, model, turn_id)],
+        }, {
+            "tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+            "elements": [effort_select],
+        }, {
+            "tag": "column", "width": "auto", "vertical_align": "center",
+            "elements": [reset],
+        }],
+    })]
 }
 
 /// 独立选择卡，不修改正在由轮次任务刷新的进度或答案卡。
@@ -996,11 +991,12 @@ pub fn model_choices(models: &[ModelOption], model: &str, effort: &str, turn_id:
 
 fn model_select(models: &[ModelOption], model: &str, turn_id: &str) -> Value {
     let mut select = json!({
-        "tag": "select_static", "element_id": "model_select",
+        "tag": "select_static", "element_id": "model_select", "type": "text",
         "width": "fill", "disabled": models.is_empty(),
-        "placeholder": { "tag": "plain_text", "content": if models.is_empty() { "模型列表暂不可用" } else { "选择下一轮模型（每日更新）" } },
+        "placeholder": { "tag": "plain_text", "content": plain(model, 128) },
+        "margin": "0px",
         "options": models.iter().take(5).map(|choice| json!({
-            "text": { "tag": "plain_text", "content": plain(&choice.name, 40) }, "value": choice.id,
+            "text": { "tag": "plain_text", "content": plain(&choice.id, 128) }, "value": choice.id,
         })).collect::<Vec<_>>(),
         "behaviors": [{ "type": "callback", "value": Action::Model { model: String::new() }.value(turn_id) }],
     });
@@ -1019,20 +1015,31 @@ fn select_model(select: &mut Value, model: &str) {
     }
 }
 
-/// 重画卡片时使用每日缓存和当前会话设置，避免撤回用户刚选中的模型。
-pub fn refresh_model_select(card: &mut Value, models: &[ModelOption], model: &str) {
-    let Some(elements) = card["body"]["elements"].as_array_mut() else {
-        return;
-    };
-    for element in elements
-        .iter_mut()
-        .filter(|element| element["element_id"] == "model_select")
-    {
-        let turn = element["behaviors"][0]["value"]["turn"]
+/// 重画卡片时保留当前会话的模型和强度，本轮实际配置仍留在悬停提示中。
+pub fn refresh_model_select(
+    card: &mut Value,
+    models: &[ModelOption],
+    model: &str,
+    effort: Option<&str>,
+) {
+    if card["element_id"] == "model_select" {
+        let turn = card["behaviors"][0]["value"]["turn"]
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        *element = model_select(models, model, &turn);
+        *card = model_select(models, model, &turn);
+    } else if card["element_id"] == "effort_select" {
+        select_model(card, effort.unwrap_or_default());
+    } else {
+        match card {
+            Value::Array(items) => items
+                .iter_mut()
+                .for_each(|item| refresh_model_select(item, models, model, effort)),
+            Value::Object(map) => map
+                .values_mut()
+                .for_each(|item| refresh_model_select(item, models, model, effort)),
+            _ => {}
+        }
     }
 }
 
@@ -1280,12 +1287,23 @@ mod tests {
             .collect()
     }
 
-    /// 待确认事项直接可见，依据和冲突默认折叠；卡片撑满宽度。
+    fn detail<'a>(card: &'a Value, title: &str) -> &'a Value {
+        card["body"]["elements"].as_array().expect("元素").iter()
+            .find(|element| element["tag"] == "collapsible_panel"
+                && element["header"]["title"]["content"] == format!("**{title}**"))
+            .expect("详情分组")
+    }
+
+    /// 简要结论可见，原因、依据、解决方案固定顺序，详情默认折叠。
+
     #[test]
-    fn the_summary_and_questions_show_while_details_are_folded() {
+    fn the_summary_precedes_cause_evidence_and_solution() {
         let mut a = answer_with(vec![
-            section("根本原因", "连接池只有 10"),
             section("解决方案", "调到 50"),
+            section("依据", "配置核实为 10"),
+            section("根本原因", "连接池只有 10"),
+            section("依据", "日志出现连接等待超时"),
+            section("依据", ""),
         ]);
         a.conflicts = vec![Conflict {
             topic: "影响版本".into(),
@@ -1313,19 +1331,36 @@ mod tests {
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
             .collect();
-        // 两段正文、信息冲突；参考来源不上卡片
+        // 冲突归到依据，待确认项归到解决方案。
         assert_eq!(panels.len(), 3, "{card}");
         assert!(panels.iter().all(|p| p["expanded"] == false), "{card}");
-        let text = card.to_string();
-        assert!(text.contains("信息冲突（1）"));
-        assert!(elements[1].to_string().contains("需要确认现场的 JDK 版本"));
+        assert_eq!(panels[0]["header"]["title"]["content"], "**根本原因**");
+        assert_eq!(panels[1]["header"]["title"]["content"], "**依据**");
+        assert_eq!(panels[2]["header"]["title"]["content"], "**解决方案**");
+        assert!(panels[1].to_string().contains("信息冲突"));
+        assert!(panels[1].to_string().contains("配置核实为 10"));
+        assert!(panels[1].to_string().contains("连接等待超时"));
+        assert!(panels[2].to_string().contains("需要确认现场的 JDK 版本"));
         let visible = elements.iter().filter(|e| e["tag"] == "markdown").count();
-        assert_eq!(visible, 3, "概述、待确认事项和底部信息直接可见：{card}");
+        assert_eq!(visible, 2, "仅概述和底部信息直接可见：{card}");
         assert!(!tags(&card).iter().any(|t| t == "button"), "答案卡不带按钮");
     }
 
     #[test]
-    fn the_first_two_questions_precede_commands_and_the_rest_are_folded() {
+    fn absent_details_are_omitted_and_unconfirmed_causes_are_not_asserted() {
+        let mut a = answer_with(vec![section("依据", "")]);
+        let card = render_answer(&a);
+        assert!(!tags(&card).iter().any(|tag| tag == "collapsible_panel"));
+        a.sections = vec![section("根本原因", "怀疑连接等待超时，尚缺现场配置")];
+        a.status = Status::Partial;
+        let card = render_answer(&a);
+        assert_eq!(detail(&card, "可疑原因")["expanded"], false);
+        assert!(!card.to_string().contains("**根本原因**"));
+        assert_eq!(header_tags(&card)[0], tag("根因待确认", "orange"));
+    }
+
+    #[test]
+    fn questions_precede_commands_inside_the_solution() {
         let mut a = answer_with(vec![]);
         a.open_questions = vec![
             "确认版本".into(),
@@ -1334,35 +1369,32 @@ mod tests {
         ];
         a.commands = vec![command("查看进程", "ps -ef")];
         let card = render_answer(&a);
-        let elements = card["body"]["elements"].as_array().expect("elements");
-        assert_eq!(elements[1]["tag"], "markdown");
-        let questions = elements[1].to_string();
+        let solution = detail(&card, "解决方案");
+        let questions = solution["elements"][0].to_string();
         assert!(questions.contains("确认版本") && questions.contains("确认执行位置"));
-        assert!(!questions.contains("补充现场日志"));
-        assert!(elements[2].to_string().contains("ps -ef"));
-        let extra = elements
-            .iter()
-            .find(|e| e["tag"] == "collapsible_panel")
-            .expect("其余问题");
-        assert_eq!(extra["expanded"], false);
-        assert!(extra.to_string().contains("补充现场日志"));
+        assert!(questions.contains("补充现场日志"));
+        assert!(solution["elements"][1].to_string().contains("ps -ef"));
+        assert_eq!(solution["expanded"], false);
+        assert_eq!(tags(&card).iter().filter(|tag| *tag == "collapsible_panel").count(), 1);
     }
 
-    /// 排查类的状态直接说根因查到哪一步；更正露在概述下面，不折叠。
+    /// 可疑原因不能标成已确认，确认后的更正归到依据。
     #[test]
-    fn diagnosis_status_says_whether_the_cause_is_confirmed_and_corrections_show() {
+    fn diagnosis_status_and_evidence_keep_corrections_traceable() {
         let mut a = answer_with(vec![section("可能原因与验证方法", "1. DNS 2. 连接池")]);
         a.status = Status::Partial;
         let card = render_answer(&a);
         assert_eq!(header_tags(&card)[0], tag("根因待确认", "orange"));
         a.status = Status::Answered;
+        let unconfirmed = render_answer(&a);
+        assert_eq!(header_tags(&unconfirmed)[0], tag("根因待确认", "orange"));
+        a.sections = vec![section("根本原因", "DNS 超时")];
         a.corrections = vec!["原来说是连接池耗尽 → 实际是 DNS 超时".into()];
         let card = render_answer(&a);
         assert_eq!(header_tags(&card)[0], tag("根因已确认", "green"));
-        let elements = card["body"]["elements"].as_array().expect("elements");
-        assert_eq!(elements[1]["tag"], "markdown", "更正紧跟在概述后面，不折叠");
-        assert!(elements[1].to_string().contains("本轮更正"));
-        assert!(elements[1].to_string().contains("DNS 超时"));
+        let evidence = detail(&card, "依据");
+        assert!(evidence.to_string().contains("本轮更正"));
+        assert!(evidence.to_string().contains("DNS 超时"));
     }
 
     /// 截图、图表、流程图放在各自的段落里（默认折叠）；没拿到 image_key 的不画。
@@ -1475,13 +1507,17 @@ mod tests {
         let elements = card["body"]["elements"].as_array().expect("elements");
         assert_eq!(
             elements.last().map(|e| &e["tag"]),
-            Some(&json!("form")),
-            "最底下是追问表单"
+            Some(&json!("input")),
+            "最底下是独立追问输入框"
         );
-        let form = elements.last().expect("追问表单");
-        let input = &form["elements"][0];
-        assert_eq!(form["elements"][1]["form_action_type"], "submit");
-        assert_eq!(form["elements"][1]["name"], "follow_up_submit");
+        let input = elements.last().expect("追问输入框");
+        assert_eq!(
+            Action::parse(&input["behaviors"][0]["value"], ""),
+            Some((Action::FollowUp, "t-1".to_owned()))
+        );
+        assert!(!card.to_string().contains("follow_up_submit"));
+        assert!(input.get("required").is_none());
+        assert_eq!(input["rows"], 1);
         assert!(
             !input["placeholder"]["content"]
                 .as_str()
@@ -1490,7 +1526,7 @@ mod tests {
         );
         assert_eq!(input["input_type"], "multiline_text");
         assert_eq!(input["auto_resize"], true);
-        assert_eq!(input["max_rows"], 8);
+        assert_eq!(input["max_rows"], 3);
         let footer = elements[elements.len() - 2].to_string();
         assert!(footer.contains("用时 2m15s"), "{footer}");
         assert!(
@@ -1539,15 +1575,15 @@ mod tests {
         );
         assert!(summary.contains("**已确认的处理方式**"));
         assert!(elements[1].to_string().contains("verified"));
-        assert!(!elements[1].to_string().contains("可选范围"));
+        assert!(elements[1].to_string().contains("可选范围"));
         let panels: Vec<_> = elements
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
             .collect();
-        assert_eq!(panels.len(), 2);
+        assert_eq!(panels.len(), 1);
         assert!(panels.iter().all(|p| p["expanded"] == false));
         assert!(panels[0].to_string().contains("**可选范围**"));
-        assert!(panels[1].to_string().contains("关键指标"));
+        assert!(panels[0].to_string().contains("关键指标"));
     }
 
     /// 概述行首的「根因」「解决」换成彩色胶囊，三种写法都认；模型自己写的标签照样转义。
@@ -1583,19 +1619,18 @@ mod tests {
         assert!(!text.contains("text_tag color"), "{text}");
     }
 
-    /// 关键命令紧跟概述露在外面：几条命令按顺序放进同一个命令框，每条前面一行注释写序号、
-    /// 做什么、在哪执行；一条时不编号，超过 3 条的折叠起来，序号接着排。
+    /// 命令集中在解决方案内的一个命令框，保留执行顺序、位置和成功判断。
     #[test]
-    fn key_commands_show_under_the_summary_in_one_numbered_box() {
+    fn key_commands_share_one_numbered_box_inside_the_solution() {
         let mut a = answer_with(vec![section("根本原因", "连接池只有 10")]);
         a.commands = vec![command(
             "查看消费堆积",
             "/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups",
         )];
         let card = render_answer(&a);
-        let elements = card["body"]["elements"].as_array().expect("elements");
+        let elements = detail(&card, "解决方案")["elements"].as_array().expect("命令");
         assert_eq!(
-            elements[1]["content"],
+            elements[0]["content"],
             "```bash\n# 查看消费堆积（kafka 所在主机）\n/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server <地址> --describe --all-groups\n```\n\n<font color='grey'>看 LAG 列</font>"
         );
 
@@ -1606,17 +1641,12 @@ mod tests {
         a.commands[1].place = String::new();
         a.commands[1].look = String::new();
         let card = render_answer(&a);
-        let elements = card["body"]["elements"].as_array().expect("elements");
+        let elements = detail(&card, "解决方案")["elements"].as_array().expect("命令");
         assert_eq!(
-            elements[1]["content"],
-            "```bash\n# 1. 第 1 步（kafka 所在主机）\necho 1\n# 2. 第 2 步\necho 2\n# 3. 第 3 步（kafka 所在主机）\necho 3\n```\n\n<font color='grey'>1. 看 LAG 列</font>\n<font color='grey'>3. 看 LAG 列</font>"
+            elements[0]["content"],
+            "```bash\n# 1. 第 1 步（kafka 所在主机）\necho 1\n# 2. 第 2 步\necho 2\n# 3. 第 3 步（kafka 所在主机）\necho 3\n# 4. 第 4 步（kafka 所在主机）\necho 4\n# 5. 第 5 步（kafka 所在主机）\necho 5\n```\n\n<font color='grey'>1. 看 LAG 列</font>\n<font color='grey'>3. 看 LAG 列</font>\n<font color='grey'>4. 看 LAG 列</font>\n<font color='grey'>5. 看 LAG 列</font>"
         );
-        let more = &elements[2];
-        assert_eq!(more["tag"], "collapsible_panel");
-        let more = more.to_string();
-        assert!(more.contains("更多命令（2）"), "{more}");
-        assert!(more.contains("# 4. 第 4 步（kafka 所在主机）"), "{more}");
-        assert!(more.contains("# 5. 第 5 步"), "{more}");
+        assert_eq!(elements.len(), 1, "所有命令只占一个代码块");
         assert!(!card.to_string().contains("空命令不显示"));
     }
 
@@ -1626,7 +1656,7 @@ mod tests {
         let mut a = answer_with(vec![]);
         a.commands = vec![command("看```\n结束", "echo ok")];
         let card = render_answer(&a);
-        let shown = card["body"]["elements"][1]["content"]
+        let shown = detail(&card, "解决方案")["elements"][0]["content"]
             .as_str()
             .expect("命令框")
             .to_owned();
@@ -1822,6 +1852,45 @@ mod tests {
     }
 
     #[test]
+    fn model_and_effort_share_one_row_and_keep_saved_choices_on_refresh() {
+        let models = vec![ModelOption {
+            id: "gpt-6.1-sol".into(),
+            name: "GPT-6.1-Sol".into(),
+        }];
+        let mut card = with_model(
+            failure("失败", "原因", "", None),
+            "old-model",
+            Some("high"),
+            Some("t-1"),
+        );
+        refresh_model_select(&mut card, &models, "gpt-6.1-sol", Some("xhigh"));
+        let elements = card["body"]["elements"].as_array().expect("元素");
+        assert_eq!(elements.len(), 2, "正文之外只有一行设置");
+        let row = &elements[1];
+        assert_eq!(row["tag"], "column_set");
+        assert_eq!(row["flex_mode"], "none", "窄屏仍左右排列");
+        let model = &row["columns"][0]["elements"][0];
+        let effort = &row["columns"][1]["elements"][0];
+        assert_eq!(model["initial_option"], "gpt-6.1-sol");
+        assert_eq!(model["options"][0]["text"]["content"], "gpt-6.1-sol");
+        assert_eq!(effort["initial_option"], "xhigh");
+        assert!(row["columns"][2]["elements"][0]["hover_tips"]["content"]
+            .as_str().expect("提示").contains("old-model · high"));
+        assert_eq!(
+            Action::parse(&effort["behaviors"][0]["value"], "xhigh"),
+            Some((Action::Effort(Effort::Xhigh), "t-1".into()))
+        );
+        refresh_model_select(&mut card, &[], "custom-model", Some("high"));
+        let model = &card["body"]["elements"][1]["columns"][0]["elements"][0];
+        assert_eq!(model["placeholder"]["content"], "custom-model");
+        assert_eq!(model["disabled"], true);
+        assert!(model.get("initial_option").is_none());
+        let archived = model_elements(Some("old-model"), Some("high"), None, &[]);
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["content"], "<font color='grey'>old-model · high</font>");
+    }
+
+    #[test]
     fn codex_controls_and_metadata_survive_card_size_limits() {
         let mut footer = footer();
         footer.model = Some("complex-model".into());
@@ -1835,12 +1904,11 @@ mod tests {
         );
         let encoded = card.to_string();
         assert!(encoded.len() <= MAX_CARD_BYTES, "{}", encoded.len());
-        assert!(encoded.contains("本轮模型：complex-model · 推理强度：xhigh"));
+        assert!(encoded.contains("本轮：complex-model · xhigh"));
         assert!(encoded.contains("model_select"));
         assert!(!encoded.contains("models_query"));
         assert!(!encoded.contains("model_input"));
-        assert!(encoded.contains("effort_high"));
-        assert!(encoded.contains("effort_xhigh"));
+        assert!(encoded.contains("effort_select"));
         assert!(encoded.contains("reset_model"));
         let progress = progress(&Progress {
             model: Some("complex-model"),
@@ -1851,7 +1919,7 @@ mod tests {
         assert!(
             progress
                 .to_string()
-                .contains("本轮模型：complex-model · 推理强度：high")
+                .contains("本轮：complex-model · high")
         );
         let failure = with_model(
             failure("失败", "无法使用模型", "", Some("t-1")),
@@ -1859,7 +1927,7 @@ mod tests {
             Some("xhigh"),
             Some("t-1"),
         );
-        assert!(failure.to_string().contains("effort_xhigh"));
+        assert!(failure.to_string().contains("effort_select"));
         assert!(failure.to_string().contains("retry_btn"));
     }
 }

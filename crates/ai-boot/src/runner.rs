@@ -310,7 +310,11 @@ impl Runner {
     }
 
     pub fn with_writer(mut self, writer: Arc<Writer>) -> Self {
-        writer.set_models(Arc::clone(&self.models), self.settings.model.clone());
+        writer.set_models(
+            Arc::clone(&self.models),
+            self.settings.model.clone(),
+            self.settings.effort,
+        );
         self.writer = Some(writer);
         self
     }
@@ -2072,9 +2076,12 @@ impl Runner {
     async fn model_controls(&self, card_id: &str, card: &Value) -> Value {
         let mut card = card.clone();
         let selectable = card["body"]["elements"].as_array().is_some_and(|elements| {
-            elements
-                .iter()
-                .any(|element| element["element_id"] == "model_select")
+            elements.iter().any(|element| {
+                matches!(
+                    element["element_id"].as_str(),
+                    Some("model_select" | "model_controls")
+                )
+            })
         });
         if selectable && let Ok(Some(conversation)) = self.store.conversation_by_card(card_id).await
         {
@@ -2082,6 +2089,7 @@ impl Runner {
                 &mut card,
                 &self.models.choices(),
                 self.model(&conversation).unwrap_or_default(),
+                self.effort(&conversation).map(|effort| effort.as_str()),
             );
         }
         card

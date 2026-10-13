@@ -2815,9 +2815,9 @@ async fn codex_model_switch_is_persisted_and_applies_to_queued_turns() {
     assert_eq!(requests[1].session, SessionRef::Resume("s-1".into()));
     let first = last_card(&w, "om_card_1").await.to_string();
     let second = last_card(&w, "om_card_2").await.to_string();
-    assert!(first.contains("本轮模型：opus · 推理强度：high"), "{first}");
+    assert!(first.contains("本轮：opus · high"), "{first}");
     assert!(
-        second.contains("本轮模型：complex-model · 推理强度：xhigh"),
+        second.contains("本轮：complex-model · xhigh"),
         "{second}"
     );
     let reopened = Store::open(w._dir.path()).await.expect("重开数据库");
@@ -2952,7 +2952,7 @@ async fn codex_stop_and_restart_cards_keep_the_executed_options() {
     press(&w, Action::Stop, &turns[0].id).await;
     until(&w, "停止", |t| t[0].status == TurnStatus::Interrupted).await;
     let stopped = last_card(&w, "om_card_1").await.to_string();
-    assert!(stopped.contains("本轮模型：opus · 推理强度：high"));
+    assert!(stopped.contains("本轮：opus · high"));
     w.runner
         .mark_interrupted(vec![crate::store::InterruptedTurn {
             id: turns[0].id.clone(),
@@ -2960,7 +2960,7 @@ async fn codex_stop_and_restart_cards_keep_the_executed_options() {
         }])
         .await;
     let restarted = last_card(&w, "om_card_1").await.to_string();
-    assert!(restarted.contains("本轮模型：opus · 推理强度：high"));
+    assert!(restarted.contains("本轮：opus · high"));
     assert!(restarted.contains("model_select"));
     press_retry(&w, &turns[0].id).await;
     let requests = requests_until(&w, 2).await;
@@ -2990,7 +2990,7 @@ async fn codex_closure_cards_retain_their_model_when_redrawn() {
     press_when_idle(&w, Action::Resolve, &turns[0].id).await;
     let turns = until(&w, "闭环完成", all_finished(2)).await;
     let card = last_card(&w, "om_card_2").await.to_string();
-    assert!(card.contains("本轮模型：complex-model · 推理强度：xhigh"));
+    assert!(card.contains("本轮：complex-model · xhigh"));
     assert!(card.contains("model_select"));
     press(&w, Action::Effort(Effort::High), &turns[1].id).await;
     let record = w
@@ -3002,7 +3002,7 @@ async fn codex_closure_cards_retain_their_model_when_redrawn() {
     let redrawn = crate::writeback::closure_card(&record, &[], &[], &[])
         .expect("闭环卡片")
         .to_string();
-    assert!(redrawn.contains("本轮模型：complex-model · 推理强度：xhigh"));
+    assert!(redrawn.contains("本轮：complex-model · xhigh"));
     assert_eq!(w.backend.requests()[1].effort, Some(Effort::Xhigh));
 }
 
@@ -3020,7 +3020,8 @@ async fn model_dropdown_uses_the_daily_cache_and_switches_without_an_extra_card(
         .as_array()
         .expect("元素")
         .iter()
-        .find(|element| element["element_id"] == "model_select")
+        .find(|element| element["element_id"] == "model_controls")
+        .map(|row| &row["columns"][0]["elements"][0])
         .expect("直接可见的模型下拉框");
     assert_eq!(select["tag"], "select_static");
     assert_eq!(select["options"].as_array().expect("选择").len(), 5);
@@ -3032,10 +3033,19 @@ async fn model_dropdown_uses_the_daily_cache_and_switches_without_an_extra_card(
     .expect("下拉回调");
     let reply_count = replies(&w).await.len();
     press(&w, action, &turn_id).await;
+    let row = card["body"]["elements"]
+        .as_array().expect("元素").iter()
+        .find(|element| element["element_id"] == "model_controls")
+        .expect("设置行");
+    let effort = &row["columns"][1]["elements"][0];
+    let (action, turn_id) = Action::parse(&effort["behaviors"][0]["value"], "xhigh")
+        .expect("强度下拉回调");
+    press(&w, action, &turn_id).await;
     assert_eq!(replies(&w).await.len(), reply_count, "切换不弹出另一张卡片");
     say(&w, "om_2", "继续", json!({})).await;
     until(&w, "第二轮完成", all_finished(2)).await;
     assert_eq!(w.backend.requests()[1].model.as_deref(), Some("catalog-2"));
+    assert_eq!(w.backend.requests()[1].effort, Some(Effort::Xhigh));
     let new_card = last_card(&w, "om_card_2").await;
     assert!(
         new_card
@@ -3074,6 +3084,7 @@ async fn model_dropdown_keeps_the_saved_selection_when_a_running_card_is_redrawn
         &turns[0].id,
     )
     .await;
+    press(&w, Action::Effort(Effort::Low), &turns[0].id).await;
     gate.notify_one();
     press(&w, Action::Stop, &turns[0].id).await;
     until(&w, "停止", |turns| {
@@ -3085,11 +3096,17 @@ async fn model_dropdown_keeps_the_saved_selection_when_a_running_card_is_redrawn
         .as_array()
         .expect("元素")
         .iter()
-        .find(|element| element["element_id"] == "model_select")
+        .find(|element| element["element_id"] == "model_controls")
+        .map(|row| &row["columns"][0]["elements"][0])
         .expect("下拉框");
     assert_eq!(select["initial_option"], "catalog-2");
+    let row = card["body"]["elements"]
+        .as_array().expect("元素").iter()
+        .find(|element| element["element_id"] == "model_controls")
+        .expect("设置行");
+    assert_eq!(row["columns"][1]["elements"][0]["initial_option"], "low");
     assert!(
-        card.to_string().contains("本轮模型：opus"),
+        card.to_string().contains("本轮：opus"),
         "本轮执行模型仍保留原值"
     );
     assert_eq!(w.backend.model_queries.load(Ordering::SeqCst), 1);

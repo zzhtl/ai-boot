@@ -49,11 +49,11 @@
     },
     "summary": {
       "type": "string",
-      "description": "首屏概述，支持 Markdown 重点格式"
+      "description": "最开始的简要结论，通常一两句话直接回答问题；不堆叠原因、依据、方案等标签或重复详情。关键前提或更正须简短说明。支持 Markdown 重点格式"
     },
     "commands": {
       "type": "array",
-      "description": "本轮主操作，按执行顺序排列",
+      "description": "解决方案中的待执行命令，按执行顺序排列；不要在 summary 或 sections 重复同一命令",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -126,7 +126,7 @@
     },
     "sections": {
       "type": "array",
-      "description": "由模型组织的折叠详情",
+      "description": "按需提供详情，依次为根本原因或可疑原因、依据、解决方案；同一类只写一项，没有内容则省略，不凑齐章节。未经确认的原因用可疑原因；简单问题可为空数组",
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -136,7 +136,8 @@
         ],
         "properties": {
           "title": {
-            "type": "string"
+            "type": "string",
+            "enum": ["根本原因", "可疑原因", "依据", "解决方案"]
           },
           "body": {
             "type": "string",

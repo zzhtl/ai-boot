@@ -15,7 +15,7 @@ pub mod mcp;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Duration;
 
-use ai_boot_agent::ModelOption;
+use ai_boot_agent::{Effort, ModelOption};
 use ai_boot_feishu::api::ApiClient;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub struct Writer {
     settings: Settings,
     link_hosts: Vec<String>,
     serial: tokio::sync::Mutex<()>,
-    models: OnceLock<(Arc<ModelCache>, Option<String>)>,
+    models: OnceLock<(Arc<ModelCache>, Option<String>, Option<Effort>)>,
 }
 
 enum Failure {
@@ -82,8 +82,13 @@ enum Failure {
 }
 
 impl Writer {
-    pub fn set_models(&self, models: Arc<ModelCache>, default: Option<String>) {
-        self.models.get_or_init(|| (models, default));
+    pub fn set_models(
+        &self,
+        models: Arc<ModelCache>,
+        default: Option<String>,
+        effort: Option<Effort>,
+    ) {
+        self.models.get_or_init(|| (models, default, effort));
     }
 
     pub fn new(
@@ -358,13 +363,13 @@ impl Writer {
                 &self
                     .models
                     .get()
-                    .map(|(cache, _)| cache.choices())
+                    .map(|(cache, _, _)| cache.choices())
                     .unwrap_or_default(),
             ),
         ) else {
             return;
         };
-        if let Some((cache, default)) = self.models.get()
+        if let Some((cache, default, effort)) = self.models.get()
             && let Ok(Some(conversation)) = self.store.conversation_by_card(&card_id).await
         {
             card::refresh_model_select(
@@ -375,6 +380,10 @@ impl Writer {
                     .as_deref()
                     .or(default.as_deref())
                     .unwrap_or_default(),
+                conversation
+                    .effort_override
+                    .as_deref()
+                    .or(effort.map(|level| level.as_str())),
             );
         }
         for attempt in 1..=3 {
