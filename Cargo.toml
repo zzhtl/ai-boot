@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ai-boot-feishu", "crates/ai-boot-agent", "crates/ai-boot"]
+members = ["crates/ai-bot-feishu", "crates/ai-bot-agent", "crates/ai-bot"]
 resolver = "3"
 
 [workspace.package]
@@ -9,8 +9,8 @@ rust-version = "1.98"
 publish = false
 
 [workspace.dependencies]
-ai-boot-feishu = { path = "crates/ai-boot-feishu" }
-ai-boot-agent = { path = "crates/ai-boot-agent" }
+ai-bot-feishu = { path = "crates/ai-bot-feishu" }
+ai-bot-agent = { path = "crates/ai-bot-agent" }
 
 anyhow = "1.0"
 async-trait = "0.1"

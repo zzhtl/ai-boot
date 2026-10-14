@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 本机 Codex + qtmcp 部署：配置写到 ~/config/ai-boot，服务以当前用户运行。
+# 本机 Codex + qtmcp 部署：配置写到 ~/config/ai-bot，服务以当前用户运行。
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-REFERENCE=${1:-$HOME/qt/ai-boot/config.toml}
-CONFIG_DIR=$HOME/config/ai-boot
+REFERENCE=${1:-$HOME/qt/ai-bot/config.toml}
+CONFIG_DIR=$HOME/config/ai-bot
 CODEX_DIR=${CODEX_HOME:-$HOME/.codex}
 QTMCP_CONFIG_PATH=${QTMCP_CONFIG:-$HOME/.config/qtmcp/config.toml}
 START=${2:-}
@@ -53,12 +53,12 @@ if not config.exists():
         f'go_sdk_program = {quote(str(destination / "bin/feishu-go-ws"))}',
         '[access]', f'allowed_emails = {quote(source["access"].get("allowed_emails", []))}',
         f'allowed_open_ids = {quote(source["access"].get("allowed_open_ids", []))}',
-        '[storage]', f'data_dir = {quote(str(home / ".local/share/ai-boot"))}',
+        '[storage]', f'data_dir = {quote(str(home / ".local/share/ai-bot"))}',
         '[agent]', 'backend = "codex"', 'model = "gpt-6.1-sol"', 'effort = "high"',
         f'timeout_secs = {source.get("agent", {}).get("timeout_secs", 7200)}',
         f'max_concurrent = {source.get("agent", {}).get("max_concurrent", 1)}',
-        '[agent.codex]', f'program = {quote(env["SETUP_CODEX_BIN"])}', 'profile = "ai-boot"',
-        '[agent.hook]', f'program = {quote(str(destination / "bin/ai-boot"))}',
+        '[agent.codex]', f'program = {quote(env["SETUP_CODEX_BIN"])}', 'profile = "ai-bot"',
+        '[agent.hook]', f'program = {quote(str(destination / "bin/ai-bot"))}',
         '[render]', f'link_hosts = {quote(hosts)}', '',
     ]))
     config.chmod(0o600)
@@ -73,9 +73,9 @@ if not config.exists():
                 f.write(f'{key} = {str(value).lower() if isinstance(value, bool) else quote(value)}\n')
 data = pathlib.Path(tomllib.loads(config.read_text())['storage']['data_dir'])
 data.mkdir(parents=True, exist_ok=True, mode=0o700)
-secret = destination / 'ai-boot.env'
+secret = destination / 'ai-bot.env'
 if not secret.exists():
-    env_file = next((reference.parent / name for name in ['ai-boot.env', 'dev.env']
+    env_file = next((reference.parent / name for name in ['ai-bot.env', 'dev.env']
                      if (reference.parent / name).exists()), None)
     if env_file is None:
         secret.write_text('FEISHU_APP_SECRET=\n')
@@ -87,7 +87,7 @@ if not secret.exists():
         raise SystemExit(f'{env_file} 需要非空的 FEISHU_APP_SECRET')
     secret.write_text(lines[0] + '\n')
     secret.chmod(0o600)
-profile = codex / 'ai-boot.config.toml'
+profile = codex / 'ai-bot.config.toml'
 if not profile.exists():
     lines = ['model = "gpt-6.1-sol"', 'model_reasoning_effort = "high"', 'web_search = "live"']
     base_config = codex / 'config.toml'
@@ -98,13 +98,13 @@ if not profile.exists():
     profile.write_text('\n'.join(lines) + '\n')
     profile.chmod(0o600)
 
-unit = home / '.config/systemd/user/ai-boot.service'
+unit = home / '.config/systemd/user/ai-bot.service'
 # systemd 的路径值与 shell 引号规则不同；环境值、可执行文件和参数单独引用。
 systemd_quote = lambda value: json.dumps(str(value)).replace('%', '%%').replace('$', '$$')
 unit.write_text('\n'.join([
-    '[Unit]', 'Description=ai-boot Feishu Codex bridge',
+    '[Unit]', 'Description=ai-bot Feishu Codex bridge',
     '[Service]', 'Type=simple',
-    f'ExecStart={systemd_quote(destination / "bin/ai-boot")} run --config {systemd_quote(config)}',
+    f'ExecStart={systemd_quote(destination / "bin/ai-bot")} run --config {systemd_quote(config)}',
     f'EnvironmentFile={str(secret).replace("%", "%%")}',
     f'Environment={systemd_quote("HOME=" + str(home))}',
     f'Environment={systemd_quote("CODEX_HOME=" + str(codex))}',
@@ -116,7 +116,7 @@ unit.write_text('\n'.join([
         'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY',
         'https_proxy', 'http_proxy', 'all_proxy', 'no_proxy',
     ) if env.get(key)],
-    'Environment=AI_BOOT_LOG=info', 'Restart=on-failure', 'RestartSec=5',
+    'Environment=AI_BOT_LOG=info', 'Restart=on-failure', 'RestartSec=5',
     'KillMode=control-group', 'TimeoutStopSec=30', 'UMask=0077',
     'MemoryMax=4G', 'TasksMax=512', 'NoNewPrivileges=true',
     '[Install]', 'WantedBy=default.target', '',
@@ -130,25 +130,25 @@ PY
 )
 chmod 0755 "$CONFIG_DIR/bin/feishu-go-ws.new"
 mv -f "$CONFIG_DIR/bin/feishu-go-ws.new" "$CONFIG_DIR/bin/feishu-go-ws"
-cargo build --release --manifest-path "$ROOT/Cargo.toml" -p ai-boot
-install -m 0755 "$ROOT/target/release/ai-boot" "$CONFIG_DIR/bin/ai-boot.new"
-mv -f "$CONFIG_DIR/bin/ai-boot.new" "$CONFIG_DIR/bin/ai-boot"
+cargo build --release --manifest-path "$ROOT/Cargo.toml" -p ai-bot
+install -m 0755 "$ROOT/target/release/ai-bot" "$CONFIG_DIR/bin/ai-bot.new"
+mv -f "$CONFIG_DIR/bin/ai-bot.new" "$CONFIG_DIR/bin/ai-bot"
 systemctl --user daemon-reload
 
 # 按最终 unit 的环境自检，包括 SSH agent 与构建、部署工具的配置。
-mapfile -d '' -t SERVICE_ENV < <(systemctl --user show ai-boot.service --property=Environment --value |
+mapfile -d '' -t SERVICE_ENV < <(systemctl --user show ai-bot.service --property=Environment --value |
     python3 -c 'import shlex,sys; [sys.stdout.buffer.write(v.encode() + b"\0") for v in shlex.split(sys.stdin.read())]')
-DOCTOR_PROPERTIES=("-p" "EnvironmentFile=$CONFIG_DIR/ai-boot.env")
+DOCTOR_PROPERTIES=("-p" "EnvironmentFile=$CONFIG_DIR/ai-bot.env")
 for value in "${SERVICE_ENV[@]}"; do
     DOCTOR_PROPERTIES+=("-p" "Environment=$value")
 done
 systemd-run --user --quiet --pipe --wait --collect \
     "${DOCTOR_PROPERTIES[@]}" \
-    "$CONFIG_DIR/bin/ai-boot" doctor --config "$CONFIG_DIR/config.toml"
+    "$CONFIG_DIR/bin/ai-bot" doctor --config "$CONFIG_DIR/config.toml"
 
 if [[ $START != --no-start ]]; then
-    systemctl --user enable ai-boot
-    systemctl --user restart ai-boot
-    systemctl --user --no-pager --lines=0 status ai-boot
+    systemctl --user enable ai-bot
+    systemctl --user restart ai-bot
+    systemctl --user --no-pager --lines=0 status ai-bot
 fi
-echo "查看日志：journalctl --user -u ai-boot -f"
+echo "查看日志：journalctl --user -u ai-bot -f"

@@ -1,14 +1,14 @@
-# ai-boot
+# ai-bot
 
 飞书里的问题排查机器人。通过飞书长连接收消息，在本机调起 Codex 或 Claude Code 分析，经 qtmcp 查阅和操作 Jira / Confluence / GitLab / Jenkins，把结论渲染成卡片回复到飞书。
 
 ```
-提问：飞书 ──长连接──▶ ai-boot ──▶ codex exec -p ai-boot / claude -p ──MCP──▶ qtmcp
-回复：Agent 的结构化答案 ──▶ ai-boot 渲染成卡片 ──▶ 飞书
+提问：飞书 ──长连接──▶ ai-bot ──▶ codex exec -p ai-bot / claude -p ──MCP──▶ qtmcp
+回复：Agent 的结构化答案 ──▶ ai-bot 渲染成卡片 ──▶ 飞书
 ```
 
 - **不需要公网入口**：事件和卡片回调都走飞书长连接（WebSocket），机器能出网访问 `open.feishu.cn` 就行，不用域名和回调地址。
-- **复用本机的 Codex**：使用已有的 `codex login` 和 `CODEX_HOME`，正常加载本机配置、AGENTS.md、skills、插件、rules、MCP 与 OTEL。部署配置固定 GPT-6.1 Sol（`gpt-6.1-sol`）和 high，不受个人默认模型变化影响。调用使用 `codex exec -p ai-boot`，权限及功能开关沿用本机；飞书无人值守，审批策略为 `never`。支持图片、结构化回复、多轮续接、停止和超时。
+- **复用本机的 Codex**：使用已有的 `codex login` 和 `CODEX_HOME`，正常加载本机配置、AGENTS.md、skills、插件、rules、MCP 与 OTEL。部署配置固定 GPT-6.1 Sol（`gpt-6.1-sol`）和 high，不受个人默认模型变化影响。调用使用 `codex exec -p ai-bot`，权限及功能开关沿用本机；飞书无人值守，审批策略为 `never`。支持图片、结构化回复、多轮续接、停止和超时。
 - **复用本机的 Claude Code**：直接用部署用户已登录的 `claude`，不另配 token；auto 权限模式，模型跟随 CLI 默认，推理强度 xhigh：正确优先，多花的时间用在逐条核对证据上。
 - **qtmcp 可选**：装了就接上，Agent 能读写 Jira、Confluence、GitLab、Jenkins（GitLab 能按关键词搜代码、看文件历史和 blame、按版本号找 tag，要用带这些动作的 qtmcp）；没装就只凭聊天内容回答。
 - **联网和命令行**：Codex profile 显式启用 `web_search = "live"`，使用原生 Web 搜索和网页读取；原始网页、文件下载可通过 shell 的 curl / Python 获取。shell 沿用本机 Codex 权限及服务用户的 PATH，可执行命令、读写任务文件和运行工具链。Claude 对应使用 WebSearch、WebFetch、Bash。公开仓库可 clone 到会话工作目录后检索；需要在提问人现场执行的命令仍作为回复给出。
@@ -16,13 +16,15 @@
 
 ## 本机 Codex 部署
 
+从旧名称 `ai-boot` 升级时，先停止并禁用旧服务，再将配置、数据目录和 Codex profile 改名为 `ai-bot`，更新配置中的路径及 profile。数据库 `ai-boot.db` 和存在的 `-wal`、`-shm` 文件也须一起改为 `ai-bot.db`；迁移原数据后再启动，避免创建空数据库。历史附件路径可用旧数据目录到新目录的符号链接保留。旧 Jira 写回标记仍参与查重。
+
 飞书应用已经配置好、本机 Codex 已登录、qtmcp 可用时，运行：
 
 ```bash
-deploy/setup-codex.sh /home/qingteng/qt/ai-boot/config.toml
+deploy/setup-codex.sh /home/qingteng/qt/ai-bot/config.toml
 ```
 
-参考配置提供飞书 App ID、白名单、上下文和卡片设置；也兼容目录中的 `dev.toml`。密钥用同目录的 `ai-boot.env` / `dev.env`，或填入 `~/config/ai-boot/ai-boot.env` 的 `FEISHU_APP_SECRET`。脚本生成 `~/config/ai-boot/config.toml`、`ai-boot.env` 和 `bin/ai-boot`，注册并启动用户级 systemd 服务；已有配置、密钥和 profile 保留。qtmcp 配置默认使用 `~/.config/qtmcp/config.toml`，可通过 `QTMCP_CONFIG` 指定。完整字段见 `config.codex.example.toml`。Codex 不支持 `budget_usd`，用 `timeout_secs` 限制单轮执行时间；Codex 示例及未指定超时的新部署预留 7200 秒（2 小时），参考配置或已有配置中的超时保留。停止或超时只停止本地 Agent，已触发的远端任务需按具体 ID 查询，不能假定同时停止。
+参考配置提供飞书 App ID、白名单、上下文和卡片设置；也兼容目录中的 `dev.toml`。密钥用同目录的 `ai-bot.env` / `dev.env`，或填入 `~/config/ai-bot/ai-bot.env` 的 `FEISHU_APP_SECRET`。脚本生成 `~/config/ai-bot/config.toml`、`ai-bot.env` 和 `bin/ai-bot`，注册并启动用户级 systemd 服务；已有配置、密钥和 profile 保留。qtmcp 配置默认使用 `~/.config/qtmcp/config.toml`，可通过 `QTMCP_CONFIG` 指定。完整字段见 `config.codex.example.toml`。Codex 不支持 `budget_usd`，用 `timeout_secs` 限制单轮执行时间；Codex 示例及未指定超时的新部署预留 7200 秒（2 小时），参考配置或已有配置中的超时保留。停止或超时只停止本地 Agent，已触发的远端任务需按具体 ID 查询，不能假定同时停止。
 
 新生成的 `[agent]` 默认 `model = "gpt-6.1-sol"`、`effort = "high"`；升级已有部署时，在服务实际使用的配置中补上这两项并重启。新会话、续接和重试每次都显式传入，启动和每轮日志记录模型及推理强度。
 
@@ -30,22 +32,22 @@ Codex 的进度、答案和失败卡片将模型、推理强度下拉框和「�
 
 切换后通过提示显示已保存的模型和强度；卡片上的「本轮」仍保留该轮执行时的配置。尚未开始的排队任务、下一轮追问、续接、重试和闭环方案使用新设置，正在执行的一轮不会中途切换。要立即重新分析，先切换，再「停止 → 重试」；已经成功的答案可在输入框追问「请用当前配置重新分析」。点击「恢复默认模型和强度」撤销当前会话的覆盖，清空上下文或新建会话也会恢复服务默认值。
 
-部署脚本还会构建并安装官方 Go SDK 长连接程序 `bin/feishu-go-ws`（SDK v3.12.0，需要 Go 1.24+）。`feishu.go_sdk_program` 指向它时，ai-boot 自动拉起 SDK，通过进程管道接收消息、处理卡片回调并返回 ACK，停止服务时 SDK 一起退出。应用用 App ID 和 App Secret 鉴权；长连接建立后，在飞书开发者后台登录并保存“使用长连接接收事件”订阅方式，添加 `im.message.receive_v1` 和回调 `card.action.trigger`。SDK 本身不需要用户扫码登录。未配置 `go_sdk_program` 时继续使用内置长连接客户端。
+部署脚本还会构建并安装官方 Go SDK 长连接程序 `bin/feishu-go-ws`（SDK v3.12.0，需要 Go 1.24+）。`feishu.go_sdk_program` 指向它时，ai-bot 自动拉起 SDK，通过进程管道接收消息、处理卡片回调并返回 ACK，停止服务时 SDK 一起退出。应用用 App ID 和 App Secret 鉴权；长连接建立后，在飞书开发者后台登录并保存“使用长连接接收事件”订阅方式，添加 `im.message.receive_v1` 和回调 `card.action.trigger`。SDK 本身不需要用户扫码登录。未配置 `go_sdk_program` 时继续使用内置长连接客户端。
 
-`~/.codex/ai-boot.config.toml`（设置了 `CODEX_HOME` 时在该目录下）叠加在本机 `config.toml` 上，也可以直接用于 `codex -p ai-boot`。新 profile 配置模型、实时 Web 搜索和必要的 qtmcp 审批设置，其余能力与终端一致；不再使用 `--ignore-user-config`、`--ignore-rules` 或临时 `CODEX_HOME`。飞书聊天各自绑定独立的 Codex 会话 ID，续接始终指定 ID，不使用 `--last`。Codex 历史保存在本机共享存储，由 Codex 管理；ai-boot 清空上下文后创建新的会话，不删除本机共享历史。旧版隔离会话续接失败时自动用已保存的前情恢复；旧隔离目录仍参与 ai-boot 清理。
+`~/.codex/ai-bot.config.toml`（设置了 `CODEX_HOME` 时在该目录下）叠加在本机 `config.toml` 上，也可以直接用于 `codex -p ai-bot`。新 profile 配置模型、实时 Web 搜索和必要的 qtmcp 审批设置，其余能力与终端一致；不再使用 `--ignore-user-config`、`--ignore-rules` 或临时 `CODEX_HOME`。飞书聊天各自绑定独立的 Codex 会话 ID，续接始终指定 ID，不使用 `--last`。Codex 历史保存在本机共享存储，由 Codex 管理；ai-bot 清空上下文后创建新的会话，不删除本机共享历史。旧版隔离会话续接失败时自动用已保存的前情恢复；旧隔离目录仍参与 ai-bot 清理。
 
 MCP 默认沿用本机 Codex 配置，qtmcp 应先在本机配置好。生成的 profile 为已有 qtmcp 设置 `default_tools_approval_mode = "approve"`，避免兼有读写 action 的工具在无人值守模式下被审批阻塞；如显式配置 `[[agent.mcp]]`，只覆盖对应 server 的字段，保留本机其他 server。排错优先读取内部文档、代码和日志，写操作只在当前任务明确授权时执行；继续同一任务沿用授权。OTEL 直接使用本机 `[otel]`，无需复制到 profile；收到最终结果后让 Codex 正常退出，保证日志有机会 flush。
 
-Codex 默认传递服务环境中的 SSH agent、Git、Java/Go/Rust、Kubernetes/Docker 和代理设置，部署脚本保存已设置的工具路径与连接配置；SSH agent 使用用户 systemd manager 的环境，避免固定过期 socket。终端后来更改的变量不会自动更新已运行的服务，可更新 unit 或 `ai-boot.env` 后重启；额外变量按需加入 `agent.codex.env_passthrough`，App Secret 等其他密钥不自动传给 Agent。
+Codex 默认传递服务环境中的 SSH agent、Git、Java/Go/Rust、Kubernetes/Docker 和代理设置，部署脚本保存已设置的工具路径与连接配置；SSH agent 使用用户 systemd manager 的环境，避免固定过期 socket。终端后来更改的变量不会自动更新已运行的服务，可更新 unit 或 `ai-bot.env` 后重启；额外变量按需加入 `agent.codex.env_passthrough`，App Secret 等其他密钥不自动传给 Agent。
 
 ```bash
-systemctl --user status ai-boot
-journalctl --user -u ai-boot -f
-systemctl --user restart ai-boot
-systemctl --user stop ai-boot
+systemctl --user status ai-bot
+journalctl --user -u ai-bot -f
+systemctl --user restart ai-bot
+systemctl --user stop ai-bot
 ```
 
-需要注销后继续运行、开机自动启动时执行 `loginctl enable-linger "$USER"`。升级时重跑部署脚本；只准备部署和自检、暂不启动时添加第二个参数 `--no-start`。回退时停止服务，换回上一个二进制和配置，再重启。以下 `deploy/setup.sh`、`/etc/ai-boot` 和 Claude hook 的部署说明适用于 Claude 后端。
+需要注销后继续运行、开机自动启动时执行 `loginctl enable-linger "$USER"`。升级时重跑部署脚本；只准备部署和自检、暂不启动时添加第二个参数 `--no-start`。回退时停止服务，换回上一个二进制和配置，再重启。以下 `deploy/setup.sh`、`/etc/ai-bot` 和 Claude hook 的部署说明适用于 Claude 后端。
 
 ## 工作方式
 
@@ -122,24 +124,24 @@ systemctl --user stop ai-boot
 用已登录 `claude` 的普通用户，在仓库目录里运行：
 
 ```bash
-git clone <仓库地址> ai-boot && cd ai-boot
+git clone <仓库地址> ai-bot && cd ai-bot
 deploy/setup.sh
 ```
 
 脚本需要 root 的步骤自己 sudo，依次完成：
 
 1. 检查环境：systemd、sudo、claude 的登录状态（按服务的环境检查，只认 `~/.claude` 里的登录）、lark-cli、qtmcp、cargo。
-2. `cargo build --release -p ai-boot` 编译。
-3. 用 `deploy/install.sh` 安装 ai-boot、systemd unit 和 `/etc/ai-boot`。claude 和 qtmcp 用你自己的，不另装。
-4. 按 `config.example.toml` 生成 `/etc/ai-boot/config.toml`：
+2. `cargo build --release -p ai-bot` 编译。
+3. 用 `deploy/install.sh` 安装 ai-bot、systemd unit 和 `/etc/ai-bot`。claude 和 qtmcp 用你自己的，不另装。
+4. 按 `config.example.toml` 生成 `/etc/ai-bot/config.toml`：
    - App ID 和白名单来自 lark-cli；
    - claude、qtmcp 用你 PATH 里的绝对路径；
    - 卡片链接白名单取 qtmcp 配置里各服务的域名；
    - 不配可选的 `[oauth]`、`[writeback]`。
 
    已有配置默认不动。
-5. 把 App Secret 写进 `/etc/ai-boot/ai-boot.env`（root 所有、0600）。
-6. 写 systemd drop-in `/etc/systemd/system/ai-boot.service.d/host-claude.conf`：
+5. 把 App Secret 写进 `/etc/ai-bot/ai-bot.env`（root 所有、0600）。
+6. 写 systemd drop-in `/etc/systemd/system/ai-bot.service.d/host-claude.conf`：
    - 以你的身份运行，复用 `~/.claude` 的登录；
    - 家目录绑进沙箱；
    - 藏起 `~/.ssh`、`~/.gnupg`、lark-cli、keyring 等凭据目录。
@@ -148,7 +150,7 @@ deploy/setup.sh
 9. `deploy/doctor.sh` 自检，通过后设为开机自启并（重新）启动服务。
 
 **脚本里唯一要手动的一步**：第一次运行时粘贴一次 App Secret（开发者后台 → 凭证与基础信息 → 应用凭证）。上面「飞书开发者后台」的几步 lark-cli 没有接口可以代劳，只能在后台做一次，脚本负责核对。
-- 输入不回显，只经 stdin 写进 `ai-boot.env`，不出现在命令行参数和日志里。
+- 输入不回显，只经 stdin 写进 `ai-bot.env`，不出现在命令行参数和日志里。
 - 没有终端时，用环境变量 `FEISHU_APP_SECRET` 传入。
 - lark-cli 按设计加密保存 App Secret、不对外提供，所以脚本没法替你读取。
 
@@ -156,7 +158,7 @@ deploy/setup.sh
 | --- | --- |
 | `--app-id cli_xxx` | 飞书应用的 App ID，默认取 lark-cli 绑定的应用 |
 | `--allow-open-id ou_xxx` | 白名单，可重复。默认是你在 lark-cli 里的 open_id；open_id 按应用区分，lark-cli 绑的是别的应用时必须显式指定 |
-| `--binary <路径>` | 用编译好的 ai-boot，跳过编译 |
+| `--binary <路径>` | 用编译好的 ai-bot，跳过编译 |
 | `--force-config` | 按本次环境重新生成配置，旧文件备份为 `config.toml.bak.<时间>` |
 | `--reset-secret` | 重新输入 App Secret（默认保留已有的） |
 | `--no-start` | 只安装和自检，不启动服务 |
@@ -166,11 +168,11 @@ deploy/setup.sh
 ## 验证与运维
 
 - **自检**：`sudo deploy/doctor.sh`。
-  - 用服务的身份、环境和沙箱运行 `ai-boot doctor`。
+  - 用服务的身份、环境和沙箱运行 `ai-bot doctor`。
   - 逐项检查：配置、数据目录、数据库、飞书凭据和机器人能力、白名单、claude 登录、工具判决 hook、qtmcp、SSO 会话目录、PDF/Office/graphviz 工具。
   - 改了配置或环境，先跑它。
-- **日志**：`journalctl -u ai-boot -f`，看不到就加 sudo。
-- **重启**：`sudo systemctl restart ai-boot`。改了 `/etc/ai-boot/config.toml` 要重启才生效。
+- **日志**：`journalctl -u ai-bot -f`，看不到就加 sudo。
+- **重启**：`sudo systemctl restart ai-bot`。改了 `/etc/ai-bot/config.toml` 要重启才生效。
 - **升级**：`git pull && deploy/setup.sh`。
   - 重新编译，原子替换二进制，运行中的进程不受影响。
   - 保留配置和 App Secret。
@@ -179,38 +181,38 @@ deploy/setup.sh
 
 | 路径 | 内容 |
 | --- | --- |
-| `/etc/ai-boot/config.toml` | 配置（root:部署用户，0640） |
-| `/etc/ai-boot/ai-boot.env` | App Secret（root，0600） |
-| `/var/lib/ai-boot/` | `ai-boot.db`：会话、提问和答案。`sessions/`：每个会话的工作目录，存聊天记录和附件（图片、文件）。`backup/`：数据库每天备份一次，只留最新一份 |
-| `~/.claude/projects/-var-lib-ai-boot-sessions-*` | claude 的会话记录。复用本机登录时写在你的 `~/.claude` 下 |
+| `/etc/ai-bot/config.toml` | 配置（root:部署用户，0640） |
+| `/etc/ai-bot/ai-bot.env` | App Secret（root，0600） |
+| `/var/lib/ai-bot/` | `ai-bot.db`：会话、提问和答案。`sessions/`：每个会话的工作目录，存聊天记录和附件（图片、文件）。`backup/`：数据库每天备份一次，只留最新一份 |
+| `~/.claude/projects/-var-lib-ai-bot-sessions-*` | claude 的会话记录。复用本机登录时写在你的 `~/.claude` 下 |
 
 **信息最多保留 30 天**：会话创建满 30 天，它的全部数据一起删除——库里的提问、答案、原始消息和写回记录，工作目录里的聊天记录和附件，以及 claude 的会话记录；删完整理数据库文件，被删的内容不会留在空闲页里。备份在清理之后做、只留一份，所以备份里也没有过期数据。之后群里再提问会开新会话，重新拉最近的聊天记录，需要的图片和文件重新下载。每天自动执行一次，不用人管。
 | `~/.local/share/qtmcp/` | 和交互式 qtmcp 共用的 SSO 会话 |
-| `/opt/ai-boot/bin/ai-boot`、`/etc/systemd/system/ai-boot.service{,.d/}` | 程序、unit 和 drop-in |
+| `/opt/ai-bot/bin/ai-bot`、`/etc/systemd/system/ai-bot.service{,.d/}` | 程序、unit 和 drop-in |
 
 卸载：
 
 ```bash
-sudo systemctl disable --now ai-boot
-sudo rm -rf /etc/systemd/system/ai-boot.service /etc/systemd/system/ai-boot.service.d /opt/ai-boot
+sudo systemctl disable --now ai-bot
+sudo rm -rf /etc/systemd/system/ai-bot.service /etc/systemd/system/ai-bot.service.d /opt/ai-bot
 sudo systemctl daemon-reload
 # 配置、密钥和聊天数据，确定不要了再删
-sudo rm -rf /etc/ai-boot /var/lib/ai-boot /var/lib/qtmcp
-rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
+sudo rm -rf /etc/ai-bot /var/lib/ai-bot /var/lib/qtmcp
+rm -rf ~/.claude/projects/-var-lib-ai-bot-sessions-*
 ```
 
 ## 常见问题
 
 **机器人没反应**
 
-1. 看日志 `journalctl -u ai-boot -f`：
+1. 看日志 `journalctl -u ai-bot -f`：
    - 有没有「长连接已建立」；
    - 发消息后有没有记录；
    - 白名单外的人会记「非白名单用户，已忽略」。
 2. 看是不是长连接断了：日志里有「长连接断开，准备重连」。断开后 30 秒重连，还连不上就每 120 秒试一次，恢复后自动接着收消息，不用重启；应用被停用、凭据失效这类后台问题修好之后也会自己连上。进程本身异常退出由 systemd 在 5 秒后拉起。
 3. 检查同一个应用的长连接是不是被别的进程占了。
    - 飞书长连接是集群模式：同一应用有多个客户端在线时，每条事件只随机投给其中一个，表现为时灵时不灵。
-   - 停掉其他连着这个应用的进程，常见的有 `lark-cli event consume`、另一台机器上的 ai-boot、别的用这个 App ID 的 SDK 程序。
+   - 停掉其他连着这个应用的进程，常见的有 `lark-cli event consume`、另一台机器上的 ai-bot、别的用这个 App ID 的 SDK 程序。
 4. 检查开发者后台：
    - 事件订阅方式是不是长连接，`im.message.receive_v1` 有没有加，改完有没有发布新版本；
    - 群里要 @ 机器人，机器人要在群里；
@@ -236,7 +238,7 @@ rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
 
 ## 配置
 
-`/etc/ai-boot/config.toml` 的主要字段（完整说明见 `config.example.toml` 的注释）：
+`/etc/ai-bot/config.toml` 的主要字段（完整说明见 `config.example.toml` 的注释）：
 
 | 字段 | 说明 |
 | --- | --- |
@@ -257,7 +259,7 @@ rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
 
 聊天内容、附件、文档和 Jira 正文都是不可信输入，下面的限制都是按这个前提定的。
 
-- **复用本机登录的取舍**：好处和代价如下。要隔离，就用独立的服务用户：`deploy/install.sh` 默认的 `ai-boot` 用户，配合 unit 里的 `CLAUDE_CONFIG_DIR` 和 `CLAUDE_CODE_OAUTH_TOKEN`。
+- **复用本机登录的取舍**：好处和代价如下。要隔离，就用独立的服务用户：`deploy/install.sh` 默认的 `ai-bot` 用户，配合 unit 里的 `CLAUDE_CONFIG_DIR` 和 `CLAUDE_CODE_OAUTH_TOKEN`。
   - 好处：省掉单独的 token 和配置，claude 跟着你的安装自动升级。
   - 代价：服务以你的 Unix 用户身份运行，用量计入你的 Claude 账号额度，和你本人的 claude 共用 `~/.claude.json` 等文件。
 - **沙箱**：
@@ -268,18 +270,18 @@ rm -rf ~/.claude/projects/-var-lib-ai-boot-sessions-*
     - 家目录里其余的文件，服务进程仍然可以读写。
   - claude 层：
     - `--restricted` 忽略你的 user / project / local settings，文件工具（Read、Glob、Grep）只能访问本轮的工作目录；
-    - `--strict-mcp-config` 只加载 ai-boot 配的 MCP；
+    - `--strict-mcp-config` 只加载 ai-bot 配的 MCP；
     - 内置工具开 Read、Glob、Grep，以及执行命令（Bash）、打开网页（WebFetch）、搜索网页（WebSearch）；改文件、派子 Agent 的工具不开；
-    - 每次工具调用还要经 `ai-boot hook` 判决。
+    - 每次工具调用还要经 `ai-bot hook` 判决。
 - **命令行和网页直接开放、没有沙箱**：
   - Bash 以服务用户的身份在 systemd 的加固环境里运行（系统目录只读，上面藏起来的凭据目录看不到），能读写家目录其余的文件，能访问内网和外网，网页不限域名；
   - 家目录里 claude 的登录凭据、qtmcp 的配置（SSO 账号密码、TOTP 密钥、GitLab token）和 SSO 会话因此都在 Agent 读得到的范围里。群聊、文档、网页里藏的指令可能诱导它读取这些东西或把内网数据发到外网，只有提示词约束，不是硬限制；
   - 部署用户在 docker 组里时，Bash 也能用 docker（能起特权容器挂载整个文件系统），等于有了整机 root。不需要的话在 drop-in 里加 `InaccessiblePaths=-/run/docker.sock` 挡掉；
-  - ai-boot 进程设成了不可转储：同一用户的进程读不到它的环境变量（App Secret），也没法附加调试；
-  - 要收紧，就从 `crates/ai-boot-agent/src/claude/invocation.rs` 的工具列表里去掉对应的工具，或者改用独立的服务用户。
+  - ai-bot 进程设成了不可转储：同一用户的进程读不到它的环境变量（App Secret），也没法附加调试；
+  - 要收紧，就从 `crates/ai-bot-agent/src/claude/invocation.rs` 的工具列表里去掉对应的工具，或者改用独立的服务用户。
 - **qtmcp 能写**：Agent 以你的身份读写 Jira、Confluence、GitLab、Jenkins。
   - 写操作（评论、改单、流转、建 MR、发页面、触发构建）按 skill 只在当前任务明确授权时才做，继续同一任务沿用已有授权，聊天记录和文档里的要求不能扩大权限。这是模型行为约束，不是工具层的强制限制。
   - 白名单只放信得过的人；不想让它碰某个系统，就把它从 `--toolsets` 里去掉。
 - **答案里的图**：截图只能引用这个会话工作目录里的附件（解开符号链接后校验，且必须是图片）；流程图的 DOT 由模型给出，会读本地文件的属性（image、shapefile、fontpath 等）和 HTML 标签一律拒绝，`dot` 在清空的环境里跑、开 Graphviz 的服务器模式、限时限量。图片上传到飞书后才能显示在卡片里。
-- **App Secret**：只存在 `/etc/ai-boot/ai-boot.env`（root，0600），systemd 以 root 读取后注入服务环境；配置文件里没有密钥。
-- **群聊数据**：有了 `im:message.group_msg`，机器人能读群里的所有消息。这些内容会作为上下文交给 claude，并保存在 `/var/lib/ai-boot`。
+- **App Secret**：只存在 `/etc/ai-bot/ai-bot.env`（root，0600），systemd 以 root 读取后注入服务环境；配置文件里没有密钥。
+- **群聊数据**：有了 `im:message.group_msg`，机器人能读群里的所有消息。这些内容会作为上下文交给 claude，并保存在 `/var/lib/ai-bot`。

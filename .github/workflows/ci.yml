@@ -35,5 +35,5 @@ jobs:
       # 编排层只认 AgentBackend，具体后端只能在装配代码（main.rs）里出现，接 Codex 时才不用动编排
       - name: backend boundary
         run: |
-          ! grep -rnE --include='*.rs' 'ai_boot_agent::(\{[^}]*)?claude' crates/ai-boot/src \
-            | grep -v '^crates/ai-boot/src/main.rs:'
+          ! grep -rnE --include='*.rs' 'ai_bot_agent::(\{[^}]*)?claude' crates/ai-bot/src \
+            | grep -v '^crates/ai-bot/src/main.rs:'

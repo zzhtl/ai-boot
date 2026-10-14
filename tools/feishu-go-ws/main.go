@@ -1,4 +1,4 @@
-// feishu-go-ws 用官方 Go SDK 收消息，通过 stdin/stdout 交给 ai-boot 处理和回传 ACK。
+// feishu-go-ws 用官方 Go SDK 收消息，通过 stdin/stdout 交给 ai-bot 处理和回传 ACK。
 package main
 
 import (
@@ -64,7 +64,7 @@ func (b *bridge) handle(ctx context.Context, payload []byte) (json.RawMessage, e
 	err := b.output.Encode(request{ID: id, Payload: payload})
 	b.writer.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("向 ai-boot 转发事件: %w", err)
+		return nil, fmt.Errorf("向 ai-bot 转发事件: %w", err)
 	}
 	select {
 	case result := <-reply:
@@ -73,7 +73,7 @@ func (b *bridge) handle(ctx context.Context, payload []byte) (json.RawMessage, e
 		}
 		return result.Payload, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("等待 ai-boot ACK: %w", ctx.Err())
+		return nil, fmt.Errorf("等待 ai-bot ACK: %w", ctx.Err())
 	}
 }
 
@@ -83,7 +83,7 @@ func (b *bridge) readReplies(input io.Reader) error {
 	for scanner.Scan() {
 		var result response
 		if err := json.Unmarshal(scanner.Bytes(), &result); err != nil {
-			return fmt.Errorf("解析 ai-boot ACK: %w", err)
+			return fmt.Errorf("解析 ai-bot ACK: %w", err)
 		}
 		b.mu.Lock()
 		reply := b.pending[result.ID]
@@ -131,14 +131,14 @@ func main() {
 	}
 	// SDK 的默认日志写 os.Stdout；保留原管道做协议，SDK 日志统一进入 journald。
 	os.Stdout = os.Stderr
-	// 与 ai-boot 主进程一致，防止同一用户的 Agent 从 /proc 读取 App Secret。
+	// 与 ai-bot 主进程一致，防止同一用户的 Agent 从 /proc 读取 App Secret。
 	const prSetDumpable = 4
 	if _, _, errno := syscall.Syscall(syscall.SYS_PRCTL, prSetDumpable, 0, 0); errno != 0 {
 		log.Fatalf("保护应用凭据失败: %v", errno)
 	}
 	appID, secret := os.Getenv("FEISHU_APP_ID"), os.Getenv("FEISHU_APP_SECRET")
 	if appID == "" || secret == "" {
-		log.Fatal("需要 FEISHU_APP_ID 和 FEISHU_APP_SECRET，由 ai-boot 提供")
+		log.Fatal("需要 FEISHU_APP_ID 和 FEISHU_APP_SECRET，由 ai-bot 提供")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

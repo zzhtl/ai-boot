@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# 一键部署 ai-boot：用已经登录了 claude 的普通用户运行，需要 root 的步骤脚本自己 sudo。
+# 一键部署 ai-bot：用已经登录了 claude 的普通用户运行，需要 root 的步骤脚本自己 sudo。
 #
-#   deploy/setup.sh [--app-id cli_xxx] [--allow-open-id ou_xxx]... [--binary <ai-boot 可执行文件>]
+#   deploy/setup.sh [--app-id cli_xxx] [--allow-open-id ou_xxx]... [--binary <ai-bot 可执行文件>]
 #                   [--force-config] [--reset-secret] [--no-start]
 #
 # 服务以当前用户的身份运行，复用这台机器上已登录的 claude 和 qtmcp（配置、SSO 会话），
-# 只安装 ai-boot 本身。可以重复运行，升级就是 git pull 后重跑：已有的配置和 App Secret
+# 只安装 ai-bot 本身。可以重复运行，升级就是 git pull 后重跑：已有的配置和 App Secret
 # 默认保留，服务重启后换上新版本。
 #
 # App Secret 只从环境变量 FEISHU_APP_SECRET 或终端隐藏输入读取，经 stdin 写进 root 所有、
-# 0600 的 /etc/ai-boot/ai-boot.env，不出现在任何进程的命令行参数和输出里。
+# 0600 的 /etc/ai-bot/ai-bot.env，不出现在任何进程的命令行参数和输出里。
 set -euo pipefail
 # 脚本经手 App Secret：即使用 bash -x 调试，也不能把它打进执行轨迹
 set +x
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(dirname "$HERE")
-ETC=/etc/ai-boot
+ETC=/etc/ai-bot
 CONFIG=$ETC/config.toml
-ENV_FILE=$ETC/ai-boot.env
-DROPIN=/etc/systemd/system/ai-boot.service.d/host-claude.conf
-AI_BOOT_BIN=/opt/ai-boot/bin/ai-boot
+ENV_FILE=$ETC/ai-bot.env
+DROPIN=/etc/systemd/system/ai-bot.service.d/host-claude.conf
+AI_BOT_BIN=/opt/ai-bot/bin/ai-bot
 TOOLSETS=jira,confluence,gitlab,jenkins
 # config.example.toml 里的占位 App ID：配置里还是它，说明是 install.sh 放的示例，可以直接覆盖
 PLACEHOLDER_APP_ID=cli_xxxxxxxxxxxxxxxx
@@ -68,8 +68,8 @@ usage() {
 
   --app-id cli_xxx         飞书应用的 App ID；默认取 lark-cli 绑定的应用
   --allow-open-id ou_xxx   白名单，可重复；默认是 lark-cli 用户身份的 open_id（仅当应用相同）
-  --binary <路径>          用编译好的 ai-boot，不在本机编译
-  --force-config           按本次环境重新生成 /etc/ai-boot/config.toml（旧文件先备份）
+  --binary <路径>          用编译好的 ai-bot，不在本机编译
+  --force-config           按本次环境重新生成 /etc/ai-bot/config.toml（旧文件先备份）
   --reset-secret           重新输入 App Secret（默认保留已有的）
   --no-start               只安装和自检，不启动服务
   -h, --help               显示帮助
@@ -189,7 +189,7 @@ check_host() {
     local groups
     groups=" $(id -Gn "$user") "
     [[ $groups == *" $user "* ]] ||
-        die "没有与用户同名的组 $user，或者你不在这个组里" "install.sh 用这个组做 /etc/ai-boot 的属组；多数发行版建用户时会自动建同名组"
+        die "没有与用户同名的组 $user，或者你不在这个组里" "install.sh 用这个组做 /etc/ai-bot 的属组；多数发行版建用户时会自动建同名组"
 }
 
 check_claude() {
@@ -291,7 +291,7 @@ check_build() {
         binary=$(realpath -- "$binary")
     else
         command -v cargo >/dev/null ||
-            die "找不到 cargo" "装上 rustup（仓库的 rust-toolchain.toml 会自动装好对应的工具链），或者用 --binary 指定编译好的 ai-boot"
+            die "找不到 cargo" "装上 rustup（仓库的 rust-toolchain.toml 会自动装好对应的工具链），或者用 --binary 指定编译好的 ai-bot"
     fi
 }
 
@@ -326,20 +326,20 @@ build() {
         step "使用编译好的 $binary"
         return
     fi
-    step "编译 ai-boot（cargo build --release -p ai-boot）"
+    step "编译 ai-bot（cargo build --release -p ai-bot）"
     # 在仓库目录里跑：rustup 按当前目录找 rust-toolchain.toml
-    (cd "$REPO" && cargo build --release -p ai-boot) ||
+    (cd "$REPO" && cargo build --release -p ai-bot) ||
         die "编译失败" "看上面 cargo 的报错；缺 C 编译器就装 gcc（Debian/Ubuntu 装 build-essential）"
     local target
     target=$(cd "$REPO" && cargo metadata --format-version 1 --no-deps | json_get target_directory) ||
         die "取不到 cargo 的 target 目录" "编译好的文件可以用 --binary 直接指定"
-    binary=$target/release/ai-boot
+    binary=$target/release/ai-bot
     [[ -x $binary ]] || die "编译完却找不到 $binary"
 }
 
 install_service() {
-    step "安装 ai-boot 到 /opt/ai-boot/bin（deploy/install.sh）"
-    sudo AI_BOOT_USER="$user" "$HERE/install.sh" "$binary" || die "install.sh 失败，见上面的报错"
+    step "安装 ai-bot 到 /opt/ai-bot/bin（deploy/install.sh）"
+    sudo AI_BOT_USER="$user" "$HERE/install.sh" "$binary" || die "install.sh 失败，见上面的报错"
     info "install.sh 提到的 qtmcp.toml 和后续步骤不用管：服务用你自己的 qtmcp 配置，自检和启动由本脚本接着做"
 }
 
@@ -354,7 +354,7 @@ write_config() {
         SETUP_APP_ID=$app_id \
         SETUP_OPEN_IDS=$(printf '%s\n' "${open_ids[@]}") \
         SETUP_CLAUDE=$claude_bin \
-        SETUP_HOOK=$AI_BOOT_BIN \
+        SETUP_HOOK=$AI_BOT_BIN \
         SETUP_QTMCP=$qtmcp_bin \
         SETUP_QTMCP_CONFIG=$qtmcp_config \
         SETUP_QTMCP_STATE=$qtmcp_state \
@@ -405,7 +405,7 @@ values = {
     ("feishu", "app_id"): string(env["SETUP_APP_ID"]),
     ("access", "allowed_emails"): "[]",
     ("access", "allowed_open_ids"): array(env["SETUP_OPEN_IDS"].split()),
-    ("storage", "data_dir"): string("/var/lib/ai-boot"),
+    ("storage", "data_dir"): string("/var/lib/ai-bot"),
     ("agent", "effort"): string("xhigh"),
     ("agent", "budget_usd"): "20.0",
     ("agent", "max_concurrent"): "2",
@@ -428,8 +428,8 @@ else:
     drop.add("agent.mcp")
 
 PREAMBLE = [
-    "# ai-boot 配置，由 deploy/setup.sh 按 config.example.toml 生成。",
-    "# 密钥不写在这里：飞书 App Secret 在 /etc/ai-boot/ai-boot.env；claude 复用部署用户 ~/.claude 里的登录。",
+    "# ai-bot 配置，由 deploy/setup.sh 按 config.example.toml 生成。",
+    "# 密钥不写在这里：飞书 App Secret 在 /etc/ai-bot/ai-bot.env；claude 复用部署用户 ~/.claude 里的登录。",
     "# 按当前环境重新生成：deploy/setup.sh --force-config（旧文件会先备份）",
 ]
 HEADER = re.compile(r"\s*\[\[?\s*([A-Za-z0-9_.-]+)\s*\]\]?\s*(#.*)?$")
@@ -515,7 +515,7 @@ for line in lines:
 if not done:
     out.append("FEISHU_APP_SECRET=" + secret)
 # mkstemp 建的文件就是 0600，属主是当前的 root；rename 之前任何时刻都没有别人能读的副本
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".ai-boot.env.")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".ai-bot.env.")
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
@@ -560,7 +560,7 @@ Group=$user
 Environment=HOME=$home
 # Agent 执行命令时用的 PATH：部署用户自己的工具链也能用
 Environment=PATH=$service_path
-# 只用 ~/.claude 里的登录：unit 设的 CLAUDE_CONFIG_DIR、ai-boot.env 里的 token 都去掉
+# 只用 ~/.claude 里的登录：unit 设的 CLAUDE_CONFIG_DIR、ai-bot.env 里的 token 都去掉
 UnsetEnvironment=CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN
 # claude 用同目录临时文件 + rename 更新 ~/.claude.json，只绑定这个文件的话 rename 会失败，
 # 所以整个家目录都绑回来（unit 的 ProtectHome=tmpfs 把 /home 换成了空目录）……
@@ -677,7 +677,7 @@ PY
 }
 
 run_doctor() {
-    step "自检（deploy/doctor.sh：用服务的身份、环境和沙箱运行 ai-boot doctor）"
+    step "自检（deploy/doctor.sh：用服务的身份、环境和沙箱运行 ai-bot doctor）"
     sudo "$HERE/doctor.sh" ||
         die "自检有失败项，服务没有启动" "按上面 ❌ 那几项的提示处理后重跑 deploy/setup.sh" "App Secret 输错了就加 --reset-secret 重跑"
 }
@@ -685,16 +685,16 @@ run_doctor() {
 start_service() {
     if [[ $start -eq 0 ]]; then
         step "按 --no-start 不启动服务"
-        info "启动：sudo systemctl enable --now ai-boot（已经在运行的话用 sudo systemctl restart ai-boot 换上新版本）"
+        info "启动：sudo systemctl enable --now ai-bot（已经在运行的话用 sudo systemctl restart ai-bot 换上新版本）"
         return
     fi
     step "启动服务"
-    sudo systemctl enable --quiet ai-boot
+    sudo systemctl enable --quiet ai-bot
     # 用 restart 而不是 start：重跑（升级）时要换上新的二进制、配置和 drop-in
-    sudo systemctl restart ai-boot
+    sudo systemctl restart ai-bot
     sleep 3
-    if ! systemctl is-active --quiet ai-boot; then
-        sudo journalctl -u ai-boot -n 30 --no-pager >&2 || true
+    if ! systemctl is-active --quiet ai-bot; then
+        sudo journalctl -u ai-bot -n 30 --no-pager >&2 || true
         die "服务没有起来，日志见上" "修好后重跑 deploy/setup.sh"
     fi
 }
@@ -702,8 +702,8 @@ start_service() {
 finish() {
     step "完成"
     if [[ $start -eq 1 ]]; then
-        systemctl --no-pager --lines=0 status ai-boot || true
-        info "" "看日志：journalctl -u ai-boot -f" "私聊机器人发一句试试"
+        systemctl --no-pager --lines=0 status ai-bot || true
+        info "" "看日志：journalctl -u ai-bot -f" "私聊机器人发一句试试"
     fi
     if [[ $console_incomplete -eq 1 ]]; then
         warn "开发者后台还有没配好的项（见上面「核对飞书开发者后台」一步），配好并发布新版本后才收得到消息"

@@ -1,4 +1,4 @@
-# ai-boot 配置示例。密钥不写在这里：飞书 AppSecret 从环境变量 FEISHU_APP_SECRET 读取，
+# ai-bot 配置示例。密钥不写在这里：飞书 AppSecret 从环境变量 FEISHU_APP_SECRET 读取，
 # Claude 的登录 token 从 CLAUDE_CODE_OAUTH_TOKEN 读取（见 agent.claude.env_passthrough）。
 
 [feishu]
@@ -14,7 +14,7 @@ allowed_emails = ["someone@example.com"]
 allowed_open_ids = []
 
 [storage]
-data_dir = "/var/lib/ai-boot"
+data_dir = "/var/lib/ai-bot"
 
 [agent]
 # claude 或 codex；本机 Codex 部署示例见 config.codex.example.toml
@@ -31,21 +31,21 @@ budget_usd = 5.0
 max_concurrent = 2
 
 [agent.claude]
-# 用本机已登录用户的 claude（会自动升级）；要锁版本就指向一份固定拷贝，比如 /opt/ai-boot/bin/claude
+# 用本机已登录用户的 claude（会自动升级）；要锁版本就指向一份固定拷贝，比如 /opt/ai-bot/bin/claude
 program = "/home/someone/.local/bin/claude"
-# 按名字从 ai-boot 自己的环境里挑出来传给 claude，其余一律不传
+# 按名字从 ai-bot 自己的环境里挑出来传给 claude，其余一律不传
 env_passthrough = ["HOME", "PATH", "LANG", "XDG_RUNTIME_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]
 
 [agent.hook]
-# ai-boot 自己的可执行文件，CLI 通过 `ai-boot hook` 判决每一次工具调用
-program = "/opt/ai-boot/bin/ai-boot"
+# ai-bot 自己的可执行文件，CLI 通过 `ai-bot hook` 判决每一次工具调用
+program = "/opt/ai-bot/bin/ai-bot"
 timeout_secs = 10
 
 [[agent.mcp]]
 name = "qtmcp"
-command = "/opt/ai-boot/bin/qtmcp"
+command = "/opt/ai-bot/bin/qtmcp"
 args = ["--toolsets", "jira,confluence,gitlab,jenkins"]
-env = { QTMCP_CONFIG = "/etc/ai-boot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
+env = { QTMCP_CONFIG = "/etc/ai-bot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
 
 [render]
 # 卡片里允许出现链接的 host（含子域），通常是 Jira、Confluence、GitLab 的域名
@@ -61,7 +61,7 @@ office_legacy = true
 # 环境速查（markdown）：团队整理的部署方式、命名空间、常用路径和代码在哪个仓库，接在规则
 # 后面给模型参考，省得每次从头找。每轮读一次，改了不用重启；内容可能过时，模型以现场为准。
 # 不配就不带
-# knowledge_file = "/etc/ai-boot/knowledge.md"
+# knowledge_file = "/etc/ai-bot/knowledge.md"
 
 # 以你的身份读云文档（OAuth 授权一次，之后后台自动续期）。不配这一节就不读文档。
 [oauth]
@@ -85,12 +85,12 @@ scopes = [
 ]
 
 # 闭环方案写回：点「已解决」生成闭环方案后，可以写入 Jira 评论、发布到 Confluence。
-# 写回由 ai-boot 在你点按钮确认后执行。不配这一节就只生成方案。
+# 写回由 ai-bot 在你点按钮确认后执行。不配这一节就只生成方案。
 [writeback]
 # 和 Agent 用的是同一个 qtmcp，但这里不能带只读开关
-command = "/opt/ai-boot/bin/qtmcp"
+command = "/opt/ai-bot/bin/qtmcp"
 args = ["--toolsets", "jira,confluence"]
-env = { QTMCP_CONFIG = "/etc/ai-boot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
+env = { QTMCP_CONFIG = "/etc/ai-bot/qtmcp.toml", QTMCP_STATE_DIR = "/var/lib/qtmcp" }
 # 发布到 Confluence 的空间和父页面（页面 ID）
 confluence_space = "DEV"
 confluence_parent_id = "123456789"

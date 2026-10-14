@@ -1,4 +1,4 @@
-module ai-boot/feishu-go-ws
+module ai-bot/feishu-go-ws
 
 go 1.24.0
 

@@ -18,11 +18,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-boot"
+name = "ai-bot"
 version = "0.1.0"
 dependencies = [
- "ai-boot-agent",
- "ai-boot-feishu",
+ "ai-bot-agent",
+ "ai-bot-feishu",
  "anyhow",
  "async-trait",
  "axum",
@@ -60,7 +60,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-boot-agent"
+name = "ai-bot-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -78,7 +78,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-boot-feishu"
+name = "ai-bot-feishu"
 version = "0.1.0"
 dependencies = [
  "async-trait",

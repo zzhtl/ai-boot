@@ -2,13 +2,13 @@
 # 飞书 App Secret 从 FEISHU_APP_SECRET 读取，Codex 复用本机登录。
 [feishu]
 app_id = "cli_xxxxxxxxxxxxxxxx"
-go_sdk_program = "/home/someone/config/ai-boot/bin/feishu-go-ws"
+go_sdk_program = "/home/someone/config/ai-bot/bin/feishu-go-ws"
 
 [access]
 allowed_emails = ["someone@example.com"]
 
 [storage]
-data_dir = "/home/someone/.local/share/ai-boot"
+data_dir = "/home/someone/.local/share/ai-bot"
 
 [agent]
 backend = "codex"
@@ -22,13 +22,13 @@ max_concurrent = 1
 [agent.codex]
 program = "/home/someone/.local/bin/codex"
 # profile 显式启用 web_search = "live"；skills、插件、rules、MCP、OTEL 和 shell 权限沿用本机。
-profile = "ai-boot"
+profile = "ai-bot"
 # 默认传递 SSH agent、Git、Java/Go/Rust、Kubernetes/Docker 与代理环境设置。
-# systemd 服务从用户 manager、unit 或 ai-boot.env 获取这些值；不自动传递其他密钥变量。
+# systemd 服务从用户 manager、unit 或 ai-bot.env 获取这些值；不自动传递其他密钥变量。
 
 [agent.hook]
-# 表格解析子进程也使用这个 ai-boot 路径；Codex 不调用 Claude 的 hook。
-program = "/home/someone/config/ai-boot/bin/ai-boot"
+# 表格解析子进程也使用这个 ai-bot 路径；Codex 不调用 Claude 的 hook。
+program = "/home/someone/config/ai-bot/bin/ai-bot"
 
 [render]
 link_hosts = ["jira.example.com", "wiki.example.com", "git.example.com"]
